@@ -707,19 +707,27 @@ pub(crate) async fn restores_across_flush_and_compaction(make: MakeLake) {
 /// commits anything.
 pub(crate) async fn refusals(make: MakeLake) {
     let lake = make(Some(5)).await;
-    create(&lake, "t").await;
+    Box::pin(refusals_of_reads(&lake)).await;
+    Box::pin(refusals_of_changes(&lake)).await;
+    Box::pin(refusals_of_conflicts(&lake)).await;
+}
+
+/// A snapshot not before the table's, one the table did not exist at, and a
+/// read-only table.
+async fn refusals_of_reads(lake: &Lake) {
+    create(lake, "t").await;
     lake.append_parquet("t", &batch(1..=5, "a")).await;
     let mark = lake.head();
     lake.append_parquet("t", &batch(6..=9, "b")).await;
     let head = lake.head();
 
     for snapshot in [head, head + 5] {
-        let error = restore(&lake, "t", snapshot).await.unwrap_err();
+        let error = restore(lake, "t", snapshot).await.unwrap_err();
         assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
     }
-    create(&lake, "later").await;
+    create(lake, "later").await;
     lake.append_parquet("later", &batch(1..=3, "l")).await;
-    let error = restore(&lake, "later", head).await.unwrap_err();
+    let error = restore(lake, "later", head).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::InvalidConfig(m) if m.contains("does not exist")),
         "{error}"
@@ -741,24 +749,71 @@ pub(crate) async fn refusals(make: MakeLake) {
     let read_only = (read_only.as_ref() as &dyn std::any::Any)
         .downcast_ref::<DuckLakeTable>()
         .unwrap();
-    let error = read_only
-        .restore_rows_to(&ctx.state(), mark)
+    let error = Box::pin(read_only.restore_rows_to(&ctx.state(), mark))
         .await
         .unwrap_err();
     assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
+}
 
+/// Column changes, a partition-spec change and an expired mark.
+async fn refusals_of_changes(lake: &Lake) {
     // A column change since the mark.
-    create(&lake, "c").await;
+    create(lake, "c").await;
     lake.append_parquet("c", &batch(1..=5, "a")).await;
     let mark_c = lake.head();
     create_with(
-        &lake,
+        lake,
         "c",
         &[("id", DataType::Int64), ("v", DataType::Utf8), ("w", DataType::Int64)],
     )
     .unwrap();
     let head = lake.head();
-    let error = restore(&lake, "c", mark_c).await.unwrap_err();
+    let error = restore(lake, "c", mark_c).await.unwrap_err();
+    assert!(
+        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
+        "{error}"
+    );
+    assert_eq!(lake.head(), head);
+
+    // A column dropped since the mark.
+    create(lake, "dr").await;
+    lake.append_parquet("dr", &batch(1..=5, "a")).await;
+    let mark_d = lake.head();
+    create_with(lake, "dr", &[("id", DataType::Int64)]).unwrap();
+    let error = restore(lake, "dr", mark_d).await.unwrap_err();
+    assert!(
+        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
+        "{error}"
+    );
+
+    // A column widened since the mark.
+    create_with(
+        lake,
+        "wi",
+        &[("id", DataType::Int64), ("n", DataType::Int32)],
+    )
+    .unwrap();
+    lake.append_parquet(
+        "wi",
+        &RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("n", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap(),
+    )
+    .await;
+    let mark_w = lake.head();
+    lake.writer
+        .promote_column_type(lake.table_id("wi"), "n", "int64")
+        .unwrap();
+    let head = lake.head();
+    let error = restore(lake, "wi", mark_w).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
         "{error}"
@@ -771,7 +826,7 @@ pub(crate) async fn refusals(make: MakeLake) {
         .await
         .unwrap();
     let head = lake.head();
-    let error = restore(&lake, "t", mark).await.unwrap_err();
+    let error = restore(lake, "t", mark).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("partition spec")),
         "{error}"
@@ -779,7 +834,7 @@ pub(crate) async fn refusals(make: MakeLake) {
     assert_eq!(lake.head(), head);
 
     // An expired mark.
-    create(&lake, "e").await;
+    create(lake, "e").await;
     lake.append_parquet("e", &batch(1..=5, "a")).await;
     let expired = lake.head();
     lake.append_parquet("e", &batch(6..=9, "b")).await;
@@ -790,15 +845,18 @@ pub(crate) async fn refusals(make: MakeLake) {
         .await
         .unwrap();
     let head = lake.head();
-    let error = restore(&lake, "e", expired).await.unwrap_err();
+    let error = restore(lake, "e", expired).await.unwrap_err();
     assert!(
         matches!(error, DuckLakeError::InvalidSnapshot(_)),
         "{error}"
     );
     assert_eq!(lake.head(), head);
+}
 
+/// Commits since the table was read.
+async fn refusals_of_conflicts(lake: &Lake) {
     // A commit since the table was read conflicts.
-    create(&lake, "s").await;
+    create(lake, "s").await;
     lake.append_parquet("s", &batch(1..=5, "a")).await;
     let mark = lake.head();
     lake.append_parquet("s", &batch(6..=9, "b")).await;
@@ -808,17 +866,19 @@ pub(crate) async fn refusals(make: MakeLake) {
         .unwrap();
     let head = lake.head();
     let rows = lake.rows("s").await;
-    let error = stale.restore_rows_to(&ctx.state(), mark).await.unwrap_err();
+    let error = Box::pin(stale.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
     assert_eq!(lake.head(), head);
     assert_eq!(lake.rows("s").await, rows);
-    restore_and_check(&lake, "s", mark).await;
+    restore_and_check(lake, "s", mark).await;
 
     // A restore that only inserts rows again conflicts with any commit to
     // the table since it was read: another restore of the same rows (whose
     // row ids would be live twice), or an insert (whose rows the mark never
     // had).
-    create(&lake, "r").await;
+    create(lake, "r").await;
     lake.append_parquet("r", &batch(1..=10, "a")).await;
     let mark = lake.head();
     lake.sql("DELETE FROM lake.main.r WHERE id = 3")
@@ -826,10 +886,11 @@ pub(crate) async fn refusals(make: MakeLake) {
         .unwrap();
     let (ctx, first) = lake.table("r").await;
     let (ctx2, second) = lake.table("r").await;
-    first.restore_rows_to(&ctx.state(), mark).await.unwrap();
+    Box::pin(first.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap();
     let head = lake.head();
-    let error = second
-        .restore_rows_to(&ctx2.state(), mark)
+    let error = Box::pin(second.restore_rows_to(&ctx2.state(), mark))
         .await
         .unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
@@ -841,13 +902,42 @@ pub(crate) async fn refusals(make: MakeLake) {
     let (ctx, stale) = lake.table("r").await;
     lake.append("r", &batch([70], "x")).await;
     let head = lake.head();
-    let error = stale.restore_rows_to(&ctx.state(), mark).await.unwrap_err();
+    let error = Box::pin(stale.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
     assert_eq!(lake.head(), head);
+    // A restore that wrote files and then lost to a concurrent commit leaves
+    // none of them behind.
+    create(lake, "x").await;
+    lake.append_parquet("x", &batch(1..=30, "a")).await;
+    let mark = lake.head();
+    lake.sql("DELETE FROM lake.main.x WHERE id <= 20")
+        .await
+        .unwrap();
+    lake.append_parquet("x", &batch(40..=49, "b")).await;
+    lake.sql("DELETE FROM lake.main.x WHERE id IN (40, 41)")
+        .await
+        .unwrap();
+    let (ctx, stale) = lake.table("x").await;
+    lake.append("x", &batch([90], "c")).await;
+    let head = lake.head();
+    let objects = files_under(&lake.data);
+    let error = Box::pin(stale.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(lake.head(), head);
+    assert_eq!(
+        files_under(&lake.data),
+        objects,
+        "the refused restore leaves none of the files it wrote"
+    );
+
     // A concurrent `DELETE` that rewrites the delete file of a file the
     // restore does not touch writes a delete file beginning before the
     // restore's snapshot; it still conflicts.
-    create(&lake, "w").await;
+    create(lake, "w").await;
     lake.append_parquet("w", &batch(1..=20, "a")).await;
     lake.sql("DELETE FROM lake.main.w WHERE id <= 6")
         .await
@@ -859,7 +949,9 @@ pub(crate) async fn refusals(make: MakeLake) {
         .await
         .unwrap();
     let head = lake.head();
-    let error = stale.restore_rows_to(&ctx.state(), mark).await.unwrap_err();
+    let error = Box::pin(stale.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
     assert_eq!(lake.head(), head);
 }
@@ -952,6 +1044,173 @@ pub(crate) async fn restores_through_a_catalog_read_memo(make: MakeLake) {
     assert_eq!(lake.head(), head);
 }
 
+/// The table `(id, d DATE, ts TIMESTAMP, tstz TIMESTAMPTZ, dec DECIMAL(18,3),
+/// f DOUBLE, b BOOLEAN, blob BLOB)`.
+fn typed_columns() -> Vec<(&'static str, DataType)> {
+    vec![
+        ("id", DataType::Int64),
+        ("d", DataType::Date32),
+        (
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        ),
+        (
+            "tstz",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        ),
+        ("dec", DataType::Decimal128(18, 3)),
+        ("f", DataType::Float64),
+        ("b", DataType::Boolean),
+        ("blob", DataType::Binary),
+    ]
+}
+
+/// Rows of [`typed_columns`] for `ids`: every value NULL on a multiple of 5,
+/// NaN and infinities among the doubles, dates and times either side of
+/// 1970.
+fn typed(ids: impl IntoIterator<Item = i64>) -> RecordBatch {
+    use arrow::array::{
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array,
+        TimestampMicrosecondArray,
+    };
+    let ids: Vec<i64> = ids.into_iter().collect();
+    let null = |id: &i64| id % 5 == 0;
+    let schema = Arc::new(Schema::new(
+        typed_columns()
+            .into_iter()
+            .map(|(name, data_type)| Field::new(name, data_type, true))
+            .collect::<Vec<_>>(),
+    ));
+    let micros = |id: &i64| (!null(id)).then(|| (id - 10) * 86_400_000_123);
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Date32Array::from(
+                ids.iter()
+                    .map(|id| (!null(id)).then(|| (*id as i32 - 10) * 400))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampMicrosecondArray::from(
+                ids.iter().map(micros).collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                TimestampMicrosecondArray::from(ids.iter().map(micros).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(
+                Decimal128Array::from(
+                    ids.iter()
+                        .map(|id| (!null(id)).then(|| i128::from(*id) * 1_234_567 - 9_000_000))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(18, 3)
+                .unwrap(),
+            ),
+            Arc::new(Float64Array::from(
+                ids.iter()
+                    .map(|id| {
+                        (!null(id)).then(|| match id % 4 {
+                            0 => f64::NAN,
+                            1 => f64::INFINITY,
+                            2 => -1.5 * *id as f64,
+                            _ => f64::NEG_INFINITY,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                ids.iter()
+                    .map(|id| (!null(id) && id % 3 != 0).then_some(id % 2 == 0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                ids.iter().map(|id| (!null(id)).then(|| id.to_le_bytes())),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// Dates, timestamps with and without a time zone, decimals, doubles with
+/// NaN and infinities, booleans, blobs and rows of NULLs, in Parquet and
+/// inlined, restored inlined and in Parquet, values and row ids as at the
+/// mark.
+pub(crate) async fn restores_typed_columns(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create_with(&lake, "ty", &typed_columns()).unwrap();
+    lake.append_parquet("ty", &typed(1..=20)).await;
+    lake.append("ty", &typed(21..=24)).await;
+    // MySQL stores some of these types in Parquet where the others inline.
+    let inlines = lake.inlined_rows("ty") > 0;
+    let mark = lake.head();
+    for statement in [
+        "DELETE FROM lake.main.ty WHERE id IN (2, 5, 22)",
+        "UPDATE lake.main.ty SET f = 'NaN'::DOUBLE, b = NULL WHERE id >= 10 AND id <= 18",
+        "UPDATE lake.main.ty SET blob = NULL, d = NULL WHERE id = 23",
+    ] {
+        lake.sql(statement).await.unwrap();
+    }
+    lake.append("ty", &typed(30..=31)).await;
+    let result = restore_and_check(&lake, "ty", mark).await;
+    assert!(result.rows_restored >= 12, "{result:?}");
+
+    // A few rows only: restored inlined.
+    let mark = lake.head();
+    let inlined = lake.inlined_rows("ty");
+    lake.sql("DELETE FROM lake.main.ty WHERE id IN (1, 3, 4)")
+        .await
+        .unwrap();
+    let result = restore_and_check(&lake, "ty", mark).await;
+    assert_eq!(counts(&result), (0, 3, 0));
+    if inlines {
+        assert_eq!(lake.inlined_rows("ty"), inlined + 3);
+    }
+}
+
+/// Snapshots between the mark and the head expired, and their files cleaned
+/// up: the rows at the mark are still restored whole.
+pub(crate) async fn restores_across_expired_snapshots(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create(&lake, "t").await;
+    lake.append_parquet("t", &batch(1..=20, "a")).await;
+    lake.append("t", &batch(100..=101, "i")).await;
+    let mark = lake.head();
+    lake.sql("DELETE FROM lake.main.t WHERE id <= 8")
+        .await
+        .unwrap();
+    let first = lake.head();
+    lake.sql("UPDATE lake.main.t SET v = 'u' WHERE id >= 15")
+        .await
+        .unwrap();
+    let second = lake.head();
+    lake.append_parquet("t", &batch(30..=39, "b")).await;
+    lake.sql("DELETE FROM lake.main.t WHERE id = 100")
+        .await
+        .unwrap();
+    let expected = lake.rows_at("t", Some(mark)).await;
+    let maintenance = lake.writer.maintenance().unwrap();
+    maintenance
+        .expire_snapshots(ExpireCriteria::Versions(vec![first, second]))
+        .await
+        .unwrap();
+    maintenance
+        .cleanup_old_files(
+            Arc::new(object_store::local::LocalFileSystem::new()),
+            datafusion_ducklake::maintenance::CleanupCriteria::All,
+            false,
+        )
+        .await
+        .unwrap();
+    let before = lake.head();
+    let pre = lake.rows("t").await;
+    let result = restore(&lake, "t", mark).await.unwrap();
+    assert!(result.snapshot_id.is_some(), "{result:?}");
+    assert_eq!(lake.rows("t").await, expected);
+    assert_eq!(lake.rows_at("t", Some(before)).await, pre, "history kept");
+    assert_eq!(lake.rows_at("t", Some(mark)).await, expected);
+}
+
 /// Nothing to undo commits nothing: no change to the table since the mark,
 /// or changes that cancel out (rows inserted and deleted again).
 pub(crate) async fn nothing_to_undo(make: MakeLake) {
@@ -987,6 +1246,8 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
     Box::pin(restores_across_flush_and_compaction(Arc::clone(&make))).await;
     Box::pin(refusals(Arc::clone(&make))).await;
     Box::pin(restores_through_a_catalog_read_memo(Arc::clone(&make))).await;
+    Box::pin(restores_typed_columns(Arc::clone(&make))).await;
+    Box::pin(restores_across_expired_snapshots(Arc::clone(&make))).await;
     Box::pin(nothing_to_undo(make)).await;
 }
 
@@ -1023,6 +1284,8 @@ per_backend!(
     restores_across_flush_and_compaction,
     refusals,
     restores_through_a_catalog_read_memo,
+    restores_typed_columns,
+    restores_across_expired_snapshots,
     nothing_to_undo,
 );
 
@@ -1174,6 +1437,50 @@ async fn postgres_single_catalog_refuses() {
     let error = restore(&lake, "t", mark).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("stages row mutations")),
+        "{error}"
+    );
+    assert_eq!(lake.head(), head);
+}
+
+/// A column renamed since the mark (by official DuckLake, as this crate has
+/// no rename) refuses the restore.
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_since_the_mark_refuses() {
+    use crate::inlined_mutation_differential_tests as differential;
+    let lake = duckdb()(Some(5)).await;
+    create(&lake, "t").await;
+    lake.append_parquet("t", &batch(1..=10, "a")).await;
+    let mark = lake.head();
+    let Lake {
+        writer,
+        provider,
+        data,
+        _dir: dir,
+        ..
+    } = lake;
+    drop((writer, provider));
+    let path = dir.path().join("lake.ducklake");
+    differential::official(
+        &differential::Metadata::Duckdb(path.clone()),
+        &data,
+        &["ALTER TABLE lake.main.t RENAME COLUMN v TO w".to_string()],
+    );
+    let writer =
+        datafusion_ducklake::DuckdbMetadataWriter::new(path.display().to_string()).unwrap();
+    let provider = writer.metadata_provider();
+    let lake = Lake {
+        writer: Arc::new(writer),
+        provider: Arc::new(provider),
+        data,
+        inlines: true,
+        _dir: dir,
+    };
+    let head = lake.head();
+    assert!(head > mark);
+    let error = restore(&lake, "t", mark).await.unwrap_err();
+    assert!(
+        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
         "{error}"
     );
     assert_eq!(lake.head(), head);
