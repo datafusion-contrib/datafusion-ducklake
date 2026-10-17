@@ -4840,7 +4840,10 @@ impl Run<'_> {
         let outcome = Box::pin(table.restore_rows_to(&ctx.state(), mark)).await;
         drop((ctx, table));
         match outcome {
-            Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) if dropped || respecified => {
+            Err(datafusion_ducklake::DuckLakeError::Unsupported(reason))
+                if (dropped && reason.contains("was dropped"))
+                    || (respecified && reason.contains("partition spec")) =>
+            {
                 self.ran(if dropped {
                     "restore refused: a dropped column"
                 } else {

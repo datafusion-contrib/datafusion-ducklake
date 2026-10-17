@@ -24,8 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DuckLakeTable::delete_positions` and `delete_rowids` record small deletions inlined, as a
   SQL `DELETE` does.
 - `DuckLakeTable::restore_rows_to` (feature `restore`) restores a table's rows to an earlier
-  snapshot in one new snapshot, keeping their row ids; no official equivalent.
-- `restore_rows_to` restores across columns added or losslessly widened since the snapshot.
+  snapshot, keeping row ids, across added or widened columns; no official equivalent.
 - `DuckLakeTable::locate_rowids`, `read_rows_by_rowid` and `file_row_id_layout` find rows by
   `rowid`, inlined or in files embedding row ids; `DuckLakeTableFile::may_embed_row_ids`.
 - `change_detection` reports what snapshots did to a table: the change ledger, and the change

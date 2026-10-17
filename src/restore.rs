@@ -57,7 +57,8 @@
 //! `NOT NULL`, changes nothing restored. Any other change since the mark
 //! refuses the restore with [`DuckLakeError::Unsupported`]: a column dropped,
 //! renamed, changed to any other type (narrowed, or a nested column's fields
-//! changed) or made `NOT NULL`, and a change of the partition spec.
+//! changed) or made `NOT NULL`, a column added since that is `NOT NULL` with
+//! no initial default, and a change of the partition spec.
 //!
 //! # Requirements
 //!
@@ -893,12 +894,31 @@ fn row_ids_of(batch: &RecordBatch) -> &[i64] {
 /// mark and at the head, that a restore cannot carry its rows across, or
 /// `None` when every column live at the mark is live at the head under its
 /// name, in its type or widened losslessly ([`crate::types::is_promotable`]),
-/// and nullable if it was. Columns added since, a dropped `NOT NULL` and a
-/// changed default are not changes it refuses.
+/// and nullable if it was. Columns added since (nullable, or with an initial
+/// default), a dropped `NOT NULL` and a changed default are not changes it
+/// refuses.
 fn column_change(
     at_mark: &[DuckLakeTableColumn],
     at_head: &[DuckLakeTableColumn],
 ) -> crate::Result<Option<String>> {
+    let live_at_mark: HashSet<i64> = at_mark.iter().map(|column| column.column_id).collect();
+    // A column added since that is `NOT NULL` with no initial default reads
+    // NULL in every restored row.
+    for added in at_head
+        .iter()
+        .filter(|column| !live_at_mark.contains(&column.column_id))
+    {
+        let defaulted = added
+            .initial_default
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case("NULL"));
+        if !added.is_nullable && !defaulted {
+            return Ok(Some(format!(
+                "column '{}' was added NOT NULL with no default",
+                added.column_name
+            )));
+        }
+    }
     let at_head: HashMap<i64, &DuckLakeTableColumn> = at_head
         .iter()
         .map(|column| (column.column_id, column))
@@ -1010,6 +1030,7 @@ mod tests {
         assert_eq!(change(&mark, &head), None);
         let mut added = column(8, "a", "int32");
         added.initial_default = Some("7".to_string());
+        added.is_nullable = false;
         head.push(added);
         head.push(column(9, "b", "varchar"));
         assert_eq!(change(&mark, &head), None);
@@ -1065,6 +1086,15 @@ mod tests {
             vec![column(1, "id", "int64"), widened_not_null],
             "column 'n' became NOT NULL",
         );
+        for initial_default in [None, Some("NULL"), Some("null")] {
+            let mut added = column(3, "a", "int32");
+            added.is_nullable = false;
+            added.initial_default = initial_default.map(str::to_string);
+            refused(
+                vec![column(1, "id", "int64"), column(2, "n", "int32"), added],
+                "column 'a' was added NOT NULL with no default",
+            );
+        }
     }
 
     #[test]
