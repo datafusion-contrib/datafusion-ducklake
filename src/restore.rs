@@ -45,6 +45,20 @@
 //! wrote new ones has its new files ended and the rows of the files it ended
 //! restored.
 //!
+//! # Column changes
+//!
+//! The table keeps its columns as they are at the head. Columns added since
+//! the mark, and columns widened since by one of the lossless widenings
+//! [`crate::types::is_promotable`] allows (an integer to a wider one of the
+//! same signedness, `FLOAT` to `DOUBLE`), are carried across: each restored
+//! row is written in the current columns, as the head reads the row's version
+//! at the mark, its widened values cast and each added column holding that
+//! column's `initial_default`, else NULL. A changed default, or a dropped
+//! `NOT NULL`, changes nothing restored. Any other change since the mark
+//! refuses the restore with [`DuckLakeError::Unsupported`]: a column dropped,
+//! renamed, changed to any other type (narrowed, or a nested column's fields
+//! changed) or made `NOT NULL`, and a change of the partition spec.
+//!
 //! # Requirements
 //!
 //! The table must have been opened at the head of a writable catalog
@@ -79,7 +93,7 @@ use futures::{StreamExt, TryStreamExt};
 use crate::DuckLakeError;
 use crate::delete_exec::{DeletionTarget, FileDeletions, LatestDeleteFiles};
 use crate::keyed_mutation::from_df;
-use crate::metadata_provider::DuckLakeTableFile;
+use crate::metadata_provider::{DuckLakeTableColumn, DuckLakeTableFile};
 use crate::metadata_writer::{DroppedDataFile, InlinedRowRef, StagedTableData};
 use crate::rowid_lookup::bounded;
 use crate::table::{DuckLakeTable, rewrite_output_schema, rewrite_scanned_batch};
@@ -116,7 +130,9 @@ impl DuckLakeTable {
     ///   catalog: it has expired (or was never one of this catalog's), so the
     ///   rows it read may be gone;
     /// - [`DuckLakeError::Unsupported`] when the writer does not stage row
-    ///   mutations (single-catalog PostgreSQL), or the table's columns or
+    ///   mutations (single-catalog PostgreSQL), the table's columns changed
+    ///   since `snapshot` other than by added columns and lossless widenings
+    ///   (see [Column changes](crate::restore#column-changes)), or its
     ///   partition spec changed since `snapshot`;
     /// - [`DuckLakeError::Conflict`] when the table's rows changed since the
     ///   snapshot it was opened at; a PostgreSQL commit guard that refuses
@@ -167,6 +183,7 @@ struct RestoreContext<'a> {
     mark: DuckLakeTable,
     table_writer: DuckLakeTableWriter,
     schema_name: String,
+    /// The table's columns at the head, which restored rows are written in.
     physical_schema: SchemaRef,
     /// The table's scoped `data_inlining_row_limit`.
     inline_limit: usize,
@@ -287,12 +304,12 @@ impl<'a> RestoreContext<'a> {
             Arc::clone(head.object_store_url()),
             head.table_path().to_string(),
         )?;
-        let physical_schema = head.physical_schema();
-        if mark.column_ids() != head.column_ids() || mark.physical_schema() != physical_schema {
+        if let Some(change) = column_change(mark.table_columns(), head.table_columns())? {
             return Err(DuckLakeError::Unsupported(format!(
-                "restore of '{name}': its columns changed since snapshot {snapshot}"
+                "restore of '{name}': its columns changed since snapshot {snapshot}: {change}"
             )));
         }
+        let physical_schema = head.physical_schema();
         let partition_id = |at: i64| -> crate::Result<Option<i64>> {
             Ok(provider
                 .get_partition_spec(head.table_id(), at)?
@@ -421,7 +438,8 @@ impl<'a> RestoreContext<'a> {
         }
         diff.rows_removed += diff.removed_inlined.len() as u64;
         let out_schema = rewrite_output_schema(&self.physical_schema);
-        for rows in mark.inlined_data_with_row_ids()? {
+        // Read in the head's columns, as the head reads them.
+        for rows in head.inlined_data_with_row_ids_at(mark.snapshot_id())? {
             check_aligned(&rows)?;
             let keep = BooleanArray::from(
                 rows.row_ids
@@ -435,7 +453,7 @@ impl<'a> RestoreContext<'a> {
             if keep.true_count() == 0 {
                 continue;
             }
-            let Some((batch, _)) = mark.apply_update_to_inlined(&rows, None, &[])? else {
+            let Some((batch, _)) = head.apply_update_to_inlined(&rows, None, &[])? else {
                 continue;
             };
             let kept = arrow::compute::filter_record_batch(&batch, &keep)?;
@@ -595,11 +613,11 @@ impl<'a> RestoreContext<'a> {
         if rows == 0 {
             return Ok((StagedTableData::None, None));
         }
-        let mark = &self.mark;
-        let table_name = self.head.table_name();
+        let head = self.head;
+        let table_name = head.table_name();
         let source = || -> BoxStream<'_, DataFusionResult<RecordBatch>> {
             stream::iter(restored.iter())
-                .map(move |file| file_rows(mark, state, &file.file, &file.positions))
+                .map(move |file| file_rows(head, state, &file.file, &file.positions))
                 .flatten()
                 .chain(stream::iter(restored_inlined.iter().cloned().map(Ok)))
                 .boxed()
@@ -810,9 +828,10 @@ async fn row_count(
     }
 }
 
-/// The rows of `file` at `positions`, read at `table`'s snapshot as
+/// The rows of `file` at `positions`, read in `table`'s columns as
 /// `[physical columns..., rowid]` with each row's `rowid`, its delete files
-/// not applied: the positions include rows deleted since.
+/// not applied: the positions include rows deleted since. `file` need not be
+/// live at `table`'s snapshot.
 fn file_rows<'a>(
     table: &'a DuckLakeTable,
     state: &'a dyn Session,
@@ -870,6 +889,63 @@ fn row_ids_of(batch: &RecordBatch) -> &[i64] {
         .values()
 }
 
+/// What changed between `at_mark` and `at_head`, the table's columns at the
+/// mark and at the head, that a restore cannot carry its rows across, or
+/// `None` when every column live at the mark is live at the head under its
+/// name, in its type or widened losslessly ([`crate::types::is_promotable`]),
+/// and nullable if it was. Columns added since, a dropped `NOT NULL` and a
+/// changed default are not changes it refuses.
+fn column_change(
+    at_mark: &[DuckLakeTableColumn],
+    at_head: &[DuckLakeTableColumn],
+) -> crate::Result<Option<String>> {
+    let at_head: HashMap<i64, &DuckLakeTableColumn> = at_head
+        .iter()
+        .map(|column| (column.column_id, column))
+        .collect();
+    for was in at_mark {
+        let name = &was.column_name;
+        let Some(now) = at_head.get(&was.column_id) else {
+            return Ok(Some(format!("column '{name}' was dropped")));
+        };
+        if now.column_name != *name {
+            return Ok(Some(format!(
+                "column '{name}' was renamed to '{}'",
+                now.column_name
+            )));
+        }
+        let (from, to) = (was.data_type()?, now.data_type()?);
+        let same_type = was.column_type == now.column_type
+            && from == to
+            && was.nested_column_ids == now.nested_column_ids
+            && was.nested_initial_defaults == now.nested_initial_defaults;
+        let widened = !from.is_nested()
+            && !to.is_nested()
+            && from != to
+            && crate::types::is_promotable(&was.column_type, &now.column_type);
+        if !same_type && !widened {
+            let spell = |column: &DuckLakeTableColumn, data_type: &arrow::datatypes::DataType| {
+                if data_type.is_nested() {
+                    data_type.to_string()
+                } else {
+                    column.column_type.clone()
+                }
+            };
+            return Ok(Some(format!(
+                "column '{name}' changed type from {} to {}, which is not a lossless widening",
+                spell(was, &from),
+                spell(now, &to)
+            )));
+        }
+        // A restored row may hold a NULL the column now refuses. A default
+        // changes nothing restored: the rows are read as the head reads them.
+        if was.is_nullable && !now.is_nullable {
+            return Ok(Some(format!("column '{name}' became NOT NULL")));
+        }
+    }
+    Ok(None)
+}
+
 fn check_aligned(rows: &crate::metadata_provider::DuckLakeInlinedData) -> crate::Result<()> {
     if rows.begin_snapshots.len() != rows.row_ids.len() {
         return Err(DuckLakeError::Internal(format!(
@@ -880,4 +956,127 @@ fn check_aligned(rows: &crate::metadata_provider::DuckLakeInlinedData) -> crate:
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(id: i64, name: &str, column_type: &str) -> DuckLakeTableColumn {
+        DuckLakeTableColumn::new(id, name.to_string(), column_type.to_string(), true)
+    }
+
+    fn change(at_mark: &[DuckLakeTableColumn], at_head: &[DuckLakeTableColumn]) -> Option<String> {
+        column_change(at_mark, at_head).unwrap()
+    }
+
+    /// A struct column `s` with fields `a` (id 11) and, when `with_b`, `b`
+    /// (id 12), `a` of type `a_type`.
+    fn struct_column(a_type: arrow::datatypes::DataType, with_b: bool) -> DuckLakeTableColumn {
+        use arrow::datatypes::{DataType, Field};
+        let mut fields = vec![Field::new("a", a_type, true)];
+        let mut ids = vec![11];
+        if with_b {
+            fields.push(Field::new("b", DataType::Utf8, true));
+            ids.push(12);
+        }
+        let mut column = column(10, "s", "struct");
+        column.data_type = Some(DataType::Struct(fields.into()));
+        column.nested_column_ids = ids;
+        column
+    }
+
+    #[test]
+    fn carries_added_columns_and_lossless_widenings() {
+        let mark = [
+            column(1, "id", "int64"),
+            column(2, "i8", "int8"),
+            column(3, "i16", "int16"),
+            column(4, "u8", "uint8"),
+            column(5, "u32", "uint32"),
+            column(6, "f", "float32"),
+            column(7, "v", "varchar"),
+        ];
+        assert_eq!(change(&mark, &mark), None);
+        let mut head = vec![
+            column(1, "id", "int64"),
+            column(2, "i8", "int64"),
+            column(3, "i16", "int32"),
+            column(4, "u8", "uint16"),
+            column(5, "u32", "uint64"),
+            column(6, "f", "float64"),
+            column(7, "v", "varchar"),
+        ];
+        assert_eq!(change(&mark, &head), None);
+        let mut added = column(8, "a", "int32");
+        added.initial_default = Some("7".to_string());
+        head.push(added);
+        head.push(column(9, "b", "varchar"));
+        assert_eq!(change(&mark, &head), None);
+        let nested = [struct_column(arrow::datatypes::DataType::Int32, false)];
+        assert_eq!(change(&nested, &nested), None);
+
+        // A default set, or re-encoded by another writer's widening, and a
+        // dropped NOT NULL.
+        let mut not_null = column(2, "n", "int32");
+        not_null.is_nullable = false;
+        let mut defaulted = column(2, "n", "int64");
+        defaulted.default_value_type = Some("literal".to_string());
+        defaulted.default_value_dialect = Some("duckdb".to_string());
+        defaulted.default_value = Some("5".to_string());
+        assert_eq!(change(&[not_null], &[defaulted]), None);
+    }
+
+    #[test]
+    fn refuses_every_other_column_change() {
+        let mark = [column(1, "id", "int64"), column(2, "n", "int32")];
+        let refused = |head: Vec<DuckLakeTableColumn>, expected: &str| {
+            let change = change(&mark, &head).expect("a change the restore refuses");
+            assert!(change.contains(expected), "{change}");
+        };
+        refused(vec![column(1, "id", "int64")], "column 'n' was dropped");
+        refused(
+            vec![column(1, "id", "int64"), column(3, "n", "int32")],
+            "column 'n' was dropped",
+        );
+        refused(
+            vec![column(1, "id", "int64"), column(2, "m", "int32")],
+            "column 'n' was renamed to 'm'",
+        );
+        for narrowed_or_other in ["int16", "int8", "uint32", "uint64", "float64", "varchar"] {
+            refused(
+                vec![column(1, "id", "int64"), column(2, "n", narrowed_or_other)],
+                &format!("from int32 to {narrowed_or_other}"),
+            );
+        }
+        refused(
+            vec![column(1, "id", "int32"), column(2, "n", "int32")],
+            "column 'id' changed type from int64 to int32",
+        );
+        let mut not_null = column(2, "n", "int32");
+        not_null.is_nullable = false;
+        refused(
+            vec![column(1, "id", "int64"), not_null],
+            "column 'n' became NOT NULL",
+        );
+        let mut widened_not_null = column(2, "n", "int64");
+        widened_not_null.is_nullable = false;
+        refused(
+            vec![column(1, "id", "int64"), widened_not_null],
+            "column 'n' became NOT NULL",
+        );
+    }
+
+    #[test]
+    fn refuses_a_nested_column_change() {
+        use arrow::datatypes::DataType;
+        let mark = [struct_column(DataType::Int32, false)];
+        for head in [struct_column(DataType::Int32, true), struct_column(DataType::Int64, false)] {
+            let change = change(&mark, &[head]).expect("a nested change");
+            assert!(
+                change.contains("column 's' changed type from Struct"),
+                "{change}"
+            );
+        }
+    }
 }

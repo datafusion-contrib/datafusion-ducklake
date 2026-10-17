@@ -25,9 +25,10 @@
 //!   and partition values of the live files, against official's.
 //!
 //! After the last step (with the `restore` feature), this crate writes a few
-//! more steps of its own and restores its table to a random earlier step
-//! ([`Run::check_restore`]): `rowid, *` at the head must be the mark's, and
-//! on DuckDB official must read it so too.
+//! more steps of its own, column changes among them, and restores its table
+//! to a random earlier step ([`Run::check_restore`]): `rowid, *` at the head
+//! must be the mark's in the current columns, and on DuckDB official must
+//! read it so too; a column dropped since must refuse it.
 //!
 //! Official's `UPDATE` and `DELETE` run without filter pushdown, so its rows
 //! stay right where its statistics are known to be wrong.
@@ -169,6 +170,16 @@ const TYPES: [Ty; 19] = [
 ];
 
 impl Ty {
+    /// The type a [`Step::Widen`] widens this one to, losslessly.
+    fn widened(self) -> Ty {
+        match self {
+            Ty::SmallInt => Ty::Int,
+            Ty::Int => Ty::BigInt,
+            Ty::Float => Ty::Double,
+            other => other,
+        }
+    }
+
     fn duckdb(self) -> &'static str {
         match self {
             Ty::Int => "INTEGER",
@@ -805,7 +816,11 @@ enum Step {
     Merge,
     Rewrite,
     AddColumn(Col, Option<String>),
+    /// Widen a column by [`Ty::widened`].
     Widen(String),
+    /// Declare the table again without the column, which drops it. This
+    /// crate's only, in a restore window ([`Run::extend_for_restore`]).
+    DropColumn(String),
     Limit(usize),
     Partition(Option<(String, Transform)>),
     /// `SET SORTED BY (<key> ASC|DESC, id)` (`true` for `DESC`; `id` alone
@@ -839,10 +854,11 @@ impl History {
                 Step::Widen(name) => {
                     for column in &mut columns {
                         if &column.name == name {
-                            column.ty = Ty::BigInt;
+                            column.ty = column.ty.widened();
                         }
                     }
                 },
+                Step::DropColumn(name) => columns.retain(|column| &column.name != name),
                 _ => {},
             }
         }
@@ -1379,9 +1395,17 @@ impl Official {
                     ))
                     .unwrap_or_default()
             )),
-            Step::Widen(column) => self.run(&format!(
-                "ALTER TABLE t ALTER COLUMN {column} SET DATA TYPE BIGINT"
-            )),
+            Step::Widen(column) => {
+                let to = columns
+                    .iter()
+                    .find(|c| &c.name == column)
+                    .map_or(Ty::BigInt, |c| c.ty.widened());
+                self.run(&format!(
+                    "ALTER TABLE t ALTER COLUMN {column} SET DATA TYPE {}",
+                    to.duckdb()
+                ))
+            },
+            Step::DropColumn(_) => unreachable!("a restore window's step, this crate's only"),
             Step::Limit(limit) => self.run(&format!(
                 "CALL lake.set_option('data_inlining_row_limit', {limit}, table_name => 't')"
             )),
@@ -1682,8 +1706,38 @@ impl Lake {
             Step::Widen(column) => {
                 let (writer, _) = (self.open)().await;
                 let table_id = self.table_id().await.ok_or("no table")?;
+                let to = match columns.iter().find(|c| &c.name == column).map(|c| c.ty) {
+                    Some(Ty::SmallInt) => "int32",
+                    Some(Ty::Float) => "float64",
+                    _ => "int64",
+                };
                 writer
-                    .promote_column_type(table_id, column, "int64")
+                    .promote_column_type(table_id, column, to)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+            Step::DropColumn(column) => {
+                let (writer, _) = (self.open)().await;
+                let kept: Vec<Col> = columns
+                    .iter()
+                    .filter(|c| &c.name != column)
+                    .cloned()
+                    .collect();
+                let defs = Self::column_defs(&kept);
+                let setup = writer
+                    .begin_write_transaction("main", "t", &defs, WriteMode::Replace)
+                    .map_err(|e| e.to_string())?;
+                writer
+                    .publish_snapshot(
+                        setup.table_id,
+                        "main",
+                        "t",
+                        setup.snapshot_id,
+                        WriteMode::Replace,
+                        setup.base_snapshot_id,
+                        &defs,
+                        &setup.field_ids,
+                    )
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             },
@@ -2082,6 +2136,63 @@ fn describe_rows(rows: &Rows) -> String {
         Ok(rows) => describe(rows),
         Err(error) => format!("error: {error}"),
     }
+}
+
+/// `rows`, read as `rowid, id` and `at_mark`'s columns, as `columns` (the
+/// current columns: `at_mark`'s, some widened, then those added since) read
+/// them: each `FLOAT` widened to `DOUBLE` in `DOUBLE`'s text, and each
+/// column added in `since` holding its default, else NULL.
+#[cfg(feature = "restore")]
+fn as_widened(
+    (mut names, rows): (Vec<String>, Vec<Vec<String>>),
+    at_mark: &[Col],
+    columns: &[Col],
+    since: &[Step],
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let widened_floats: Vec<usize> = at_mark
+        .iter()
+        .enumerate()
+        .filter(|(_, was)| {
+            was.ty == Ty::Float
+                && columns
+                    .iter()
+                    .any(|now| now.name == was.name && now.ty == Ty::Double)
+        })
+        .map(|(index, _)| index + 2)
+        .collect();
+    let added: Vec<(String, String)> = columns
+        .iter()
+        .filter(|now| !at_mark.iter().any(|was| was.name == now.name))
+        .map(|now| {
+            let default = since.iter().find_map(|step| match step {
+                Step::AddColumn(column, default) if column.name == now.name => default.clone(),
+                _ => None,
+            });
+            let cell = match default {
+                None => "NULL".to_string(),
+                Some(text) if now.ty == Ty::Varchar => format!("{text:?}"),
+                Some(text) => text,
+            };
+            (now.name.clone(), cell)
+        })
+        .collect();
+    names.extend(added.iter().map(|(name, _)| name.clone()));
+    let rows = rows
+        .into_iter()
+        .map(|mut row| {
+            for index in &widened_floats {
+                let cell = &mut row[*index];
+                if let Ok(value) = cell.parse::<f32>()
+                    && !value.is_nan()
+                {
+                    *cell = format!("{:?}", f64::from(value));
+                }
+            }
+            row.extend(added.iter().map(|(_, cell)| cell.clone()));
+            row
+        })
+        .collect();
+    (names, rows)
 }
 
 fn describe(rows: &(Vec<String>, Vec<Vec<String>>)) -> String {
@@ -4572,11 +4683,14 @@ impl Run<'_> {
 
     /// Restore this crate's table to a random earlier step's snapshot, after
     /// more writes of its own (inserts, deletes, updates, keyed upserts, a
-    /// replace, maintenance): `rowid, *` at the head must then be the mark's
-    /// exactly, and earlier snapshots must still read what they read. A
-    /// window that changed the table's columns or partition spec is refused
-    /// with `Unsupported`, as is any restore on a backend that stages no row
-    /// mutation. On DuckDB, official reads the head as `AT (VERSION => mark)`.
+    /// replace, maintenance, and column changes): `rowid, *` at the head must
+    /// then be the mark's exactly, in the current columns ([`as_widened`]),
+    /// and earlier snapshots must still read what they read. Columns added
+    /// and widened since the mark are carried across; a window that dropped a
+    /// column live at the mark or changed the partition spec is refused with
+    /// `Unsupported`, as is any restore on a backend that stages no row
+    /// mutation. On DuckDB, official reads the head as its rows at the mark in
+    /// the current columns.
     #[cfg(feature = "restore")]
     async fn check_restore(&mut self) -> Result<(), Mismatch> {
         let steps = self.history.steps.len();
@@ -4597,13 +4711,14 @@ impl Run<'_> {
             step: steps,
             detail: format!("{detail}\n  steps after the history: {window}"),
         };
-        let list = |at: usize| {
+        let list = |columns: &[Col]| {
             std::iter::once("id".to_string())
-                .chain(self.history.columns_at(at).into_iter().map(|c| c.name))
+                .chain(columns.iter().map(|c| c.name.clone()))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let select = |at: usize| format!("SELECT rowid, {} FROM lake.main.t", list(at));
+        let select = |columns: &[Col]| format!("SELECT rowid, {} FROM lake.main.t", list(columns));
+        let at_mark = self.history.columns_at(at);
 
         if !self.lake.kind.mutations() {
             let (ctx, table) = self.lake.table().await;
@@ -4620,7 +4735,7 @@ impl Run<'_> {
         }
 
         // More writes past the history, this crate's only.
-        let extended = self.extend_for_restore();
+        let extended = self.extend_for_restore(&at_mark);
         let mut window = extended.steps[steps..]
             .iter()
             .map(step_source)
@@ -4634,7 +4749,7 @@ impl Run<'_> {
                 ));
             }
         }
-        let columns = self.history.columns_at(steps);
+        let columns = extended.columns_at(extended.steps.len());
         let rows = self.restore_rows(&columns, self.history.steps.len() as i64 + 1000);
         if let Ok(staged) = self.lake.staged_rows(&columns, &rows).await {
             let (ctx, table) = self.lake.table().await;
@@ -4672,7 +4787,35 @@ impl Run<'_> {
             }
         }
 
-        let expected = sorted_rows(self.lake.rows(Some(mark), &select(at)).await);
+        // The column changes since the mark, the history's and the window's.
+        let since = &extended.steps[at..];
+        let dropped = at_mark
+            .iter()
+            .any(|c| !columns.iter().any(|now| now.name == c.name));
+        let respecified = {
+            // The spec changed unless it was unset at the mark and at the head.
+            let partitioned = |steps: &[Step]| {
+                steps.iter().fold(false, |on, step| match step {
+                    Step::Partition(spec) => spec.is_some(),
+                    _ => on,
+                })
+            };
+            since.iter().any(|step| matches!(step, Step::Partition(_)))
+                && (partitioned(&extended.steps[..at]) || partitioned(&extended.steps))
+        };
+        let columns_changed = since.iter().any(|step| {
+            matches!(
+                step,
+                Step::AddColumn(..) | Step::Widen(_) | Step::DropColumn(_)
+            )
+        });
+
+        let mark_rows = sorted_rows(self.lake.rows(Some(mark), &select(&at_mark)).await);
+        let expected = sorted_rows(
+            mark_rows
+                .clone()
+                .map(|rows| as_widened(rows, &at_mark, &columns, since)),
+        );
         if let Err(error) = &expected {
             return Err(failed(&window, format!("reading the mark {mark}: {error}")));
         }
@@ -4686,23 +4829,23 @@ impl Run<'_> {
         let mut history = Vec::with_capacity(kept.len() + 1);
         for (snapshot, step) in &kept {
             history.push(sorted_rows(
-                self.lake.rows(Some(*snapshot), &select(*step)).await,
+                self.lake
+                    .rows(Some(*snapshot), &select(&self.history.columns_at(*step)))
+                    .await,
             ));
         }
-        let before_restore = sorted_rows(self.lake.rows(Some(current), &select(steps)).await);
+        let before_restore = sorted_rows(self.lake.rows(Some(current), &select(&columns)).await);
 
-        let changed = self.history.steps[at..].iter().any(|step| {
-            matches!(
-                step,
-                Step::AddColumn(..) | Step::Widen(_) | Step::Partition(_)
-            )
-        });
         let (ctx, table) = self.lake.table().await;
         let outcome = Box::pin(table.restore_rows_to(&ctx.state(), mark)).await;
         drop((ctx, table));
         match outcome {
-            Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) if changed => {
-                self.ran("restore refused");
+            Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) if dropped || respecified => {
+                self.ran(if dropped {
+                    "restore refused: a dropped column"
+                } else {
+                    "restore refused: a partition-spec change"
+                });
                 return Ok(());
             },
             Err(error) => {
@@ -4712,37 +4855,26 @@ impl Run<'_> {
                 ));
             },
             Ok(result) => {
-                if self.history.steps[at..]
-                    .iter()
-                    .any(|step| matches!(step, Step::AddColumn(..) | Step::Widen(_)))
-                {
+                if dropped {
                     return Err(failed(
                         &window,
-                        format!("a restore across a column change committed: {result:?}"),
+                        format!("a restore across a dropped column committed: {result:?}"),
                     ));
                 }
-                // The spec changed unless it was unset at the mark and at
-                // the head.
-                let partitioned = |steps: &[Step]| {
-                    steps.iter().fold(false, |on, step| match step {
-                        Step::Partition(spec) => spec.is_some(),
-                        _ => on,
-                    })
-                };
-                let respecified = self.history.steps[at..]
-                    .iter()
-                    .any(|step| matches!(step, Step::Partition(_)))
-                    && (partitioned(&self.history.steps[..at]) || partitioned(&self.history.steps));
                 if respecified {
                     return Err(failed(
                         &window,
                         format!("a restore across a partition-spec change committed: {result:?}"),
                     ));
                 }
-                self.ran("restore");
+                self.ran(if columns_changed {
+                    "restore across column changes"
+                } else {
+                    "restore"
+                });
             },
         }
-        let restored = sorted_rows(self.lake.rows(None, &select(steps)).await);
+        let restored = sorted_rows(self.lake.rows(None, &select(&columns)).await);
         if restored != expected {
             return Err(failed(
                 &window,
@@ -4755,7 +4887,11 @@ impl Run<'_> {
             ));
         }
         for ((snapshot, step), before) in kept.iter().zip(&history) {
-            let after = sorted_rows(self.lake.rows(Some(*snapshot), &select(*step)).await);
+            let after = sorted_rows(
+                self.lake
+                    .rows(Some(*snapshot), &select(&self.history.columns_at(*step)))
+                    .await,
+            );
             if &after != before {
                 return Err(failed(
                     &window,
@@ -4768,7 +4904,7 @@ impl Run<'_> {
                 ));
             }
         }
-        let after = sorted_rows(self.lake.rows(Some(current), &select(steps)).await);
+        let after = sorted_rows(self.lake.rows(Some(current), &select(&columns)).await);
         if after != before_restore {
             return Err(failed(
                 &window,
@@ -4781,7 +4917,8 @@ impl Run<'_> {
             ));
         }
 
-        // Official reads this crate's restored head as the mark.
+        // Official reads this crate's restored head as its rows at the mark,
+        // in the current columns.
         if self.lake.kind == Kind::Duckdb
             && let Some(copy) = self.lake.duckdb_copy(&self.dir).await
         {
@@ -4797,25 +4934,27 @@ impl Run<'_> {
             let read = |sql: String| {
                 sorted_rows(Official::rows(&reader, &sql).map(|rows| normalize_cells(rows, &cells)))
             };
-            let at_head = read(format!("SELECT rowid, {} FROM t", list(steps)));
-            let at_mark = read(format!(
+            let at_head = read(format!("SELECT rowid, {} FROM t", list(&columns)));
+            let official_mark = read(format!(
                 "SELECT rowid, {} FROM t AT (VERSION => {mark})",
-                list(steps)
+                list(&at_mark)
             ));
-            if let Err(error) = &at_mark {
+            if let Err(error) = &official_mark {
                 return Err(failed(
                     &window,
                     format!("official reading AT (VERSION => {mark}): {error}"),
                 ));
             }
-            if at_head != at_mark {
+            let at_mark_now =
+                sorted_rows(official_mark.map(|rows| as_widened(rows, &at_mark, &columns, since)));
+            if at_head != at_mark_now {
                 return Err(failed(
                     &window,
                     format!(
                         "official reads the restored head apart from AT (VERSION => {mark}):\n  \
                      head: {}\n  mark: {}",
                         describe_rows(&at_head),
-                        describe_rows(&at_mark)
+                        describe_rows(&at_mark_now)
                     ),
                 ));
             }
@@ -4825,13 +4964,61 @@ impl Run<'_> {
     }
 
     /// The history and a few more steps of this crate's only, to run before
-    /// a restore: inserts, deletes, updates and maintenance.
+    /// a restore: inserts, deletes, updates and maintenance, and now and
+    /// then a column change: a column added (with or without a default) or
+    /// widened, or one of `at_mark`, the mark's columns, dropped.
     #[cfg(feature = "restore")]
-    fn extend_for_restore(&mut self) -> History {
+    fn extend_for_restore(&mut self, at_mark: &[Col]) -> History {
         let mut extended = self.history.clone();
-        let columns = self.history.columns_at(self.history.steps.len());
         let base = self.history.steps.len() as i64 + 3000;
+        let added = extended
+            .steps
+            .iter()
+            .filter(|step| matches!(step, Step::AddColumn(..)))
+            .count();
+        let mut adds = 0;
         for index in 0..1 + self.rng.below(4) {
+            let columns = extended.columns_at(extended.steps.len());
+            if self.rng.chance(30) {
+                let widenable: Vec<String> = columns
+                    .iter()
+                    .filter(|c| c.ty.widened() != c.ty)
+                    .map(|c| c.name.clone())
+                    .collect();
+                let droppable: Vec<String> = at_mark
+                    .iter()
+                    .filter(|c| columns.iter().any(|now| now.name == c.name))
+                    .map(|c| c.name.clone())
+                    .collect();
+                let step = match self.rng.below(10) {
+                    0..=3 if !widenable.is_empty() => {
+                        Step::Widen(self.rng.pick(&widenable).clone())
+                    },
+                    9 if !droppable.is_empty() => {
+                        Step::DropColumn(self.rng.pick(&droppable).clone())
+                    },
+                    _ => {
+                        adds += 1;
+                        let ty = *self.rng.pick(&TYPES);
+                        let default = match ty {
+                            Ty::Int | Ty::BigInt | Ty::SmallInt if self.rng.chance(50) => {
+                                Some("7".to_string())
+                            },
+                            Ty::Varchar if self.rng.chance(50) => Some("dflt".to_string()),
+                            _ => None,
+                        };
+                        Step::AddColumn(
+                            Col {
+                                name: format!("r{}", added + adds),
+                                ty,
+                            },
+                            default,
+                        )
+                    },
+                };
+                extended.steps.push(step);
+                continue;
+            }
             let step = match self.rng.below(7) {
                 0 | 1 => Step::Insert(self.restore_rows(&columns, base + 100 * index as i64)),
                 2 => Step::Delete(Some(Pred::IdLt(self.rng.below(40) as i64))),
@@ -5401,6 +5588,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::Rewrite => "rewrite",
         Step::AddColumn(..) => "add column",
         Step::Widen(_) => "widen",
+        Step::DropColumn(_) => "drop column",
         Step::Limit(_) => "limit",
         Step::Partition(_) => "partition",
         Step::Sort(Some((key, _))) if !is_bare_key(key) => "sort expression",
@@ -5503,7 +5691,7 @@ fn step_names(step: &Step, name: &str) -> bool {
             ..
         } => column == name || pred_names(pred, name),
         Step::Delete(Some(pred)) => pred_names(pred, name),
-        Step::Widen(column) => column == name,
+        Step::Widen(column) | Step::DropColumn(column) => column == name,
         Step::Partition(Some((column, _))) => column == name,
         Step::Sort(Some((key, _))) => key
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -5672,6 +5860,7 @@ fn step_source(step: &Step) -> String {
                 .map_or("None".into(), |d| format!("Some({d:?}.into())"))
         ),
         Step::Widen(c) => format!("Step::Widen({c:?}.into())"),
+        Step::DropColumn(c) => format!("Step::DropColumn({c:?}.into())"),
         Step::Partition(p) => format!(
             "Step::Partition({})",
             p.as_ref().map_or("None".into(), |(c, t)| format!(

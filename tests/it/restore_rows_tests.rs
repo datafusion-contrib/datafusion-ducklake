@@ -6,11 +6,12 @@
 //! per backend (one container, a fresh catalog per scenario). Single-catalog
 //! PostgreSQL refuses. Every restore is checked the same way
 //! ([`restore_and_check`]): `rowid, *` at the head equals `rowid, *` at the
-//! mark, the snapshot before the restore still reads what it read, and the
-//! crate's change feed of each snapshot from the mark through the restore turns
-//! the rows before it into the rows at it. A last test has official DuckLake
-//! read a restored DuckDB catalog, diff its change feed against this crate's,
-//! and go on writing it.
+//! mark (in the current columns, when columns were added or widened since),
+//! the snapshot before the restore still reads what it read, and the crate's
+//! change feed of each snapshot from the mark through the restore turns the
+//! rows before it into the rows at it. The last tests have official DuckLake
+//! read restored DuckDB catalogs, diff a change feed against this crate's, and
+//! go on writing one; and make column changes this crate does not.
 
 #![cfg(feature = "restore")]
 #![cfg(any(feature = "write-sqlite", feature = "write-duckdb"))]
@@ -22,9 +23,10 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use datafusion_ducklake::maintenance::ExpireCriteria;
+use datafusion_ducklake::metadata_writer::ColumnDef;
 use datafusion_ducklake::{
     CatalogReadMemo, DuckLakeCatalog, DuckLakeError, DuckLakeTable, DuckLakeWriteOptions,
-    InlinedFlushPolicy, MergeOptions, MetadataProvider, RestoreResult, RewriteOptions,
+    InlinedFlushPolicy, MergeOptions, MetadataProvider, RestoreResult, RewriteOptions, WriteMode,
 };
 
 #[cfg(feature = "write-duckdb")]
@@ -147,25 +149,47 @@ fn replay(rows: &[String], changes: &[(i64, String, String)]) -> Vec<String> {
 /// snapshot from the mark through the restore turns the rows before it into
 /// the rows at it.
 async fn restore_and_check(lake: &Lake, table: &str, mark: i64) -> RestoreResult {
+    let expected = lake.rows_at(table, Some(mark)).await;
     Box::pin(restore_and_check_with(
         lake,
         table,
         mark,
         DuckLakeWriteOptions::default(),
+        expected,
     ))
     .await
 }
 
-/// [`restore_and_check`] on the table opened through a catalog with `options`.
+/// [`restore_and_check`] of a table whose columns changed since `mark`:
+/// `rowid, *` at the head after the restore must be `expected`, the mark's
+/// rows as the current columns read them.
+async fn restore_and_check_as(
+    lake: &Lake,
+    table: &str,
+    mark: i64,
+    expected: Vec<String>,
+) -> RestoreResult {
+    Box::pin(restore_and_check_with(
+        lake,
+        table,
+        mark,
+        DuckLakeWriteOptions::default(),
+        expected,
+    ))
+    .await
+}
+
+/// [`restore_and_check`] on the table opened through a catalog with `options`,
+/// expecting `expected` at the head after the restore.
 async fn restore_and_check_with(
     lake: &Lake,
     table: &str,
     mark: i64,
     options: DuckLakeWriteOptions,
+    expected: Vec<String>,
 ) -> RestoreResult {
     let before = lake.head();
     let pre = lake.rows(table).await;
-    let expected = lake.rows_at(table, Some(mark)).await;
     let (ctx, handle) = table_with(lake, table, options).await;
     let result = Box::pin(handle.restore_rows_to(&ctx.state(), mark))
         .await
@@ -194,21 +218,27 @@ async fn restore_and_check_with(
         },
         Some(snapshot) => {
             assert_eq!(snapshot, lake.head(), "one snapshot");
-            // Snapshot by snapshot, the feed turns the rows at the mark into
-            // the rows at each later snapshot, the restore's included.
-            let mut rows = expected.clone();
+            // Snapshot by snapshot, the feed turns the rows before each
+            // snapshot from the mark on into the rows at it, the restore's
+            // included. A snapshot that changed the columns changes no row.
+            let table_id = lake.table_id(table);
+            let columns = |at: i64| lake.provider.get_table_structure(table_id, at).unwrap();
+            let mut rows = lake.rows_at(table, Some(mark)).await;
+            let mut previous = mark;
             for at in lake
                 .provider
                 .snapshot_ids_between(mark + 1, snapshot)
                 .unwrap()
             {
                 let feed = changes(lake, table, at, at).await;
-                rows = replay(&rows, &feed);
-                assert_eq!(
-                    rows,
-                    lake.rows_at(table, Some(at)).await,
-                    "the feed of {at}"
-                );
+                let read = lake.rows_at(table, Some(at)).await;
+                if columns(previous) == columns(at) {
+                    assert_eq!(replay(&rows, &feed), read, "the feed of {at}");
+                } else {
+                    assert!(feed.is_empty(), "the column change {at} changes rows");
+                }
+                rows = read;
+                previous = at;
             }
         },
     }
@@ -633,7 +663,8 @@ pub(crate) async fn restores_into_several_files(make: MakeLake) {
     let mut options = DuckLakeWriteOptions::default();
     options.target_file_size = Some(4096);
     options.max_row_group_rows = Some(64);
-    let result = restore_and_check_with(&lake, "t", mark, options).await;
+    let expected = lake.rows_at("t", Some(mark)).await;
+    let result = restore_and_check_with(&lake, "t", mark, options, expected).await;
     assert_eq!(
         counts(&result),
         (
@@ -702,8 +733,8 @@ pub(crate) async fn restores_across_flush_and_compaction(make: MakeLake) {
 }
 
 /// Refusals: a snapshot not before the table's, one before the table
-/// existed, a read-only table, a column or partition-spec change since the
-/// mark, an expired mark, and a commit since the table was read. None of them
+/// existed, a read-only table, a column dropped or a partition-spec change
+/// since the mark, an expired mark, and a commit since the table was read. None of them
 /// commits anything.
 pub(crate) async fn refusals(make: MakeLake) {
     let lake = make(Some(5)).await;
@@ -755,26 +786,8 @@ async fn refusals_of_reads(lake: &Lake) {
     assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
 }
 
-/// Column changes, a partition-spec change and an expired mark.
+/// A dropped column, a partition-spec change and an expired mark.
 async fn refusals_of_changes(lake: &Lake) {
-    // A column change since the mark.
-    create(lake, "c").await;
-    lake.append_parquet("c", &batch(1..=5, "a")).await;
-    let mark_c = lake.head();
-    create_with(
-        lake,
-        "c",
-        &[("id", DataType::Int64), ("v", DataType::Utf8), ("w", DataType::Int64)],
-    )
-    .unwrap();
-    let head = lake.head();
-    let error = restore(lake, "c", mark_c).await.unwrap_err();
-    assert!(
-        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
-        "{error}"
-    );
-    assert_eq!(lake.head(), head);
-
     // A column dropped since the mark.
     create(lake, "dr").await;
     lake.append_parquet("dr", &batch(1..=5, "a")).await;
@@ -782,40 +795,6 @@ async fn refusals_of_changes(lake: &Lake) {
     create_with(lake, "dr", &[("id", DataType::Int64)]).unwrap();
     let head = lake.head();
     let error = restore(lake, "dr", mark_d).await.unwrap_err();
-    assert!(
-        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
-        "{error}"
-    );
-    assert_eq!(lake.head(), head);
-
-    // A column widened since the mark.
-    create_with(
-        lake,
-        "wi",
-        &[("id", DataType::Int64), ("n", DataType::Int32)],
-    )
-    .unwrap();
-    lake.append_parquet(
-        "wi",
-        &RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, true),
-                Field::new("n", DataType::Int32, true),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(arrow::array::Int32Array::from(vec![7, 8])),
-            ],
-        )
-        .unwrap(),
-    )
-    .await;
-    let mark_w = lake.head();
-    lake.writer
-        .promote_column_type(lake.table_id("wi"), "n", "int64")
-        .unwrap();
-    let head = lake.head();
-    let error = restore(lake, "wi", mark_w).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
         "{error}"
@@ -1170,6 +1149,446 @@ pub(crate) async fn restores_typed_columns(make: MakeLake) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Column changes since the mark
+// ---------------------------------------------------------------------------
+
+/// Add `columns` (in full: the table's current columns first) to
+/// `main.<table>`, as an append that brings new columns adds them.
+fn evolve(lake: &Lake, table: &str, columns: &[ColumnDef]) {
+    let setup = lake
+        .writer
+        .begin_write_transaction("main", table, columns, WriteMode::Append)
+        .unwrap();
+    lake.writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            table,
+            setup.snapshot_id,
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            columns,
+            &setup.field_ids,
+        )
+        .unwrap();
+}
+
+fn column(name: &str, data_type: &DataType) -> ColumnDef {
+    ColumnDef::from_arrow(name, data_type, true).unwrap()
+}
+
+fn column_with_default(name: &str, data_type: &DataType, default: &str) -> ColumnDef {
+    column(name, data_type).with_default(default).unwrap()
+}
+
+/// The catalog type of each of `main.<table>`'s columns at the head.
+fn column_types(lake: &Lake, table: &str) -> Vec<(String, String)> {
+    lake.provider
+        .get_table_structure(lake.table_id(table), lake.head())
+        .unwrap()
+        .into_iter()
+        .map(|column| (column.column_name, column.column_type))
+        .collect()
+}
+
+/// Each line of `rows` with `cells` appended: rows as columns added since
+/// read them.
+fn with_cells(rows: &[String], cells: &str) -> Vec<String> {
+    rows.iter().map(|row| format!("{row},{cells}")).collect()
+}
+
+/// The table `(id, i8 TINYINT, i16 SMALLINT, i32 INTEGER, u8 UTINYINT,
+/// u32 UINTEGER, f FLOAT)`, before ([`narrow`]) and after ([`wide`]) its
+/// columns are widened by [`WIDENINGS`].
+fn narrow_columns() -> Vec<(&'static str, DataType)> {
+    vec![
+        ("id", DataType::Int64),
+        ("i8", DataType::Int8),
+        ("i16", DataType::Int16),
+        ("i32", DataType::Int32),
+        ("u8", DataType::UInt8),
+        ("u32", DataType::UInt32),
+        ("f", DataType::Float32),
+    ]
+}
+
+/// Lossless widenings the crate promotes a column by, one of each kind.
+/// `UINTEGER` to `UBIGINT` is widened on DuckDB alone
+/// ([`official_reads_a_restore_across_column_changes`]): SQLite reads an
+/// inlined `UINTEGER` written before it as text, and fails.
+const WIDENINGS: [(&str, &str); 5] =
+    [("i8", "int64"), ("i16", "int32"), ("i32", "int64"), ("u8", "uint16"), ("f", "float64")];
+
+/// Rows of [`narrow_columns`] for `ids` (at most 40), each value NULL on a
+/// multiple of 7, the integers near their type's bounds and the floats exact
+/// in binary.
+fn narrow(ids: impl IntoIterator<Item = i64>) -> RecordBatch {
+    use arrow::array::{Float32Array, Int8Array, Int16Array, Int32Array, UInt8Array, UInt32Array};
+    let ids: Vec<i64> = ids.into_iter().collect();
+    let value = |id: &i64| (id % 7 != 0).then_some(*id);
+    let schema = Arc::new(Schema::new(
+        narrow_columns()
+            .into_iter()
+            .map(|(name, data_type)| Field::new(name, data_type, true))
+            .collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int8Array::from_iter(
+                ids.iter()
+                    .map(|id| value(id).map(|id| (id * 3 - 127) as i8)),
+            )),
+            Arc::new(Int16Array::from_iter(
+                ids.iter()
+                    .map(|id| value(id).map(|id| (id * 800 - 32_000) as i16)),
+            )),
+            Arc::new(Int32Array::from_iter(ids.iter().map(|id| {
+                value(id).map(|id| (id * 100_000_000 - 2_000_000_000) as i32)
+            }))),
+            Arc::new(UInt8Array::from_iter(
+                ids.iter().map(|id| value(id).map(|id| (255 - id) as u8)),
+            )),
+            Arc::new(UInt32Array::from_iter(
+                ids.iter()
+                    .map(|id| value(id).map(|id| 4_000_000_000 + id as u32)),
+            )),
+            Arc::new(Float32Array::from_iter(
+                ids.iter()
+                    .map(|id| value(id).map(|id| id as f32 * 1.25 - 10.0)),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// [`narrow`]'s rows in the widened types, `i32` past `INTEGER`'s range.
+fn wide(ids: impl IntoIterator<Item = i64>) -> RecordBatch {
+    use arrow::array::{Float64Array, Int32Array, UInt16Array, UInt32Array};
+    let ids: Vec<i64> = ids.into_iter().collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("i8", DataType::Int64, true),
+        Field::new("i16", DataType::Int32, true),
+        Field::new("i32", DataType::Int64, true),
+        Field::new("u8", DataType::UInt16, true),
+        Field::new("u32", DataType::UInt32, true),
+        Field::new("f", DataType::Float64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from_iter(ids.iter().map(|id| Some(-id * 1000)))),
+            Arc::new(Int32Array::from_iter(
+                ids.iter().map(|id| Some(*id as i32 * 100_000)),
+            )),
+            Arc::new(Int64Array::from_iter(
+                ids.iter().map(|id| Some(id * 10_000_000_000)),
+            )),
+            Arc::new(UInt16Array::from_iter(
+                ids.iter().map(|id| Some(60_000 + *id as u16)),
+            )),
+            Arc::new(UInt32Array::from_iter(
+                ids.iter().map(|id| Some(u32::MAX - *id as u32)),
+            )),
+            Arc::new(Float64Array::from_iter(
+                ids.iter().map(|id| Some(*id as f64 / 3.0)),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// Every lossless widening since the mark, of Parquet and inlined rows: the
+/// rows are restored in the widened types, in Parquet when many and into the
+/// current inlined table when few, each with its row id; the columns stay
+/// widened.
+pub(crate) async fn restores_across_widening(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create_with(&lake, "w", &narrow_columns()).unwrap();
+    lake.append_parquet("w", &narrow(1..=20)).await;
+    lake.append("w", &narrow(21..=23)).await;
+    let inlines = lake.inlined_rows("w") > 0;
+    let mark = lake.head();
+    // Some rows deleted before the widening, some after.
+    lake.sql("DELETE FROM lake.main.w WHERE id IN (1, 2, 21)")
+        .await
+        .unwrap();
+    // The mark's rows read the same in the widened types: integers
+    // unchanged, the floats exact in binary.
+    let expected = lake.rows_at("w", Some(mark)).await;
+    for (column, to) in WIDENINGS {
+        lake.writer
+            .promote_column_type(lake.table_id("w"), column, to)
+            .unwrap();
+    }
+    let widened = column_types(&lake, "w");
+    lake.sql("DELETE FROM lake.main.w WHERE id <= 12 OR id = 22")
+        .await
+        .unwrap();
+    lake.sql("UPDATE lake.main.w SET i32 = 5000000000, f = 0.1 WHERE id >= 15")
+        .await
+        .unwrap();
+    lake.append_parquet("w", &wide(30..=39)).await;
+    lake.append("w", &wide([40])).await;
+    let result = restore_and_check_as(&lake, "w", mark, expected).await;
+    assert!(result.rows_restored > 5, "{result:?}");
+    assert_eq!(column_types(&lake, "w"), widened, "the widening stays");
+
+    // A few rows across another widening: inlined, into the inlined table
+    // the widening made current.
+    let mark = lake.head();
+    let expected = lake.rows("w").await;
+    lake.writer
+        .promote_column_type(lake.table_id("w"), "i16", "int64")
+        .unwrap();
+    lake.sql("DELETE FROM lake.main.w WHERE id IN (13, 16, 23)")
+        .await
+        .unwrap();
+    let result = restore_and_check_as(&lake, "w", mark, expected).await;
+    assert_eq!(counts(&result), (0, 3, 0));
+    if inlines {
+        assert_restored_into_current_inlined_table(&lake, "w", &[13, 16, 23]);
+    }
+}
+
+/// The rows of `main.<table>` with `ids` live in its newest inlined table.
+fn assert_restored_into_current_inlined_table(lake: &Lake, table: &str, ids: &[i64]) {
+    let table_id = lake.table_id(table);
+    let head = lake.head();
+    let columns = lake.provider.get_table_structure(table_id, head).unwrap();
+    let data = lake
+        .provider
+        .get_inlined_data_with_row_ids(table_id, head, &columns)
+        .unwrap();
+    let version = |name: &str| -> i64 { name.rsplit('_').next().unwrap().parse().unwrap() };
+    let newest = data
+        .iter()
+        .map(|data| version(&data.table_name))
+        .max()
+        .unwrap();
+    let id_column =
+        |data: &datafusion_ducklake::metadata_provider::DuckLakeInlinedData| -> Vec<i64> {
+            data.batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+    for id in ids {
+        let holder = data
+            .iter()
+            .find(|data| id_column(data).contains(id))
+            .unwrap_or_else(|| panic!("row {id} is inlined"));
+        assert_eq!(version(&holder.table_name), newest, "row {id}");
+    }
+}
+
+/// `(id, v, n, s, d, k)`: [`batch`]'s rows with the columns
+/// [`restores_across_added_columns`] adds.
+fn evolved(ids: impl IntoIterator<Item = i64>, prefix: &str) -> RecordBatch {
+    let base = batch(ids, prefix);
+    let rows = base.num_rows();
+    let ids = base
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("d", DataType::Int64, true),
+            Field::new("k", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::clone(base.column(0)),
+            Arc::clone(base.column(1)),
+            Arc::new(arrow::array::Int32Array::from(vec![Some(1); rows])),
+            Arc::new(StringArray::from(vec![Some("x"); rows])),
+            Arc::new(Int64Array::from_iter(ids.iter().map(|id| id.map(|id| -id)))),
+            Arc::new(Int64Array::from(vec![Some(i64::MAX); rows])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Columns added since the mark, with and without an initial default, one
+/// of them then widened: the restored rows read those columns as the rows
+/// did before they were deleted (the default, else NULL), in Parquet when
+/// many and inlined when few; the columns stay.
+pub(crate) async fn restores_across_added_columns(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create(&lake, "a").await;
+    lake.append_parquet("a", &batch(1..=20, "p")).await;
+    lake.append("a", &batch(100..=102, "i")).await;
+    let inlines = lake.inlined_rows("a") > 0;
+    let mark = lake.head();
+    let expected = with_cells(&lake.rows_at("a", Some(mark)).await, "NULL,dflt,7,-3");
+    // Some rows deleted before the columns are added, some after.
+    lake.sql("DELETE FROM lake.main.a WHERE id IN (1, 2, 100)")
+        .await
+        .unwrap();
+    let mut columns = vec![column("id", &DataType::Int64), column("v", &DataType::Utf8)];
+    columns.push(column("n", &DataType::Int32));
+    evolve(&lake, "a", &columns);
+    columns.push(column_with_default("s", &DataType::Utf8, "dflt"));
+    columns.push(column_with_default("d", &DataType::Int64, "7"));
+    columns.push(column_with_default("k", &DataType::Int32, "-3"));
+    evolve(&lake, "a", &columns);
+    lake.writer
+        .promote_column_type(lake.table_id("a"), "k", "int64")
+        .unwrap();
+    columns.pop();
+    columns.push(column_with_default("k", &DataType::Int64, "-3"));
+    let changed = column_types(&lake, "a");
+    lake.sql("DELETE FROM lake.main.a WHERE id <= 12 OR id = 101")
+        .await
+        .unwrap();
+    lake.sql("UPDATE lake.main.a SET v = 'u', n = 5, s = 'set' WHERE id >= 15")
+        .await
+        .unwrap();
+    lake.append_parquet("a", &evolved(30..=39, "b")).await;
+    lake.append("a", &evolved([40], "j")).await;
+    let result = restore_and_check_as(&lake, "a", mark, expected).await;
+    assert!(result.rows_restored > 5, "{result:?}");
+    assert_eq!(column_types(&lake, "a"), changed, "the columns stay");
+
+    // A few rows: inlined, into the inlined table of the current columns.
+    let mark = lake.head();
+    let expected = with_cells(&lake.rows("a").await, "NULL");
+    columns.push(column("e", &DataType::Utf8));
+    evolve(&lake, "a", &columns);
+    lake.sql("DELETE FROM lake.main.a WHERE id IN (13, 14, 102)")
+        .await
+        .unwrap();
+    let ids = [13, 14, 102];
+    let result = restore_and_check_as(&lake, "a", mark, expected).await;
+    assert_eq!(counts(&result), (0, 3, 0));
+    if inlines {
+        assert_restored_into_current_inlined_table(&lake, "a", &ids);
+    }
+}
+
+/// Columns widened and added since the mark of partitioned tables, one
+/// partitioned by the widened column: the restored rows land in their
+/// partitions.
+pub(crate) async fn restores_partitioned_across_column_changes(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create_with(
+        &lake,
+        "pc",
+        &[("region", DataType::Utf8), ("id", DataType::Int64), ("n", DataType::Int32)],
+    )
+    .unwrap();
+    lake.sql("ALTER TABLE lake.main.pc SET PARTITIONED BY (n)")
+        .await
+        .unwrap();
+    use arrow::array::Array as _;
+    let rows = |ids: std::ops::RangeInclusive<i64>, wide: bool| {
+        let ids: Vec<i64> = ids.collect();
+        let n: Arc<dyn arrow::array::Array> = if wide {
+            Arc::new(Int64Array::from_iter(ids.iter().map(|id| Some(id % 3))))
+        } else {
+            Arc::new(arrow::array::Int32Array::from_iter(
+                ids.iter().map(|id| Some((id % 3) as i32)),
+            ))
+        };
+        let mut fields = vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("n", n.data_type().clone(), true),
+        ];
+        let mut arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
+            Arc::new(StringArray::from_iter(ids.iter().map(|id| {
+                Some(if id % 2 == 0 {
+                    "eu"
+                } else {
+                    "us"
+                })
+            }))),
+            Arc::new(Int64Array::from(ids.clone())),
+            n,
+        ];
+        if wide {
+            fields.push(Field::new("added", DataType::Utf8, true));
+            arrays.push(Arc::new(StringArray::from(vec![Some("new"); ids.len()])));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+    };
+    lake.append_parquet("pc", &rows(1..=24, false)).await;
+    lake.append("pc", &rows(100..=101, false)).await;
+    let mark = lake.head();
+    let expected = with_cells(&lake.rows_at("pc", Some(mark)).await, "old");
+    lake.writer
+        .promote_column_type(lake.table_id("pc"), "n", "int64")
+        .unwrap();
+    evolve(
+        &lake,
+        "pc",
+        &[
+            column("region", &DataType::Utf8),
+            column("id", &DataType::Int64),
+            column("n", &DataType::Int64),
+            column_with_default("added", &DataType::Utf8, "old"),
+        ],
+    );
+    lake.sql("DELETE FROM lake.main.pc WHERE id <= 18 OR id = 100")
+        .await
+        .unwrap();
+    lake.append_parquet("pc", &rows(30..=35, true)).await;
+    let result = restore_and_check_as(&lake, "pc", mark, expected).await;
+    assert!(result.rows_restored > 5, "{result:?}");
+    for path in file_paths(&lake, "pc") {
+        assert!(path.contains("n="), "{path} is in a partition");
+    }
+
+    // Partitioned by a column that is not widened.
+    let lake = make(Some(5)).await;
+    create_with(
+        &lake,
+        "pr",
+        &[("region", DataType::Utf8), ("id", DataType::Int64), ("n", DataType::Int32)],
+    )
+    .unwrap();
+    lake.sql("ALTER TABLE lake.main.pr SET PARTITIONED BY (region)")
+        .await
+        .unwrap();
+    lake.append_parquet("pr", &rows(1..=24, false)).await;
+    let mark = lake.head();
+    let expected = with_cells(&lake.rows_at("pr", Some(mark)).await, "old");
+    lake.writer
+        .promote_column_type(lake.table_id("pr"), "n", "int64")
+        .unwrap();
+    evolve(
+        &lake,
+        "pr",
+        &[
+            column("region", &DataType::Utf8),
+            column("id", &DataType::Int64),
+            column("n", &DataType::Int64),
+            column_with_default("added", &DataType::Utf8, "old"),
+        ],
+    );
+    lake.sql("DELETE FROM lake.main.pr WHERE id % 3 <> 0")
+        .await
+        .unwrap();
+    lake.append_parquet("pr", &rows(30..=35, true)).await;
+    let result = restore_and_check_as(&lake, "pr", mark, expected).await;
+    assert!(result.rows_restored > 5, "{result:?}");
+    for path in file_paths(&lake, "pr") {
+        assert!(path.contains("region="), "{path} is in a partition");
+    }
+}
+
 /// Snapshots between the mark and the head expired, and their files cleaned
 /// up: the rows at the mark are still restored whole.
 pub(crate) async fn restores_across_expired_snapshots(make: MakeLake) {
@@ -1254,6 +1673,12 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
     Box::pin(refusals(Arc::clone(&make))).await;
     Box::pin(restores_through_a_catalog_read_memo(Arc::clone(&make))).await;
     Box::pin(restores_typed_columns(Arc::clone(&make))).await;
+    Box::pin(restores_across_widening(Arc::clone(&make))).await;
+    Box::pin(restores_across_added_columns(Arc::clone(&make))).await;
+    Box::pin(restores_partitioned_across_column_changes(Arc::clone(
+        &make,
+    )))
+    .await;
     Box::pin(restores_across_expired_snapshots(Arc::clone(&make))).await;
     Box::pin(nothing_to_undo(make)).await;
 }
@@ -1292,6 +1717,9 @@ per_backend!(
     refusals,
     restores_through_a_catalog_read_memo,
     restores_typed_columns,
+    restores_across_widening,
+    restores_across_added_columns,
+    restores_partitioned_across_column_changes,
     restores_across_expired_snapshots,
     nothing_to_undo,
 );
@@ -1451,50 +1879,6 @@ async fn postgres_single_catalog_refuses() {
     let error = restore(&lake, "t", mark).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("stages row mutations")),
-        "{error}"
-    );
-    assert_eq!(lake.head(), head);
-}
-
-/// A column renamed since the mark (by official DuckLake, as this crate has
-/// no rename) refuses the restore.
-#[cfg(feature = "write-duckdb")]
-#[tokio::test(flavor = "multi_thread")]
-async fn rename_since_the_mark_refuses() {
-    use crate::inlined_mutation_differential_tests as differential;
-    let lake = duckdb()(Some(5)).await;
-    create(&lake, "t").await;
-    lake.append_parquet("t", &batch(1..=10, "a")).await;
-    let mark = lake.head();
-    let Lake {
-        writer,
-        provider,
-        data,
-        _dir: dir,
-        ..
-    } = lake;
-    drop((writer, provider));
-    let path = dir.path().join("lake.ducklake");
-    differential::official(
-        &differential::Metadata::Duckdb(path.clone()),
-        &data,
-        &["ALTER TABLE lake.main.t RENAME COLUMN v TO w".to_string()],
-    );
-    let writer =
-        datafusion_ducklake::DuckdbMetadataWriter::new(path.display().to_string()).unwrap();
-    let provider = writer.metadata_provider();
-    let lake = Lake {
-        writer: Arc::new(writer),
-        provider: Arc::new(provider),
-        data,
-        inlines: true,
-        _dir: dir,
-    };
-    let head = lake.head();
-    assert!(head > mark);
-    let error = restore(&lake, "t", mark).await.unwrap_err();
-    assert!(
-        matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
         "{error}"
     );
     assert_eq!(lake.head(), head);
@@ -1734,4 +2118,198 @@ async fn official_reads_a_restore() {
         .await
         .unwrap();
     assert_eq!(differential::arrow_lines(&batches), current);
+}
+
+/// Column changes this crate does not make, made by official DuckLake since
+/// the mark: a rename, a change of type official allows that is not one of
+/// the crate's lossless widenings (`INTEGER` to `DOUBLE`), a field added to
+/// a struct, and `SET NOT NULL` each refuse the restore; official's own
+/// widening (`INTEGER` to `BIGINT`) does not.
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn official_column_changes_since_the_mark() {
+    use crate::inlined_mutation_differential_tests as differential;
+    let lake = duckdb()(Some(5)).await;
+    let struct_type = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
+    for table in ["rn", "ty", "st", "nn", "ok"] {
+        create_with(
+            &lake,
+            table,
+            &[
+                ("id", DataType::Int64),
+                ("v", DataType::Utf8),
+                ("n", DataType::Int32),
+                ("s", struct_type.clone()),
+            ],
+        )
+        .unwrap();
+        lake.sql(&format!(
+            "INSERT INTO lake.main.{table} (id, v, n) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)"
+        ))
+        .await
+        .unwrap();
+    }
+    let mark = lake.head();
+    let Lake {
+        writer,
+        provider,
+        data,
+        _dir: dir,
+        ..
+    } = lake;
+    drop((writer, provider));
+    let path = dir.path().join("lake.ducklake");
+    differential::official(
+        &differential::Metadata::Duckdb(path.clone()),
+        &data,
+        &[
+            "ALTER TABLE lake.main.rn RENAME COLUMN v TO w".to_string(),
+            "ALTER TABLE lake.main.ty ALTER COLUMN n TYPE DOUBLE".to_string(),
+            "ALTER TABLE lake.main.st ADD COLUMN s.b VARCHAR".to_string(),
+            "ALTER TABLE lake.main.nn ALTER COLUMN v SET NOT NULL".to_string(),
+            "ALTER TABLE lake.main.ok ALTER COLUMN n TYPE BIGINT".to_string(),
+            "DELETE FROM lake.main.ok WHERE id = 2".to_string(),
+        ],
+    );
+    let writer =
+        datafusion_ducklake::DuckdbMetadataWriter::new(path.display().to_string()).unwrap();
+    let provider = writer.metadata_provider();
+    let lake = Lake {
+        writer: Arc::new(writer),
+        provider: Arc::new(provider),
+        data,
+        inlines: true,
+        _dir: dir,
+    };
+    let head = lake.head();
+    assert!(head > mark);
+    for (table, change) in [
+        ("rn", "was renamed"),
+        ("ty", "changed type"),
+        ("st", "changed type"),
+        ("nn", "became NOT NULL"),
+    ] {
+        let error = restore(&lake, table, mark).await.unwrap_err();
+        assert!(
+            matches!(&error, DuckLakeError::Unsupported(m)
+                if m.contains("columns changed") && m.contains(change)),
+            "{table}: {error}"
+        );
+        assert_eq!(lake.head(), head);
+    }
+    let expected = lake.rows_at("ok", Some(mark)).await;
+    restore_and_check_as(&lake, "ok", mark, expected).await;
+}
+
+/// A history of column changes and row changes written by this crate on a
+/// DuckDB catalog and restored by it: official DuckLake reads the restored
+/// head as it reads the snapshot after the column changes, before any row
+/// changed (the mark's rows in the current columns, added columns as it
+/// reads them), and the mark's columns as its rows at the mark cast to the
+/// widened types. Both a restore to Parquet and one of few rows, inlined.
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn official_reads_a_restore_across_column_changes() {
+    use crate::inlined_mutation_differential_tests as differential;
+
+    let lake = duckdb()(Some(5)).await;
+    let widened = || {
+        vec![
+            column("id", &DataType::Int64),
+            column("i8", &DataType::Int64),
+            column("i16", &DataType::Int32),
+            column("i32", &DataType::Int64),
+            column("u8", &DataType::UInt16),
+            column("u32", &DataType::UInt64),
+            column("f", &DataType::Float64),
+        ]
+    };
+    let mut marks = Vec::new();
+    for (table, deleted) in [("w", "id <= 12 OR id = 22"), ("s", "id IN (3, 21)")] {
+        create_with(&lake, table, &narrow_columns()).unwrap();
+        lake.append_parquet(table, &narrow(1..=20)).await;
+        lake.append(table, &narrow(21..=23)).await;
+        let mark = lake.head();
+        let table_id = lake.table_id(table);
+        for (column, to) in WIDENINGS.into_iter().chain([("u32", "uint64")]) {
+            lake.writer
+                .promote_column_type(table_id, column, to)
+                .unwrap();
+        }
+        let mut columns = widened();
+        columns.push(column_with_default("a", &DataType::Int32, "7"));
+        columns.push(column("b", &DataType::Utf8));
+        columns.push(column_with_default("c", &DataType::Int32, "-3"));
+        evolve(&lake, table, &columns);
+        lake.writer
+            .promote_column_type(table_id, "c", "int64")
+            .unwrap();
+        let evolved_at = lake.head();
+        let expected = lake.rows(table).await;
+        assert_eq!(
+            expected,
+            with_cells(&lake.rows_at(table, Some(mark)).await, "7,NULL,-3"),
+        );
+        lake.sql(&format!("DELETE FROM lake.main.{table} WHERE {deleted}"))
+            .await
+            .unwrap();
+        lake.sql(&format!(
+            "UPDATE lake.main.{table} SET i32 = 5000000000, b = 'u', a = 1 WHERE id = 15"
+        ))
+        .await
+        .unwrap();
+        let result = restore_and_check_as(&lake, table, mark, expected.clone()).await;
+        marks.push((table, mark, evolved_at, expected, result));
+    }
+    assert!(marks[0].4.rows_restored > 5, "{:?}", marks[0].4);
+    assert_eq!(counts(&marks[1].4), (1, 3, 0), "{:?}", marks[1].4);
+
+    let Lake {
+        writer,
+        provider,
+        data,
+        _dir: dir,
+        ..
+    } = lake;
+    drop((writer, provider));
+    let metadata = differential::Metadata::Duckdb(dir.path().join("lake.ducklake"));
+    let connection = differential::duckdb_connection();
+    differential::attach_lake(&connection, &metadata, &data, true);
+    for (table, mark, evolved_at, expected, _) in &marks {
+        let all = "rowid, id, i8, i16, i32, u8, u32, f, a, b, c";
+        let head = differential::query_lines(
+            &connection,
+            &format!("SELECT {all} FROM lake.{table} ORDER BY rowid"),
+        );
+        assert_eq!(
+            &head, expected,
+            "{table}: official reads the head as this crate"
+        );
+        assert_eq!(
+            head,
+            differential::query_lines(
+                &connection,
+                &format!(
+                    "SELECT {all} FROM lake.{table} AT (VERSION => {evolved_at}) ORDER BY rowid"
+                ),
+            ),
+            "{table}: the head as the snapshot after the column changes"
+        );
+        let widened = "rowid, id, i8, i16, i32, u8, u32, f";
+        assert_eq!(
+            differential::query_lines(
+                &connection,
+                &format!("SELECT {widened} FROM lake.{table} ORDER BY rowid"),
+            ),
+            differential::query_lines(
+                &connection,
+                &format!(
+                    "SELECT rowid, id, i8::BIGINT, i16::INTEGER, i32::BIGINT, u8::USMALLINT, \
+                     u32::UBIGINT, f::DOUBLE FROM lake.{table} AT (VERSION => {mark}) \
+                     ORDER BY rowid"
+                ),
+            ),
+            "{table}: the mark's rows cast to the widened types"
+        );
+    }
 }
