@@ -1462,3 +1462,209 @@ async fn caller_named_files_are_not_recorded() {
     assert_eq!(verified.files_recorded, 1, "{verified:?}");
     assert_all_queries_correct(&env.ctx(4).await).await;
 }
+
+/// Every file scan in `plan` that declares an output ordering, as
+/// `(preserve_order, file groups)`.
+fn ordered_scans(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    out: &mut Vec<(bool, usize)>,
+) {
+    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    if let Some(config) = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+        .filter(|config| !config.output_ordering.is_empty())
+    {
+        out.push((config.preserve_order, config.file_groups.len()));
+    }
+    for child in plan.children() {
+        ordered_scans(child, out);
+    }
+}
+
+/// `sql`'s ordered scans: at least one, each with several file groups (so the
+/// merge above trusts several per-partition orders), and each keeping its
+/// files in order. A scan that declares an ordering without `preserve_order`
+/// shares one work queue between its partitions (DataFusion's file-stream
+/// work stealing, on by default), so a partition can read another chain's
+/// file after its own and its declared order is false.
+async fn assert_ordered_scans_keep_file_order(ctx: &SessionContext, sql: &str) {
+    let physical = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let mut scans = Vec::new();
+    ordered_scans(&physical, &mut scans);
+    let shown = displayable(physical.as_ref()).indent(true).to_string();
+    assert!(!scans.is_empty(), "no ordered scan\n{shown}");
+    for (preserve_order, groups) in scans {
+        assert!(groups > 1, "want several chains\n{shown}");
+        assert!(preserve_order, "ordered scan must keep file order\n{shown}");
+    }
+}
+
+/// Disjoint files over 4 partitions make 4 chains of 4 files each. With no
+/// `LIMIT` nothing pushes a fetch into the ordered scan, so only the ordered
+/// plan itself can keep each partition on its own chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_without_limit_keeps_chains_in_order() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&env, 16, 2_000).await;
+    let ctx = env.ctx(4).await;
+    let queries = [
+        "SELECT ts, level, id FROM ducklake.main.logs ORDER BY ts DESC",
+        "SELECT id, ts FROM ducklake.main.logs ORDER BY ts DESC NULLS FIRST",
+    ];
+    for sql in queries {
+        let p = plan(&ctx, sql).await;
+        assert!(!sorts(&p), "the ordered plan serves the sort\n{p}");
+        // Work stealing is timing-dependent: run it enough times to see it.
+        for _ in 0..10 {
+            assert_matches_reference(&ctx, sql).await;
+        }
+        assert_ordered_scans_keep_file_order(&ctx, sql).await;
+    }
+}
+
+/// A pass-through wrapper like RuntimeDB's `SchemaCoerceExec`: it forwards a
+/// sort request to its child but not a fetch, so a `LIMIT` above it never
+/// reaches the ordered scan (whose builder would otherwise turn on
+/// `preserve_order` as a side effect).
+mod fetch_blocker {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::catalog::{Session, TableProvider};
+    use datafusion::common::Result;
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::TableType;
+    use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+    };
+
+    #[derive(Debug)]
+    pub struct BlockFetchExec(pub Arc<dyn ExecutionPlan>);
+
+    impl DisplayAs for BlockFetchExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "BlockFetchExec")
+        }
+    }
+
+    impl ExecutionPlan for BlockFetchExec {
+        fn name(&self) -> &str {
+            "BlockFetchExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.0.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.0]
+        }
+        fn maintains_input_order(&self) -> Vec<bool> {
+            vec![true]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self(children.swap_remove(0))))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.0.execute(partition, context)
+        }
+        fn try_pushdown_sort(
+            &self,
+            order: &[PhysicalSortExpr],
+        ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+            self.0
+                .try_pushdown_sort(order)?
+                .try_map(|inner| Ok(Arc::new(Self(inner)) as Arc<dyn ExecutionPlan>))
+        }
+    }
+
+    /// `inner`, with every scan wrapped in [`BlockFetchExec`].
+    #[derive(Debug)]
+    pub struct BlockFetchTable(pub Arc<dyn TableProvider>);
+
+    #[async_trait]
+    impl TableProvider for BlockFetchTable {
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+        fn table_type(&self) -> TableType {
+            self.0.table_type()
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>> {
+            self.0.supports_filters_pushdown(filters)
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            let inner = self.0.scan(state, projection, filters, limit).await?;
+            Ok(Arc::new(BlockFetchExec(inner)))
+        }
+    }
+}
+
+/// `ORDER BY ... LIMIT` through a wrapper that forwards the sort but not the
+/// fetch: the ordered scan must keep its chains in order on its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_limit_through_a_fetch_blocking_wrapper_keeps_chains_in_order() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&env, 16, 2_000).await;
+    let ctx = env.ctx(4).await;
+    let table = ctx.table_provider("ducklake.main.logs").await.unwrap();
+    ctx.register_table("wrapped", Arc::new(fetch_blocker::BlockFetchTable(table)))
+        .unwrap();
+    for sql in [
+        "SELECT ts, level, id FROM wrapped ORDER BY ts DESC LIMIT 5000",
+        "SELECT ts, level, id FROM wrapped ORDER BY ts DESC",
+    ] {
+        let p = plan(&ctx, sql).await;
+        assert!(
+            p.contains("BlockFetchExec") && !sorts(&p),
+            "the ordered plan serves the sort under the wrapper\n{p}"
+        );
+        let reference = sql.replace("wrapped", "ducklake.main.logs");
+        let got = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let want = ctx.sql(&reference).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&got)
+                .unwrap()
+                .to_string(),
+            arrow::util::pretty::pretty_format_batches(&want)
+                .unwrap()
+                .to_string(),
+            "{sql}"
+        );
+        assert_ordered_scans_keep_file_order(&ctx, sql).await;
+    }
+}

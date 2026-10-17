@@ -138,6 +138,12 @@ impl OrderOnRequestExec {
                 let mut ordered = config.clone();
                 ordered.file_groups = self.chains.as_ref().clone();
                 ordered.output_ordering = vec![self.ordering.clone()];
+                // Each partition must read only its own chain, in order. Off,
+                // DataFusion's file-stream work stealing puts every chain's
+                // files in one shared queue and a partition reads whichever
+                // comes next. Only `FileScanConfigBuilder` sets this from
+                // `output_ordering`, and a direct field write skips it.
+                ordered.preserve_order = true;
                 // Fewer chains than partitions (a short window: few files)
                 // would read on fewer threads than today's byte-range split.
                 // DataFusion's order-preserving repartitioner splits
