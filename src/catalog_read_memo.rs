@@ -643,8 +643,8 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner.get_sort_spec(table_id, snapshot_id)
     }
 
-    // Not memoized: a row describes an immutable file and is read once per
-    // page of a scan's files.
+    // Not memoized here: `DuckLakeTable` remembers the answers itself (its
+    // `file_order_memo`), shared across its clones and rebinds.
     fn verified_file_orders(
         &self,
         table_id: i64,

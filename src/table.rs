@@ -1348,6 +1348,12 @@ pub struct DuckLakeTable {
     /// every clone, as the other caches are, and keyed by snapshot so that a
     /// clone at a later snapshot reads again.
     inlined_absent_through: Arc<AtomicI64>,
+    /// The `ext_file_order` sidecar's answer for each `(path, size)` this
+    /// table's scans have asked about: the recorded sort key, `None` for no
+    /// row. Shared with every clone. A row describes immutable bytes, so a
+    /// remembered key stays true; a remembered `None` can only miss a row
+    /// recorded later (the verify job), until the table is built again.
+    file_order_memo: Arc<std::sync::Mutex<FileOrderMemo>>,
     /// How this table reuses what its scans read. The delete memo is off by
     /// default.
     read_options: DuckLakeReadOptions,
@@ -1508,6 +1514,7 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
+            file_order_memo: Arc::default(),
             read_options: DuckLakeReadOptions::default(),
             delete_memo: None,
             #[cfg(feature = "write")]
@@ -4737,6 +4744,7 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
+            file_order_memo: Arc::clone(&self.file_order_memo),
             read_options: self.read_options.clone(),
             delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
@@ -5513,6 +5521,10 @@ pub(crate) struct FileUpdateOutput {
     pub(crate) cumulative_positions: Vec<i64>,
 }
 
+/// See `DuckLakeTable::file_order_memo`: `(path, size)` to the sidecar's sort
+/// key, `None` for no row.
+type FileOrderMemo = HashMap<(String, i64), Option<String>>;
+
 /// EXPERIMENTAL (`ext_file_order`): the ordered alternative's ingredients,
 /// gathered across a scan's pages of files and only used if a sort asks for
 /// them (see [`crate::order_on_request`]).
@@ -5610,38 +5622,64 @@ impl DuckLakeTable {
     }
 
     /// Each file's verified ordering over the table schema, from the
-    /// `ext_ducklake_file_order` sidecar (one query for the whole page). Only
-    /// files without a name mapping are considered: the recorded key names
-    /// columns by field id. A row applies to a file only when its path and
-    /// size match the file's, so it never vouches for another file. A file
-    /// without a matching row (or whose row does not parse, or the lookup
-    /// failing) is simply absent: it is scanned exactly as before.
+    /// `ext_ducklake_file_order` sidecar: one query for the page's files not
+    /// yet in [`Self::file_order_memo`], none once all are. Only files without
+    /// a name mapping are considered: the recorded key names columns by field
+    /// id. A row applies to a file only when its path and size match the
+    /// file's, so it never vouches for another file. A file without a matching
+    /// row (or whose row does not parse, or the lookup failing) is simply
+    /// absent: it is scanned exactly as before.
     fn attested_file_orderings(&self, files: &[&DuckLakeTableFile]) -> HashMap<i64, LexOrdering> {
         let files: Vec<&DuckLakeTableFile> = files
             .iter()
             .copied()
             .filter(|table_file| table_file.file.mapping_id.is_none())
             .collect();
-        let paths: Vec<&str> = files.iter().map(|tf| tf.file.path.as_str()).collect();
-        let recorded = match self.provider.verified_file_orders(self.table_id, &paths) {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                tracing::debug!(%error, "ext_file_order lookup failed; scanning unordered");
-                return HashMap::new();
-            },
+        let key = |tf: &DuckLakeTableFile| (tf.file.path.clone(), tf.file.file_size_bytes);
+        let memo = || {
+            self.file_order_memo
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
-        let recorded: HashMap<&str, &crate::ext_file_order::FileOrder> = recorded
-            .iter()
-            .map(|order| (order.path.as_str(), order))
-            .collect();
+        let unknown: Vec<&DuckLakeTableFile> = {
+            let memo = memo();
+            files
+                .iter()
+                .copied()
+                .filter(|tf| !memo.contains_key(&key(tf)))
+                .collect()
+        };
+        // The lock is not held across the query: a concurrent scan may ask
+        // too, and both store the same answer.
+        if !unknown.is_empty() {
+            let paths: Vec<&str> = unknown.iter().map(|tf| tf.file.path.as_str()).collect();
+            match self.provider.verified_file_orders(self.table_id, &paths) {
+                Ok(recorded) => {
+                    let mut recorded: HashMap<String, crate::ext_file_order::FileOrder> = recorded
+                        .into_iter()
+                        .map(|order| (order.path.clone(), order))
+                        .collect();
+                    let mut memo = memo();
+                    for tf in unknown {
+                        let sort_key = recorded
+                            .remove(&tf.file.path)
+                            .filter(|order| order.file_size_bytes == tf.file.file_size_bytes)
+                            .map(|order| order.sort_key);
+                        memo.insert(key(tf), sort_key);
+                    }
+                },
+                // Nothing remembered: the next scan asks again.
+                Err(error) => {
+                    tracing::debug!(%error, "ext_file_order lookup failed; scanning unordered");
+                },
+            }
+        }
+        let memo = memo();
         files
             .iter()
             .filter_map(|tf| {
-                let order = recorded.get(tf.file.path.as_str())?;
-                if order.file_size_bytes != tf.file.file_size_bytes {
-                    return None;
-                }
-                let keys = crate::file_ordering::decode(&order.sort_key)?;
+                let sort_key = memo.get(&key(tf))?.as_deref()?;
+                let keys = crate::file_ordering::decode(sort_key)?;
                 Some((tf.data_file_id, self.ordering_for_attestation(&keys)?))
             })
             .collect()
