@@ -1739,6 +1739,7 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
         &make,
     )))
     .await;
+    Box::pin(added_not_null_columns(Arc::clone(&make))).await;
     Box::pin(restores_across_expired_snapshots(Arc::clone(&make))).await;
     Box::pin(nothing_to_undo(make)).await;
 }

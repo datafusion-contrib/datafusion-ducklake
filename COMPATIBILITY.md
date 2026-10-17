@@ -1033,8 +1033,9 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   values cast, added columns holding their initial default, else NULL. A column dropped,
   renamed, made `NOT NULL` or changed to any other type since (a narrowing, a nested field
   change, or a promotion official allows beyond those, such as `INTEGER` to `DOUBLE`), or one
-  added since that is `NOT NULL` with no initial default, refuses it (`Unsupported`). Official DuckLake reads the result and its change feed as an `UPDATE`'s;
-  its closest equivalent, inserting the rows read `AT (VERSION => ...)`, gives them new row ids.
+  added since that is `NOT NULL` with no initial default, refuses it (`Unsupported`). Official
+  DuckLake reads the result and its change feed as an `UPDATE`'s; its closest equivalent,
+  inserting the rows read `AT (VERSION => ...)`, gives them new row ids.
 - **Maintenance flush** (`InlinedFlushPolicy`, carried by `DuckLakeWriteOptions`; an opt-in
   addition of this crate): by default `merge_adjacent_files` and `rewrite_data_files` flush
   nothing, as official's `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`; its
