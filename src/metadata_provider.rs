@@ -1158,6 +1158,22 @@ pub(crate) fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
+/// Whether a `changes_made` token of `kind` names a schema, view or macro by
+/// its id rather than a table: official draws those ids from the table id
+/// sequence, but not every catalog this crate writes does, so such a token
+/// may carry a table's id.
+pub(crate) fn change_kind_names_other_object(kind: &str) -> bool {
+    [
+        "dropped_schema",
+        "dropped_view",
+        "altered_view",
+        "dropped_scalar_macro",
+        "dropped_table_macro",
+    ]
+    .iter()
+    .any(|other| kind.trim().eq_ignore_ascii_case(other))
+}
+
 pub(crate) fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
     let mut quoted = false;
     changes.split(move |character| {

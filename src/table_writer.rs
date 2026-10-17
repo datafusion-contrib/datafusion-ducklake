@@ -1122,6 +1122,31 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
+        self.begin_embedded_rowid_write(schema_name, table_name, arrow_schema, mode, false)
+    }
+
+    /// [`Self::begin_write_with_embedded_rowid`] rolling over to a new file
+    /// once one exceeds the target file size, as [`Self::begin_write`] does,
+    /// for a caller that commits the files with [`TableWriteSession::finish_files`].
+    #[cfg(feature = "restore")]
+    pub(crate) fn begin_rolling_write_with_embedded_rowid(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        self.begin_embedded_rowid_write(schema_name, table_name, arrow_schema, mode, true)
+    }
+
+    fn begin_embedded_rowid_write(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        roll: bool,
+    ) -> Result<TableWriteSession> {
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
@@ -1139,7 +1164,7 @@ impl DuckLakeTableWriter {
             true,
             mode,
             StreamPartitionMode::Split,
-            false,
+            roll,
             false,
         )
     }
@@ -2695,6 +2720,7 @@ impl DuckLakeTableWriter {
                     rewritten_deletes: Vec::new(),
                     dropped_files: Vec::new(),
                     inlined_flush: false,
+                    exclusive: false,
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
@@ -2768,6 +2794,7 @@ impl DuckLakeTableWriter {
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written,
@@ -3217,6 +3244,15 @@ impl DuckLakeTableWriter {
 }
 
 impl<'a> DuckLakeWriteTransaction<'a> {
+    /// Make the last staged write conflict with any commit to its table since
+    /// the snapshot it was staged against, as a row restore needs.
+    #[cfg(feature = "restore")]
+    pub(crate) fn make_last_write_exclusive(&mut self) {
+        if let Some(prepared) = self.writes.last_mut() {
+            prepared.write.exclusive = true;
+        }
+    }
+
     /// Read concurrent delete files through `positions` when the commit's
     /// inlined deletions meet one, retrying the commit when it deletes none of
     /// their rows instead of aborting.
@@ -3492,6 +3528,7 @@ impl DuckLakeWriteTransaction<'_> {
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written: 0,
@@ -3667,6 +3704,7 @@ impl DuckLakeWriteTransaction<'_> {
                 inlined_file_deletes,
                 dropped_files,
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written,
@@ -5377,6 +5415,7 @@ impl TableWriteSession {
             inlined_file_deletes: Vec::new(),
             dropped_files: Vec::new(),
             inlined_flush: false,
+            exclusive: false,
         }
         .with_materialized_nulls()?;
         let committed = self.with_inlining_limit(|| {

@@ -2692,6 +2692,22 @@ pub(crate) fn inlined_flush_table_conflict(
     })
 }
 
+/// Whether any of `changes` names table `table_id`: a token with its id, of
+/// any kind but those naming a schema, view or macro, so a kind this crate
+/// does not know counts.
+fn changes_name_table(changes: &[Option<String>], table_id: i64) -> bool {
+    changes
+        .iter()
+        .flatten()
+        .flat_map(|changes| snapshot_change_tokens(changes))
+        .any(|token| {
+            token.trim().split_once(':').is_some_and(|(kind, id)| {
+                !crate::metadata_provider::change_kind_names_other_object(kind)
+                    && id.trim().parse::<i64>().ok() == Some(table_id)
+            })
+        })
+}
+
 /// [`table_conflict`] for a staged write: an insert, a `DELETE` or an
 /// `UPDATE`. The insert of a `Replace` is not checked here: the Replace
 /// conflict detection checks its retirement of the prior generation. A
@@ -2702,6 +2718,16 @@ pub(crate) fn staged_conflict(
     write: &StagedTableWrite,
     changes: &[Option<String>],
 ) -> Option<DuckLakeError> {
+    if write.exclusive {
+        let changed = changes_name_table(changes, write.table_id);
+        if changed {
+            return Some(DuckLakeError::Conflict(format!(
+                "Transaction conflict - attempting to restore rows of table with index \
+                 \"{}\" - but another transaction has changed it",
+                write.table_id
+            )));
+        }
+    }
     if write.inlined_flush {
         let ours = TableChanges {
             deleted_inlined: !write.inlined_deletes.is_empty(),
@@ -2890,6 +2916,9 @@ pub struct StagedTableWrite {
     /// Set by the deprecated `DuckLakeTableWriter::flush_inlined_data`: the
     /// stage moves inlined rows into Parquet without changing logical rows.
     pub(crate) inlined_flush: bool,
+    /// Set by a row restore, which must leave exactly the rows it compared
+    /// against: any commit to the table since `base_snapshot_id` conflicts.
+    pub(crate) exclusive: bool,
 }
 
 /// `batches` with each top-level Arrow `Null` column (one with no type of its
@@ -4871,6 +4900,53 @@ mod tests {
             proposed_column_orders(&live, &[1, 2, 3, 4], &nested, &[1, 2, 3, 5, 4]),
             vec![1, 2, 3, 5, 4]
         );
+    }
+
+    /// A restore's conflict check counts a token with the table's id of
+    /// any kind, a kind it does not know included, but one naming a schema,
+    /// view or macro by an id that happens to equal it.
+    #[test]
+    fn only_tokens_naming_a_table_name_it() {
+        let changes = |list: &[&str]| -> Vec<Option<String>> {
+            list.iter().map(|c| Some((*c).to_string())).collect()
+        };
+        for kind in [
+            "inserted_into_table",
+            "deleted_from_table",
+            "inlined_insert",
+            "inlined_delete",
+            "flushed_inlined",
+            "inline_flush",
+            "merge_adjacent",
+            "rewrite_delete",
+            "compacted_table",
+            "altered_table",
+            "dropped_table",
+            "Inserted_Into_Table",
+            "a_kind_added_later",
+        ] {
+            assert!(
+                changes_name_table(&changes(&[&format!("{kind}:7")]), 7),
+                "{kind}"
+            );
+        }
+        assert!(changes_name_table(
+            &changes(&["created_schema:\"s\",altered_table:7"]),
+            7
+        ));
+        for other in [
+            "dropped_schema:7",
+            "dropped_view:7",
+            "altered_view:7",
+            "Altered_View:7",
+            "dropped_scalar_macro:7",
+            "dropped_table_macro:7",
+            "created_table:\"main\".\"t\"",
+            "inserted_into_table:8",
+        ] {
+            assert!(!changes_name_table(&changes(&[other]), 7), "{other}");
+        }
+        assert!(!changes_name_table(&[None], 7));
     }
 
     /// Official's table-level conflict check: inserts before deletions, each

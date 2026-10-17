@@ -258,7 +258,7 @@ jobs:
       # of failing. It stopped being a default feature, so it has to be listed.
       - name: Run tests (macOS; Linux is covered by test-full)
         if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
-        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite"
+        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite restore"
 
       - name: Check documentation
         if: steps.changes.outputs.code == 'true'
@@ -403,6 +403,8 @@ jobs:
             write-sqlite \
             write-postgres \
             write-mysql \
+            restore \
+            write-sqlite,restore \
             metadata-duckdb,encryption
           do
             echo "::group::cargo check --no-default-features --features '$features'"
@@ -567,7 +569,7 @@ jobs:
 
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
-        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite"
+        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite restore"
 
       - name: Save target directory (main only)
         if: |

@@ -460,11 +460,19 @@ fn commit_refusal<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a DuckLakeEr
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn multicatalog_refusal_commits_nothing_on_every_path() {
+    // Path by path, each on the heap: as one function the paths' awaits
+    // outgrow a test thread's stack in a debug build.
     let (pool, base, _c) = spin_up_postgres().await.unwrap();
+    Box::pin(multicatalog_refusal_writes(&pool, &base)).await;
+    Box::pin(multicatalog_refusal_statements(&pool, &base)).await;
+    Box::pin(multicatalog_refusal_maintenance(&pool, &base)).await;
+    Box::pin(multicatalog_refusal_ddl(&pool, &base)).await;
+}
 
+async fn multicatalog_refusal_writes(pool: &PgPool, base: &str) {
     // Whole-table writes: the id reservation is approved, the registering commit
     // refused after its files were uploaded.
-    let l = Lake::multi(&pool, &base, "append_rows").await;
+    let l = Lake::multi(pool, base, "append_rows").await;
     let before = l.state().await;
     l.guard.refuse_after(1);
     let r = l
@@ -473,7 +481,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .await;
     l.assert_refused("append_table", before, 1, r).await;
 
-    let l = Lake::multi(&pool, &base, "replace_rows").await;
+    let l = Lake::multi(pool, base, "replace_rows").await;
     let before = l.state().await;
     l.guard.refuse_after(1);
     let r = l
@@ -482,7 +490,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .await;
     l.assert_refused("write_table", before, 1, r).await;
 
-    let l = Lake::multi(&pool, &base, "partitioned").await;
+    let l = Lake::multi(pool, base, "partitioned").await;
     l.writer
         .set_partition_spec(
             l.table_id,
@@ -512,7 +520,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     l.assert_refused("write_partitioned", before, 1, r).await;
 
     // A refused reservation stops a write before it uploads anything.
-    let l = Lake::multi(&pool, &base, "reservation").await;
+    let l = Lake::multi(pool, base, "reservation").await;
     let before = l.state().await;
     l.guard.refuse_after(0);
     let r = l
@@ -525,7 +533,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     for (case, mode) in
         [("session_append", WriteMode::Append), ("session_replace", WriteMode::Replace)]
     {
-        let l = Lake::multi(&pool, &base, case).await;
+        let l = Lake::multi(pool, base, case).await;
         let before = l.state().await;
         let table_writer = l.table_writer();
         let mut session = table_writer
@@ -537,7 +545,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         l.assert_refused(case, before, 0, r).await;
     }
 
-    let l = Lake::multi(&pool, &base, "session_deletes").await;
+    let l = Lake::multi(pool, base, "session_deletes").await;
     let target = l.live_files().await.remove(0);
     let before = l.state().await;
     let table_writer = l.table_writer();
@@ -558,7 +566,9 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         }])
         .await;
     l.assert_refused("finish_with_deletes", before, 0, r).await;
+}
 
+async fn multicatalog_refusal_statements(pool: &PgPool, base: &str) {
     // SQL DML through the catalog.
     for (case, approvals, sql) in [
         ("sql_insert", 1, "INSERT INTO {}.public.t VALUES (5, 50)"),
@@ -571,21 +581,21 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         ("sql_delete", 0, "DELETE FROM {}.public.t WHERE id = 1"),
         ("sql_truncate", 0, "DELETE FROM {}.public.t"),
     ] {
-        let l = Lake::multi(&pool, &base, case).await;
+        let l = Lake::multi(pool, base, case).await;
         let before = l.state().await;
         l.guard.refuse_after(approvals);
         let r = l.sql(&sql.replace("{}", case)).await;
         l.assert_refused(case, before, approvals, r).await;
     }
 
-    let l = Lake::multi(&pool, &base, "sql_create").await;
+    let l = Lake::multi(pool, base, "sql_create").await;
     let before = l.state().await;
     l.guard.refuse_after(0);
     let r = l.sql("CREATE TABLE sql_create.public.n (a INT)").await;
     l.assert_refused("sql_create_table", before, 0, r).await;
 
     // A multi-table transaction: both stages reserved, the one commit refused.
-    let l = Lake::multi(&pool, &base, "multi_table").await;
+    let l = Lake::multi(pool, base, "multi_table").await;
     let before = l.state().await;
     let table_writer = l.table_writer();
     let mut transaction = table_writer.transaction();
@@ -614,7 +624,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     l.assert_refused("commit_multi_table", before, 0, r).await;
 
     // Inlined data: registering it, flushing it to a file, and deleting from it.
-    let l = Lake::multi(&pool, &base, "inline_register").await;
+    let l = Lake::multi(pool, base, "inline_register").await;
     let before = l.state().await;
     l.guard.refuse_after(1);
     let r = l
@@ -624,7 +634,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     l.assert_refused("register_inlined_data", before, 1, r)
         .await;
 
-    let l = Lake::multi(&pool, &base, "inline_flush").await;
+    let l = Lake::multi(pool, base, "inline_flush").await;
     let inlined = l
         .inlining_writer()
         .append_table("public", "inl", &[batch(&[1, 2], &[10, 20])])
@@ -668,7 +678,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .await;
 
     // The flush official runs (`ducklake_flush_inlined_data`).
-    let l = Lake::multi(&pool, &base, "official_flush").await;
+    let l = Lake::multi(pool, base, "official_flush").await;
     let inlined = l
         .inlining_writer()
         .append_table("public", "inl", &[batch(&[1, 2], &[10, 20])])
@@ -683,9 +693,11 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .await;
     l.assert_refused("flush_table_inlined_data", before, 0, r)
         .await;
+}
 
+async fn multicatalog_refusal_maintenance(pool: &PgPool, base: &str) {
     // Compaction.
-    let l = Lake::multi(&pool, &base, "merge").await;
+    let l = Lake::multi(pool, base, "merge").await;
     let before = l.state().await;
     let ctx = l.context().await;
     let table = l.table(&ctx, "t").await;
@@ -695,7 +707,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .await;
     l.assert_refused("merge_adjacent_files", before, 0, r).await;
 
-    let l = Lake::multi(&pool, &base, "rewrite").await;
+    let l = Lake::multi(pool, base, "rewrite").await;
     l.sql("DELETE FROM rewrite.public.t WHERE id = 1")
         .await
         .unwrap();
@@ -715,7 +727,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     l.assert_refused("rewrite_data_files", before, 0, r).await;
 
     // Direct delete commits. The delete file is the caller's, written before.
-    let l = Lake::multi(&pool, &base, "positional").await;
+    let l = Lake::multi(pool, base, "positional").await;
     let target = l.live_files().await.remove(0);
     let delete = l
         .table_writer()
@@ -753,7 +765,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     l.assert_refused("set_delete_file", before, 0, r).await;
 
     // Registering existing files, one and several.
-    let l = Lake::multi(&pool, &base, "existing").await;
+    let l = Lake::multi(pool, base, "existing").await;
     let ids = [100_i64, 200];
     let before = l.state().await;
     l.guard.refuse_after(0);
@@ -783,9 +795,11 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     );
     l.assert_refused("register_existing_data_files", before, 0, r)
         .await;
+}
 
+async fn multicatalog_refusal_ddl(pool: &PgPool, base: &str) {
     // Schema, layout and setting changes, each one transaction.
-    let l = Lake::multi(&pool, &base, "ddl").await;
+    let l = Lake::multi(pool, base, "ddl").await;
     let head = l.head().await;
     let public_id = l
         .provider()

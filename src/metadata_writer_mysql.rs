@@ -6503,6 +6503,7 @@ mod tests {
             rewritten_deletes: Vec::new(),
             dropped_files: Vec::new(),
             inlined_flush: false,
+            exclusive: false,
         };
         let committed = writer
             .commit_multi_table(

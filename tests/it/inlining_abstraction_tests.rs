@@ -46,7 +46,7 @@ pub(crate) struct Lake {
     /// Whether the backend inlines rows (every backend but single-catalog
     /// PostgreSQL).
     pub(crate) inlines: bool,
-    _dir: tempfile::TempDir,
+    pub(crate) _dir: tempfile::TempDir,
 }
 
 type LakeFuture = Pin<Box<dyn Future<Output = Lake> + Send>>;
@@ -290,12 +290,12 @@ impl Lake {
     pub(crate) async fn sql(&self, statement: &str) -> Result<(), String> {
         let ctx = SessionContext::new();
         DuckLakeCatalog::register(&ctx, "lake", self.catalog());
-        execute_ducklake_sql(&ctx, &self.catalog(), statement)
-            .await
-            .map_err(|e| e.to_string())?
-            .collect()
+        // Each statement's futures on the heap, so a scenario of many
+        // statements keeps a small stack in a debug build.
+        let frame = Box::pin(execute_ducklake_sql(&ctx, &self.catalog(), statement))
             .await
             .map_err(|e| e.to_string())?;
+        Box::pin(frame.collect()).await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -311,13 +311,10 @@ impl Lake {
             .unwrap()
             .with_row_lineage(true);
         ctx.register_catalog("lake", Arc::new(catalog));
-        let batches = ctx
-            .sql(&format!("SELECT * FROM lake.main.{table} ORDER BY rowid"))
-            .await
-            .unwrap()
-            .collect()
+        let frame = Box::pin(ctx.sql(&format!("SELECT * FROM lake.main.{table} ORDER BY rowid")))
             .await
             .unwrap();
+        let batches = Box::pin(frame.collect()).await.unwrap();
         lines(&batches, true)
     }
 
@@ -417,8 +414,8 @@ impl Lake {
 
     /// Append `batch` to `main.<table>` with the writer's configuration.
     pub(crate) async fn append(&self, table: &str, batch: &RecordBatch) -> usize {
-        self.table_writer()
-            .append_table("main", table, std::slice::from_ref(batch))
+        let writer = self.table_writer();
+        Box::pin(writer.append_table("main", table, std::slice::from_ref(batch)))
             .await
             .unwrap()
             .files_written
@@ -427,10 +424,10 @@ impl Lake {
     /// Append `batch` to Parquet whatever the limit, as a write of more rows
     /// than it would be.
     pub(crate) async fn append_parquet(&self, table: &str, batch: &RecordBatch) {
-        let files = self
+        let writer = self
             .table_writer()
-            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
-            .append_table("main", table, std::slice::from_ref(batch))
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+        let files = Box::pin(writer.append_table("main", table, std::slice::from_ref(batch)))
             .await
             .unwrap()
             .files_written;

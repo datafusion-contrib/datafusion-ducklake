@@ -61,6 +61,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExp
 use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::Stream;
 use futures::stream::{self, TryStreamExt};
 
 use crate::compaction::sorted_rewrite_batches;
@@ -69,7 +70,7 @@ use crate::metadata_writer::{
     DataFileInfo, DeleteFileEntry, InlinedRowRef, MetadataWriter, StagedTableData, WriteMode,
 };
 use crate::table::{DuckLakeTable, UpdateSourceScan};
-use crate::table_writer::{DuckLakeTableWriter, validate_not_null_batches};
+use crate::table_writer::{DuckLakeTableWriter, TableWriteSession, validate_not_null_batches};
 
 /// Schema for the output of update operations (count of rows updated).
 fn make_update_count_schema() -> SchemaRef {
@@ -564,9 +565,9 @@ async fn write_rewritten_files(
     base_snapshot: i64,
     batches: Vec<RecordBatch>,
 ) -> DataFusionResult<Vec<DataFileInfo>> {
-    let mut batches = sorted_rewrite_batches(context, batches, None)
+    let batches = sorted_rewrite_batches(context, batches, None)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let mut session = table_writer
+    let session = table_writer
         .begin_write_with_embedded_rowid(
             schema_name,
             table_name,
@@ -575,9 +576,21 @@ async fn write_rewritten_files(
         )
         .map(|session| session.with_base_snapshot_id(base_snapshot))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    write_rewritten_stream(session, batches).await
+}
+
+/// Write `batches`, rewritten rows `[physical columns..., rowid]`, through
+/// `session` (one that embeds row ids) as they arrive, waiting while finished
+/// files queue for upload, and upload its files without committing them.
+pub(crate) async fn write_rewritten_stream(
+    mut session: TableWriteSession,
+    batches: impl Stream<Item = DataFusionResult<RecordBatch>>,
+) -> DataFusionResult<Vec<DataFileInfo>> {
+    let mut batches = std::pin::pin!(batches);
     while let Some(batch) = batches.try_next().await? {
         session
-            .write_batch(&batch)
+            .write_batch_async(&batch)
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
     }
     session
