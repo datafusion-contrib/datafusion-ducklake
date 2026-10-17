@@ -1766,8 +1766,18 @@ impl DuckLakeTable {
     pub(crate) fn inlined_data_with_row_ids(
         &self,
     ) -> Result<Vec<crate::metadata_provider::DuckLakeInlinedData>> {
+        self.inlined_data_with_row_ids_at(self.snapshot_id)
+    }
+
+    /// The inlined rows visible at `snapshot`, with their row ids, read in
+    /// this table's columns: a column the rows predate reads as its
+    /// `initial_default`, else NULL, and a widened one in its current type.
+    pub(crate) fn inlined_data_with_row_ids_at(
+        &self,
+        snapshot: i64,
+    ) -> Result<Vec<crate::metadata_provider::DuckLakeInlinedData>> {
         self.provider
-            .get_inlined_data_with_row_ids(self.table_id, self.snapshot_id, &self.columns)
+            .get_inlined_data_with_row_ids(self.table_id, snapshot, &self.columns)
     }
 
     /// Page the catalog's file metadata, optionally handing the provider a
@@ -4878,6 +4888,12 @@ impl DuckLakeTable {
             ids.extend_from_slice(&column.nested_column_ids);
         }
         ids
+    }
+
+    /// The live top-level columns, in `column_order`.
+    #[cfg(feature = "write")]
+    pub(crate) fn table_columns(&self) -> &[DuckLakeTableColumn] {
+        &self.columns
     }
 
     #[cfg(feature = "write")]
