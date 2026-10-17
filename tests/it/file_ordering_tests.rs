@@ -1668,3 +1668,110 @@ async fn order_by_limit_through_a_fetch_blocking_wrapper_keeps_chains_in_order()
         assert_ordered_scans_keep_file_order(&ctx, sql).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// The sidecar read is remembered by the table, across clones and rebinds
+// ---------------------------------------------------------------------------
+
+const TABLE_TOP_N: &str = "SELECT id FROM logs ORDER BY ts DESC LIMIT 7";
+
+/// `table` registered alone as `logs`: its plan for [`TABLE_TOP_N`] and the
+/// ids it returns.
+async fn top_n_over(table: DuckLakeTable) -> (String, Vec<i64>) {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_table("logs", Arc::new(table)).unwrap();
+    let plan = plan(&ctx, TABLE_TOP_N).await;
+    let batches = ctx.sql(TABLE_TOP_N).await.unwrap().collect().await.unwrap();
+    let ids = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    (plan, ids)
+}
+
+async fn clear_sidecar(env: &Env) {
+    let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
+    sqlx::query("DELETE FROM ext_ducklake_file_order")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// A warm scan asks the sidecar nothing: with its rows deleted after the
+/// first scan, the same table, a clone and a rebind onto another provider
+/// still serve the top-N without a sort. A table built afresh reads the
+/// (now empty) sidecar and sorts, which shows the rows really are gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_scans_reuse_the_sidecar_read() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&env, 3, 100).await;
+    let want: Vec<i64> = (293..300).rev().collect();
+
+    let (_ctx, table) = table_handle(&env).await;
+    let (p, ids) = top_n_over(table.clone()).await;
+    assert!(declares_ts_desc(&p) && !sorts(&p), "{p}");
+    assert_eq!(ids, want);
+
+    clear_sidecar(&env).await;
+    let rebound = table.with_metadata_provider(Arc::new(
+        SqliteMetadataProvider::new(&env.url()).await.unwrap(),
+    ));
+    for warm in [table.clone(), table.clone(), rebound] {
+        let (p, ids) = top_n_over(warm).await;
+        assert!(declares_ts_desc(&p) && !sorts(&p), "{p}");
+        assert_eq!(ids, want);
+    }
+
+    let (_ctx, fresh) = table_handle(&env).await;
+    let (p, ids) = top_n_over(fresh).await;
+    assert!(sorts(&p), "{p}");
+    assert_eq!(ids, want);
+}
+
+/// Rows the verify job adds after a table remembered "no row" are not seen by
+/// that table, which keeps sorting (correctly); a table built for the next
+/// snapshot sees them and skips the sort.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_verified_after_a_scan_apply_from_the_next_snapshot() {
+    let env = setup().await;
+    for a in 0..3 {
+        env.append_with(
+            &[batch(&desc(a * 100..(a + 1) * 100))],
+            DuckLakeWriteOptions::default(),
+        )
+        .await;
+    }
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+
+    let (ctx, table) = table_handle(&env).await;
+    let (p, ids) = top_n_over(table.clone()).await;
+    assert!(sorts(&p), "{p}");
+    assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
+
+    let result = table
+        .verify_file_orders(&ctx.state(), VerifyOrderOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.files_recorded, 3, "{result:?}");
+    let (p, ids) = top_n_over(table.clone()).await;
+    assert!(
+        sorts(&p),
+        "the table remembers the files as unverified: {p}"
+    );
+    assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
+
+    env.append(&[batch(&desc(300..400))]).await;
+    let (_ctx, next) = table_handle(&env).await;
+    let (p, ids) = top_n_over(next).await;
+    assert!(declares_ts_desc(&p) && !sorts(&p), "{p}");
+    assert_eq!(ids, (393..400).rev().collect::<Vec<_>>());
+    assert_all_queries_correct(&env.ctx(1).await).await;
+}
