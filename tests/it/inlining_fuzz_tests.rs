@@ -1483,14 +1483,9 @@ impl Lake {
         snapshot: Option<i64>,
         sql: &str,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
-        let (ctx, _, _, _) = self.session(snapshot, true).await;
-        let batches = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| e.to_string())?
-            .collect()
-            .await
-            .map_err(|e| e.to_string())?;
+        let (ctx, _, _, _) = Box::pin(self.session(snapshot, true)).await;
+        let frame = Box::pin(ctx.sql(sql)).await.map_err(|e| e.to_string())?;
+        let batches = Box::pin(frame.collect()).await.map_err(|e| e.to_string())?;
         Ok(canon_crate::rows(&batches))
     }
 
@@ -1921,13 +1916,10 @@ impl Lake {
             .collect::<Vec<_>>()
             .join(", ");
         let ctx = SessionContext::new();
-        let batches = ctx
-            .sql(&format!("SELECT * FROM (VALUES {values}) AS v({names})"))
-            .await
-            .map_err(|e| e.to_string())?
-            .collect()
+        let frame = Box::pin(ctx.sql(&format!("SELECT * FROM (VALUES {values}) AS v({names})")))
             .await
             .map_err(|e| e.to_string())?;
+        let batches = Box::pin(frame.collect()).await.map_err(|e| e.to_string())?;
         // DuckDB allows one open catalog at a time: take the schema and close
         // this handle before the caller opens its own.
         let schema = {
@@ -4578,8 +4570,6 @@ impl Run<'_> {
         self.compare_layout(step, &copy, Self::layout_rows(&copy))
     }
 
-    /// Note a rewrite at `step` (or a checkpoint's) that wrote the same rows
-    /// into more files here than official ([`known::rewrite_grouping`]).
     /// Restore this crate's table to a random earlier step's snapshot, after
     /// more writes of its own (inserts, deletes, updates, keyed upserts, a
     /// replace, maintenance): `rowid, *` at the head must then be the mark's
@@ -4595,15 +4585,17 @@ impl Run<'_> {
             .filter(|at| self.heads.ours[*at] < head)
             .collect();
         if marks.is_empty() {
-            self.skip("restore", "no snapshot before the head to restore to");
+            self.ran("restore: no snapshot before the head");
             return Ok(());
         }
         let at = marks[self.rng.below(marks.len())];
         let mark = self.heads.ours[at];
-        let failed = |detail: String| Mismatch {
+        // The window's steps past the history, in the detail: the history
+        // alone does not replay them.
+        let failed = |window: &str, detail: String| Mismatch {
             kind: "restore",
             step: steps,
-            detail,
+            detail: format!("{detail}\n  steps after the history: {window}"),
         };
         let list = |at: usize| {
             std::iter::once("id".to_string())
@@ -4615,19 +4607,25 @@ impl Run<'_> {
 
         if !self.lake.kind.mutations() {
             let (ctx, table) = self.lake.table().await;
-            return match table.restore_rows_to(&ctx.state(), mark).await {
+            return match Box::pin(table.restore_rows_to(&ctx.state(), mark)).await {
                 Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) => {
                     self.ran("restore refused");
                     Ok(())
                 },
-                other => Err(failed(format!(
-                    "a restore on a writer that stages no row mutation: {other:?}"
-                ))),
+                other => Err(failed(
+                    "",
+                    format!("a restore on a writer that stages no row mutation: {other:?}"),
+                )),
             };
         }
 
         // More writes past the history, this crate's only.
         let extended = self.extend_for_restore();
+        let mut window = extended.steps[steps..]
+            .iter()
+            .map(step_source)
+            .collect::<Vec<_>>()
+            .join("; ");
         for index in steps..extended.steps.len() {
             if Box::pin(self.lake.apply(&extended, index)).await.is_ok() {
                 self.ran(&format!(
@@ -4640,20 +4638,23 @@ impl Run<'_> {
         let rows = self.restore_rows(&columns, self.history.steps.len() as i64 + 1000);
         if let Ok(staged) = self.lake.staged_rows(&columns, &rows).await {
             let (ctx, table) = self.lake.table().await;
-            if table
-                .keyed_mutation(&["id"])
-                .upsert_by_keys(&ctx.state(), staged)
-                .await
-                .is_ok()
+            if Box::pin(
+                table
+                    .keyed_mutation(&["id"])
+                    .upsert_by_keys(&ctx.state(), staged),
+            )
+            .await
+            .is_ok()
             {
                 self.ran("restore window: upsert");
+                window.push_str(&format!("; upsert {rows:?}"));
             }
         }
         if self.rng.chance(30) {
             let rows = self.restore_rows(&columns, self.history.steps.len() as i64 + 2000);
             if let Ok(staged) = self.lake.staged_rows(&columns, &rows).await {
                 let (writer, _) = (self.lake.open)().await;
-                let replaced = async {
+                let replaced = Box::pin(async {
                     datafusion_ducklake::DuckLakeTableWriter::new(
                         writer,
                         Arc::new(object_store::local::LocalFileSystem::new()),
@@ -4662,15 +4663,19 @@ impl Run<'_> {
                     .write_table("main", "t", &staged)
                     .await
                     .map_err(|e| e.to_string())
-                }
+                })
                 .await;
                 if replaced.is_ok() {
                     self.ran("restore window: replace");
+                    window.push_str(&format!("; replace with {rows:?}"));
                 }
             }
         }
 
         let expected = sorted_rows(self.lake.rows(Some(mark), &select(at)).await);
+        if let Err(error) = &expected {
+            return Err(failed(&window, format!("reading the mark {mark}: {error}")));
+        }
         let current = self.lake.head().await;
         let mut kept = vec![(mark, at)];
         kept.push((self.heads.ours[steps], steps));
@@ -4701,50 +4706,79 @@ impl Run<'_> {
                 return Ok(());
             },
             Err(error) => {
-                return Err(failed(format!(
-                    "restore to step {at} (snapshot {mark}): {error}"
-                )));
+                return Err(failed(
+                    &window,
+                    format!("restore to step {at} (snapshot {mark}): {error}"),
+                ));
             },
             Ok(result) => {
                 if self.history.steps[at..]
                     .iter()
                     .any(|step| matches!(step, Step::AddColumn(..) | Step::Widen(_)))
                 {
-                    return Err(failed(format!(
-                        "a restore across a column change committed: {result:?}"
-                    )));
+                    return Err(failed(
+                        &window,
+                        format!("a restore across a column change committed: {result:?}"),
+                    ));
+                }
+                // The spec changed unless it was unset at the mark and at
+                // the head.
+                let partitioned = |steps: &[Step]| {
+                    steps.iter().fold(false, |on, step| match step {
+                        Step::Partition(spec) => spec.is_some(),
+                        _ => on,
+                    })
+                };
+                let respecified = self.history.steps[at..]
+                    .iter()
+                    .any(|step| matches!(step, Step::Partition(_)))
+                    && (partitioned(&self.history.steps[..at]) || partitioned(&self.history.steps));
+                if respecified {
+                    return Err(failed(
+                        &window,
+                        format!("a restore across a partition-spec change committed: {result:?}"),
+                    ));
                 }
                 self.ran("restore");
             },
         }
         let restored = sorted_rows(self.lake.rows(None, &select(steps)).await);
         if restored != expected {
-            return Err(failed(format!(
-                "rowid, * at the head after restoring to step {at} (snapshot {mark}):\n  \
+            return Err(failed(
+                &window,
+                format!(
+                    "rowid, * at the head after restoring to step {at} (snapshot {mark}):\n  \
                  mark: {}\n  head: {}",
-                describe_rows(&expected),
-                describe_rows(&restored)
-            )));
+                    describe_rows(&expected),
+                    describe_rows(&restored)
+                ),
+            ));
         }
         for ((snapshot, step), before) in kept.iter().zip(&history) {
             let after = sorted_rows(self.lake.rows(Some(*snapshot), &select(*step)).await);
             if &after != before {
-                return Err(failed(format!(
-                    "snapshot {snapshot} reads differently after the restore:\n  before: \
+                return Err(failed(
+                    &window,
+                    format!(
+                        "snapshot {snapshot} reads differently after the restore:\n  before: \
                      {}\n  after: {}",
-                    describe_rows(before),
-                    describe_rows(&after)
-                )));
+                        describe_rows(before),
+                        describe_rows(&after)
+                    ),
+                ));
             }
         }
         let after = sorted_rows(self.lake.rows(Some(current), &select(steps)).await);
         if after != before_restore {
-            return Err(failed(format!(
-                "the snapshot before the restore reads differently after it:\n  before: \
+            return Err(failed(
+                &window,
+                format!(
+                    "the snapshot before the restore reads differently after it:\n  before: \
                  {}\n  after: {}",
-                describe_rows(&before_restore),
-                describe_rows(&after)
-            )));
+                    describe_rows(&before_restore),
+                    describe_rows(&after)
+                ),
+            ));
         }
 
         // Official reads this crate's restored head as the mark.
@@ -4758,7 +4792,7 @@ impl Run<'_> {
                     copy.ducklake_uri(),
                     self.lake.data.display()
                 ))
-                .map_err(|e| failed(e.to_string()))?;
+                .map_err(|e| failed(&window, e.to_string()))?;
             let cells = self.cells(steps);
             let read = |sql: String| {
                 sorted_rows(Official::rows(&reader, &sql).map(|rows| normalize_cells(rows, &cells)))
@@ -4768,13 +4802,22 @@ impl Run<'_> {
                 "SELECT rowid, {} FROM t AT (VERSION => {mark})",
                 list(steps)
             ));
+            if let Err(error) = &at_mark {
+                return Err(failed(
+                    &window,
+                    format!("official reading AT (VERSION => {mark}): {error}"),
+                ));
+            }
             if at_head != at_mark {
-                return Err(failed(format!(
-                    "official reads the restored head apart from AT (VERSION => {mark}):\n  \
+                return Err(failed(
+                    &window,
+                    format!(
+                        "official reads the restored head apart from AT (VERSION => {mark}):\n  \
                      head: {}\n  mark: {}",
-                    describe_rows(&at_head),
-                    describe_rows(&at_mark)
-                )));
+                        describe_rows(&at_head),
+                        describe_rows(&at_mark)
+                    ),
+                ));
             }
             self.ran("restore: official reads the mark");
         }
@@ -4833,6 +4876,8 @@ impl Run<'_> {
             .collect()
     }
 
+    /// Note a rewrite at `step` (or a checkpoint's) that wrote the same rows
+    /// into more files here than official ([`known::rewrite_grouping`]).
     async fn note_rewrite_grouping(&mut self, step: usize) {
         let outputs = |metadata: &Metadata, heads: &[i64]| {
             let connection = duckdb_session();

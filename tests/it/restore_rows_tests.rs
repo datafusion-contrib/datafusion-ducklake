@@ -780,11 +780,13 @@ async fn refusals_of_changes(lake: &Lake) {
     lake.append_parquet("dr", &batch(1..=5, "a")).await;
     let mark_d = lake.head();
     create_with(lake, "dr", &[("id", DataType::Int64)]).unwrap();
+    let head = lake.head();
     let error = restore(lake, "dr", mark_d).await.unwrap_err();
     assert!(
         matches!(&error, DuckLakeError::Unsupported(m) if m.contains("columns changed")),
         "{error}"
     );
+    assert_eq!(lake.head(), head);
 
     // A column widened since the mark.
     create_with(
@@ -1189,6 +1191,7 @@ pub(crate) async fn restores_across_expired_snapshots(make: MakeLake) {
         .await
         .unwrap();
     let expected = lake.rows_at("t", Some(mark)).await;
+    let objects = files_under(&lake.data).len();
     let maintenance = lake.writer.maintenance().unwrap();
     maintenance
         .expire_snapshots(ExpireCriteria::Versions(vec![first, second]))
@@ -1202,6 +1205,10 @@ pub(crate) async fn restores_across_expired_snapshots(make: MakeLake) {
         )
         .await
         .unwrap();
+    assert!(
+        files_under(&lake.data).len() < objects,
+        "the cleanup removed a file only the expired snapshots read"
+    );
     let before = lake.head();
     let pre = lake.rows("t").await;
     let result = restore(&lake, "t", mark).await.unwrap();
@@ -1258,13 +1265,13 @@ macro_rules! per_backend {
             mod $name {
                 #[tokio::test(flavor = "multi_thread")]
                 async fn sqlite() {
-                    super::$name(super::sqlite()).await;
+                    Box::pin(super::$name(super::sqlite())).await;
                 }
 
                 #[cfg(feature = "write-duckdb")]
                 #[tokio::test(flavor = "multi_thread")]
                 async fn duckdb() {
-                    super::$name(super::duckdb()).await;
+                    Box::pin(super::$name(super::duckdb())).await;
                 }
             }
         )*
@@ -1361,59 +1368,66 @@ async fn multicatalog_scenarios() {
     ))
     .await;
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let catalog_id = datafusion_ducklake::MulticatalogManager::new(pool.clone())
-        .create_catalog("guarded")
-        .await
-        .unwrap();
-    let guard = Arc::new(Guard::default());
-    let writer = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
-        .await
-        .unwrap()
-        .with_data_inlining_row_limit(5)
-        .with_commit_guard(guard.clone());
-    writer.set_data_path(data.to_str().unwrap()).unwrap();
-    let provider = datafusion_ducklake::MulticatalogProvider::with_pool(pool, "guarded")
-        .await
-        .unwrap();
-    let lake = Lake {
-        writer: Arc::new(writer),
-        provider: Arc::new(provider),
-        data,
-        inlines: true,
-        _dir: dir,
-    };
-    create(&lake, "t").await;
-    lake.append_parquet("t", &batch(1..=20, "a")).await;
-    lake.append("t", &batch(100..=101, "i")).await;
-    let mark = lake.head();
-    lake.sql("DELETE FROM lake.main.t WHERE id <= 12")
-        .await
-        .unwrap();
-    lake.append_parquet("t", &batch(30..=39, "b")).await;
-    lake.sql("DELETE FROM lake.main.t WHERE id >= 30 AND id <= 31")
-        .await
-        .unwrap();
-    let head = lake.head();
-    let rows = lake.rows("t").await;
-    let objects = files_under(&lake.data);
-    guard.refuse.store(true, Ordering::SeqCst);
-    let error = restore(&lake, "t", mark).await.unwrap_err();
-    assert!(
-        matches!(&error, DuckLakeError::CommitRefused(source) if source.is::<Refused>()),
-        "{error}"
-    );
-    assert_eq!(lake.head(), head);
-    assert_eq!(lake.rows("t").await, rows);
-    assert_eq!(
-        files_under(&lake.data),
-        objects,
-        "the refused restore leaves none of the files it wrote"
-    );
-    guard.refuse.store(false, Ordering::SeqCst);
-    restore_and_check(&lake, "t", mark).await;
+    // On the heap, apart from the scenarios: one test body awaiting both
+    // outgrows a test thread's stack in a debug build.
+    Box::pin(guarded(pool)).await;
+
+    async fn guarded(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let catalog_id = datafusion_ducklake::MulticatalogManager::new(pool.clone())
+            .create_catalog("guarded")
+            .await
+            .unwrap();
+        let guard = Arc::new(Guard::default());
+        let writer =
+            datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(5)
+                .with_commit_guard(guard.clone());
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+        let provider = datafusion_ducklake::MulticatalogProvider::with_pool(pool, "guarded")
+            .await
+            .unwrap();
+        let lake = Lake {
+            writer: Arc::new(writer),
+            provider: Arc::new(provider),
+            data,
+            inlines: true,
+            _dir: dir,
+        };
+        create(&lake, "t").await;
+        lake.append_parquet("t", &batch(1..=20, "a")).await;
+        lake.append("t", &batch(100..=101, "i")).await;
+        let mark = lake.head();
+        lake.sql("DELETE FROM lake.main.t WHERE id <= 12")
+            .await
+            .unwrap();
+        lake.append_parquet("t", &batch(30..=39, "b")).await;
+        lake.sql("DELETE FROM lake.main.t WHERE id >= 30 AND id <= 31")
+            .await
+            .unwrap();
+        let head = lake.head();
+        let rows = lake.rows("t").await;
+        let objects = files_under(&lake.data);
+        guard.refuse.store(true, Ordering::SeqCst);
+        let error = restore(&lake, "t", mark).await.unwrap_err();
+        assert!(
+            matches!(&error, DuckLakeError::CommitRefused(source) if source.is::<Refused>()),
+            "{error}"
+        );
+        assert_eq!(lake.head(), head);
+        assert_eq!(lake.rows("t").await, rows);
+        assert_eq!(
+            files_under(&lake.data),
+            objects,
+            "the refused restore leaves none of the files it wrote"
+        );
+        guard.refuse.store(false, Ordering::SeqCst);
+        restore_and_check(&lake, "t", mark).await;
+    }
 }
 
 /// Single-catalog PostgreSQL stages no row mutation, so it refuses a
