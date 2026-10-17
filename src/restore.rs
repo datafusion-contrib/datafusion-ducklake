@@ -133,7 +133,8 @@ impl DuckLakeTable {
         // a caller that awaits it inside its own.
         let diff = Box::pin(context.diff(state)).await?;
         // An expiry commits no snapshot, so the commit's checks cannot see
-        // one: the mark surviving the reads shows they all read it whole.
+        // one: the mark surviving the diff's catalog reads shows they read it
+        // whole. A data file cleaned up since fails the read of its rows.
         mark_survives(self, snapshot)?;
         if diff.rows_removed == 0 && diff.rows_restored == 0 {
             return Ok(RestoreResult::default());
@@ -461,9 +462,8 @@ impl<'a> RestoreContext<'a> {
         let head = self.head;
         let base_snapshot = head.snapshot_id();
         let table_name = head.table_name();
-        let (data, row_ids) = self
-            .stage_restored(state, restored, restored_inlined, rows_restored)
-            .await?;
+        let (data, row_ids) =
+            Box::pin(self.stage_restored(state, restored, restored_inlined, rows_restored)).await?;
         let data_files = |data: &StagedTableData| match data {
             StagedTableData::Files(files) => files
                 .iter()
