@@ -1590,6 +1590,65 @@ pub(crate) async fn restores_partitioned_across_column_changes(make: MakeLake) {
     }
 }
 
+/// A column added since the mark and then made `NOT NULL` (declared again
+/// non-nullable once no live row holds a NULL there, as official's
+/// `SET NOT NULL` makes it): with no initial default the restored rows would
+/// hold NULL in it, and the restore is refused; with one they read it, and
+/// the restore goes ahead.
+pub(crate) async fn added_not_null_columns(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    for (table, default) in [("nn", None), ("nd", Some("5"))] {
+        create(&lake, table).await;
+        lake.append_parquet(table, &batch(1..=3, "a")).await;
+        lake.append(table, &batch([4], "i")).await;
+        let mark = lake.head();
+        let expected = with_cells(&lake.rows_at(table, Some(mark)).await, "5");
+        lake.sql(&format!("DELETE FROM lake.main.{table}"))
+            .await
+            .unwrap();
+        let declared = |nullable: bool| {
+            let mut c = ColumnDef::from_arrow("c", &DataType::Int32, nullable).unwrap();
+            if let Some(default) = default {
+                c = c.with_default(default).unwrap();
+            }
+            vec![column("id", &DataType::Int64), column("v", &DataType::Utf8), c]
+        };
+        evolve(&lake, table, &declared(true));
+        lake.sql(&format!(
+            "INSERT INTO lake.main.{table} (id, v, c) VALUES (9, 'x', 1)"
+        ))
+        .await
+        .unwrap();
+        evolve(&lake, table, &declared(false));
+        let table_id = lake.table_id(table);
+        let at_head = lake
+            .provider
+            .get_table_structure(table_id, lake.head())
+            .unwrap();
+        assert!(
+            at_head
+                .iter()
+                .any(|c| c.column_name == "c" && !c.is_nullable),
+            "c is NOT NULL"
+        );
+        let head = lake.head();
+        match default {
+            None => {
+                let error = restore(&lake, table, mark).await.unwrap_err();
+                assert!(
+                    matches!(&error, DuckLakeError::Unsupported(m)
+                        if m.contains("column 'c' was added NOT NULL with no default")),
+                    "{error}"
+                );
+                assert_eq!(lake.head(), head);
+            },
+            Some(_) => {
+                restore_and_check_as(&lake, table, mark, expected).await;
+            },
+        }
+    }
+}
+
 /// Snapshots between the mark and the head expired, and their files cleaned
 /// up: the rows at the mark are still restored whole.
 pub(crate) async fn restores_across_expired_snapshots(make: MakeLake) {
@@ -1721,6 +1780,7 @@ per_backend!(
     restores_across_widening,
     restores_across_added_columns,
     restores_partitioned_across_column_changes,
+    added_not_null_columns,
     restores_across_expired_snapshots,
     nothing_to_undo,
 );
@@ -2200,83 +2260,6 @@ async fn official_column_changes_since_the_mark() {
     }
     let expected = lake.rows_at("ok", Some(mark)).await;
     restore_and_check_as(&lake, "ok", mark, expected).await;
-}
-
-/// A column added since the mark and then made `NOT NULL`, as official's
-/// `SET NOT NULL` leaves it once no live row holds a NULL there (written
-/// into the catalog directly: this crate has no `SET NOT NULL`). With no
-/// initial default the restored rows would hold NULL in it, and the restore
-/// is refused; with one they read it, and the restore goes ahead.
-#[cfg(feature = "write-duckdb")]
-#[tokio::test(flavor = "multi_thread")]
-async fn added_not_null_columns_since_the_mark() {
-    use crate::inlined_mutation_differential_tests as differential;
-    let lake = duckdb()(Some(5)).await;
-    let mut marks = Vec::new();
-    for (table, default) in [("nn", None), ("nd", Some("5"))] {
-        create(&lake, table).await;
-        lake.append_parquet(table, &batch(1..=3, "a")).await;
-        lake.append(table, &batch([4], "i")).await;
-        let mark = lake.head();
-        let expected = with_cells(&lake.rows_at(table, Some(mark)).await, "5");
-        lake.sql(&format!("DELETE FROM lake.main.{table}"))
-            .await
-            .unwrap();
-        let mut added = column("c", &DataType::Int32);
-        if let Some(default) = default {
-            added = added.with_default(default).unwrap();
-        }
-        evolve(
-            &lake,
-            table,
-            &[column("id", &DataType::Int64), column("v", &DataType::Utf8), added],
-        );
-        lake.sql(&format!(
-            "INSERT INTO lake.main.{table} (id, v, c) VALUES (9, 'x', 1)"
-        ))
-        .await
-        .unwrap();
-        marks.push((table, mark, expected));
-    }
-    let Lake {
-        writer,
-        provider,
-        data,
-        _dir: dir,
-        ..
-    } = lake;
-    drop((writer, provider));
-    let path = dir.path().join("lake.ducklake");
-    let connection = differential::duckdb_connection();
-    connection
-        .execute_batch(&format!(
-            "ATTACH '{}' AS meta; UPDATE meta.ducklake_column SET nulls_allowed = false \
-             WHERE column_name = 'c' AND end_snapshot IS NULL; DETACH meta;",
-            path.display()
-        ))
-        .unwrap();
-    drop(connection);
-    let writer =
-        datafusion_ducklake::DuckdbMetadataWriter::new(path.display().to_string()).unwrap();
-    let provider = writer.metadata_provider();
-    let lake = Lake {
-        writer: Arc::new(writer),
-        provider: Arc::new(provider),
-        data,
-        inlines: true,
-        _dir: dir,
-    };
-    let (_, mark, _) = &marks[0];
-    let head = lake.head();
-    let error = restore(&lake, "nn", *mark).await.unwrap_err();
-    assert!(
-        matches!(&error, DuckLakeError::Unsupported(m)
-            if m.contains("column 'c' was added NOT NULL with no default")),
-        "{error}"
-    );
-    assert_eq!(lake.head(), head);
-    let (_, mark, expected) = &marks[1];
-    restore_and_check_as(&lake, "nd", *mark, expected.clone()).await;
 }
 
 /// A history of column changes and row changes written by this crate on a
