@@ -2692,36 +2692,18 @@ pub(crate) fn inlined_flush_table_conflict(
     })
 }
 
-/// The `changes_made` kinds whose id is a table's (official's
-/// `ParseChangeType`): the ids of schemas, views and macros come from the
-/// same sequence as tables' in official, but not in every catalog this crate
-/// writes, so a kind naming one of them never names a table.
-const TABLE_CHANGE_KINDS: &[&str] = &[
-    "inserted_into_table",
-    "deleted_from_table",
-    "inlined_insert",
-    "inlined_delete",
-    "flushed_inlined",
-    "inline_flush",
-    "merge_adjacent",
-    "rewrite_delete",
-    "compacted_table",
-    "altered_table",
-    "dropped_table",
-];
-
-/// Whether any of `changes` names table `table_id` with a table kind.
+/// Whether any of `changes` names table `table_id`: a token with its id, of
+/// any kind but those naming a schema, view or macro, so a kind this crate
+/// does not know counts.
 fn changes_name_table(changes: &[Option<String>], table_id: i64) -> bool {
     changes
         .iter()
         .flatten()
         .flat_map(|changes| snapshot_change_tokens(changes))
         .any(|token| {
-            token.split_once(':').is_some_and(|(kind, id)| {
-                TABLE_CHANGE_KINDS
-                    .iter()
-                    .any(|table_kind| kind.eq_ignore_ascii_case(table_kind))
-                    && id.parse::<i64>().ok() == Some(table_id)
+            token.trim().split_once(':').is_some_and(|(kind, id)| {
+                !crate::metadata_provider::change_kind_names_other_object(kind)
+                    && id.trim().parse::<i64>().ok() == Some(table_id)
             })
         })
 }
@@ -4920,15 +4902,29 @@ mod tests {
         );
     }
 
-    /// Official's table-level conflict check: inserts before deletions, each
-    /// against the other changes in official's order, across every snapshot
-    /// since the base, worded as official words it.
+    /// A restore's conflict check counts a token with the table's id of
+    /// any kind, a kind it does not know included, but one naming a schema,
+    /// view or macro by an id that happens to equal it.
     #[test]
-    fn only_table_kinds_name_a_table() {
+    fn only_tokens_naming_a_table_name_it() {
         let changes = |list: &[&str]| -> Vec<Option<String>> {
             list.iter().map(|c| Some((*c).to_string())).collect()
         };
-        for kind in TABLE_CHANGE_KINDS {
+        for kind in [
+            "inserted_into_table",
+            "deleted_from_table",
+            "inlined_insert",
+            "inlined_delete",
+            "flushed_inlined",
+            "inline_flush",
+            "merge_adjacent",
+            "rewrite_delete",
+            "compacted_table",
+            "altered_table",
+            "dropped_table",
+            "Inserted_Into_Table",
+            "a_kind_added_later",
+        ] {
             assert!(
                 changes_name_table(&changes(&[&format!("{kind}:7")]), 7),
                 "{kind}"
@@ -4942,6 +4938,7 @@ mod tests {
             "dropped_schema:7",
             "dropped_view:7",
             "altered_view:7",
+            "Altered_View:7",
             "dropped_scalar_macro:7",
             "dropped_table_macro:7",
             "created_table:\"main\".\"t\"",
@@ -4952,6 +4949,9 @@ mod tests {
         assert!(!changes_name_table(&[None], 7));
     }
 
+    /// Official's table-level conflict check: inserts before deletions, each
+    /// against the other changes in official's order, across every snapshot
+    /// since the base, worded as official words it.
     #[test]
     fn table_conflicts_follow_official_order_and_wording() {
         let changes = |list: &[&str]| -> Vec<Option<String>> {

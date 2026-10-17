@@ -207,15 +207,7 @@ impl TableDataChanges {
                 continue;
             }
             let kind = kind.trim().to_ascii_lowercase();
-            // Tokens naming another kind of object by its id.
-            if matches!(
-                kind.as_str(),
-                "dropped_schema"
-                    | "dropped_view"
-                    | "altered_view"
-                    | "dropped_scalar_macro"
-                    | "dropped_table_macro"
-            ) {
+            if crate::metadata_provider::change_kind_names_other_object(&kind) {
                 continue;
             }
             any = true;
