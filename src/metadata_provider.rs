@@ -1,4 +1,4 @@
-use crate::inlined_filter::{InlinedDataScan, InlinedFilter};
+use crate::inlined_filter::{InlinedDataScan, InlinedFilter, InlinedScanRead};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, SchemaRef};
@@ -1482,6 +1482,53 @@ pub struct DuckLakeInlinedRows {
     /// The rows under the requested columns, resolved by column id against the
     /// schema version the physical table was written with.
     pub batch: RecordBatch,
+    /// The catalog's next data file id, read no later than these rows: a data
+    /// file committed after the read has an id at least this. `None` when the
+    /// provider does not read it.
+    ///
+    /// A flush deletes the rows it moves from the inlined table and registers
+    /// the files that now hold them from the rows' own snapshots, so a scan
+    /// that reads the inlined rows and the file listing in separate statements
+    /// can see the moved rows in both. Read the rows first, then list the
+    /// files: a listed file at or above this id was committed since, and the
+    /// scan reads both again, as official DuckLake does. The built-in
+    /// providers read it in the statement that lists the inlined-data tables.
+    pub next_file_id: Option<i64>,
+}
+
+/// The catalog's next data file id, as a scalar subquery: one past the largest
+/// committed data file id (see [`DuckLakeInlinedRows::next_file_id`]).
+///
+/// A data file committed after this read has an id at least this, because
+/// every writer allocates its file ids inside the commit that registers them,
+/// from an allocator past every committed id, while holding the lock that
+/// orders its catalog's commits: SQLite's write lock, the counter row lock of
+/// MySQL and of PostgreSQL's snapshot id, the catalog row lock of the
+/// multicatalog layout, the DuckDB writer's connection, and for official
+/// DuckLake the snapshot row a commit inserts. No id is reserved below a
+/// committed one, so the ids commit in order.
+///
+/// Official DuckLake reads its snapshot's `next_file_id` counter instead. The
+/// largest committed id is never above that counter, so a scan that compares
+/// against it misses nothing the counter would catch, and it is also correct
+/// where a writer allocates from a sequence or from a `ducklake_metadata`
+/// counter. A sequence's current value would not do: it counts reservations
+/// not yet committed, which can then commit below it.
+///
+/// A catalog that holds several catalogs with their own commit order (the
+/// multicatalog layout) reads it per table instead
+/// ([`next_table_file_id_sql`]).
+pub(crate) const SQL_NEXT_FILE_ID: &str =
+    "(SELECT COALESCE(MAX(data_file_id), -1) + 1 FROM ducklake_data_file)";
+
+/// [`SQL_NEXT_FILE_ID`] over the data files of the table `table_id` names, a
+/// placeholder or a column: a data file of that table committed after this
+/// read has an id at least this.
+pub(crate) fn next_table_file_id_sql(table_id: &str) -> String {
+    format!(
+        "(SELECT COALESCE(MAX(data_file_id), -1) + 1 FROM ducklake_data_file \
+         WHERE table_id = {table_id})"
+    )
 }
 
 /// One inlined deletion of a Parquet-resident row
@@ -2901,20 +2948,27 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// commit can then inline rows at a snapshot that such a read sees.
     ///
     /// `None` means a registered table holds such a row, the catalog has no
-    /// registry yet, or the provider cannot tell. The default delegates to
-    /// [`Self::scan_inlined_data`] and answers `None`, so a provider that does
-    /// not override this one reads on every scan, as before.
+    /// registry yet, or the provider cannot tell.
+    ///
+    /// The read also reports the catalog's next data file id, read no later
+    /// than the rows ([`InlinedScanRead::next_file_id`]), which a scan that
+    /// lists its files after the rows checks them against (see
+    /// [`DuckLakeInlinedRows::next_file_id`]).
+    ///
+    /// The default delegates to [`Self::scan_inlined_data`] and answers `None`
+    /// to both, so a provider that does not override this one reads on every
+    /// scan, and its scans do not check their listing against a flush.
     fn scan_inlined_data_noting_absence(
         &self,
         table_id: i64,
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, Option<i64>)> {
-        Ok((
-            self.scan_inlined_data(table_id, snapshot_id, columns, filter)?,
-            None,
-        ))
+    ) -> Result<InlinedScanRead> {
+        Ok(InlinedScanRead {
+            scan: self.scan_inlined_data(table_id, snapshot_id, columns, filter)?,
+            ..InlinedScanRead::default()
+        })
     }
 
     /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
@@ -3026,7 +3080,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// table was written with, so a renamed column reads its old values and a
     /// column dropped and re-added under one name does not. `filter` may be
     /// applied conservatively: an implementation must never exclude a row that
-    /// could satisfy it.
+    /// could satisfy it. Each entry carries the catalog's next data file id,
+    /// read no later than its rows, when the provider reads it
+    /// ([`DuckLakeInlinedRows::next_file_id`]).
     ///
     /// The default serves [`InlinedRowSelection::VisibleAt`] from
     /// [`Self::get_inlined_data_with_row_ids`], and refuses rather than reports
@@ -3061,6 +3117,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
                         row_ids: rows.row_ids,
                         snapshots: rows.begin_snapshots,
                         batch: rows.batch,
+                        next_file_id: None,
                     })
                     .collect())
             },

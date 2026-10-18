@@ -267,27 +267,37 @@ impl MulticatalogManager {
                 .unwrap_or_default(),
         };
 
-        // Each live file with its statistics and partition values.
+        // Each live file with its statistics and partition values, listed
+        // after the source's inlined deletions and inlined rows, so that a
+        // flush of the source between the reads moves no row or deletion out
+        // of all of them (`DuckLakeTable::inlined_rows_then_files`).
         let adopted: HashSet<i64> = column_ids.iter().copied().collect();
-        let mut metadata = Vec::new();
-        let mut after = None;
-        loop {
-            let page = provider.get_table_file_metadata_page(
-                source_table_id,
-                snapshot,
-                after,
-                crate::metadata_provider::FILE_METADATA_BATCH_SIZE,
-            )?;
-            let Some(last) = page.last() else {
-                break;
-            };
-            after = Some(last.file.data_file_id);
-            let last_page = page.len() < crate::metadata_provider::FILE_METADATA_BATCH_SIZE;
-            metadata.extend(page);
-            if last_page {
-                break;
-            }
-        }
+        let inlined_deletes = source.inlined_deletes_by_file().map_err(df_error)?;
+        let (rows, mut metadata) = source.inlined_rows_then_files(
+            || {
+                let mut metadata = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = provider.get_table_file_metadata_page(
+                        source_table_id,
+                        snapshot,
+                        after,
+                        crate::metadata_provider::FILE_METADATA_BATCH_SIZE,
+                    )?;
+                    let Some(last) = page.last() else {
+                        break;
+                    };
+                    after = Some(last.file.data_file_id);
+                    let last_page = page.len() < crate::metadata_provider::FILE_METADATA_BATCH_SIZE;
+                    metadata.extend(page);
+                    if last_page {
+                        break;
+                    }
+                }
+                Ok(metadata)
+            },
+            |entry| entry.file.data_file_id,
+        )?;
         // A file of no rows holds nothing the fork reads: the 0-row file a
         // Replace with no rows commits to retire the prior generation (with no
         // partition values on a partitioned table). Official writes no file for
@@ -331,7 +341,6 @@ impl MulticatalogManager {
         let table_writer =
             DuckLakeTableWriter::new(Arc::clone(&destination), Arc::clone(&object_store))?
                 .with_options(source.write_options());
-        let inlined_deletes = source.inlined_deletes_by_file().map_err(df_error)?;
 
         // Every object the fork writes, removed when it commits nothing.
         let mut written: Vec<ObjectPath> = Vec::new();
@@ -446,7 +455,6 @@ impl MulticatalogManager {
             // The source's inlined rows, as a flush writes them.
             let mut inlined_rows = 0;
             let mut inlined_files_written = 0;
-            let rows = source.inlined_data_with_row_ids()?;
             if !rows.is_empty() {
                 // The keys the fork's own files of inlined rows are sorted by, as
                 // a flush of the fork's table sorts them.

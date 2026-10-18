@@ -17,7 +17,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_ducklake::inlined_filter::{InlinedDataScan, InlinedFilter};
+use datafusion_ducklake::inlined_filter::{InlinedDataScan, InlinedFilter, InlinedScanRead};
 use datafusion_ducklake::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileMetadata, DuckLakeInlinedData,
     DuckLakeInlinedDelete, DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeStatistics,
@@ -77,6 +77,11 @@ impl CountingProvider {
     /// Run `run` once, just before the next call of `method`.
     fn before(&self, method: &'static str, run: impl FnOnce() + Send + 'static) {
         *self.hook.lock().unwrap() = Some((method, Box::new(run)));
+    }
+
+    /// Whether the hook [`Self::before`] set has run.
+    fn hook_ran(&self) -> bool {
+        self.hook.lock().unwrap().is_none()
     }
 
     /// The calls made since the last `take`, cleared.
@@ -238,7 +243,7 @@ impl MetadataProvider for CountingProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, Option<i64>)> {
+    ) -> Result<InlinedScanRead> {
         self.count("scan_inlined_data_noting_absence");
         self.inner
             .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)
@@ -942,22 +947,33 @@ async fn a_table_over_the_budget_reads_the_catalog_on_every_query() -> anyhow::R
     let expected = Caller::plain(&lake).await?.query(all).await?;
 
     let caller = Caller::new(&lake, Some(CatalogReadMemo::new(1)), false).await?;
-    // The first query reads the inlined deletions and the files for the memo,
-    // finds that they do not fit, and reads the catalog for itself. Later
-    // queries do not try again.
-    for (run, reads) in [(0, 2), (1, 1)] {
-        assert_eq!(caller.query(all).await?, expected);
-        assert_eq!(
-            caller.counting.take(),
-            BTreeMap::from([
-                ("get_current_snapshot", 1),
-                ("get_inlined_deletes", reads),
-                ("get_table_file_metadata_page_filtered", reads),
-                ("scan_inlined_data_noting_absence", 1),
-            ]),
-            "query {run}"
-        );
-    }
+    // The first query reads the inlined deletions, the inlined rows and the
+    // files for the memo, finds that they do not fit, and reads the catalog for
+    // itself. Later queries do not try again.
+    assert_eq!(caller.query(all).await?, expected);
+    assert_eq!(
+        caller.counting.take(),
+        BTreeMap::from([
+            ("get_current_snapshot", 1),
+            ("get_inlined_deletes", 2),
+            ("get_table_file_metadata_page_filtered", 2),
+            ("get_table_structure", 1),
+            ("read_inlined_rows", 1),
+            ("scan_inlined_data_noting_absence", 2),
+        ]),
+        "query 0"
+    );
+    assert_eq!(caller.query(all).await?, expected);
+    assert_eq!(
+        caller.counting.take(),
+        BTreeMap::from([
+            ("get_current_snapshot", 1),
+            ("get_inlined_deletes", 1),
+            ("get_table_file_metadata_page_filtered", 1),
+            ("scan_inlined_data_noting_absence", 1),
+        ]),
+        "query 1"
+    );
     Ok(())
 }
 
@@ -1622,6 +1638,183 @@ async fn the_delete_memo_follows_a_replaced_delete_file() -> anyhow::Result<()> 
 }
 
 // ---------------------------------------------------------------------------
+// A flush between a scan's reads
+// ---------------------------------------------------------------------------
+
+/// The catalog reads a flush can commit between: each scan's reads of the
+/// inlined rows and of the file listing, as `(scan, before)` where `before` is
+/// the read the flush commits just before. A plain scan reads the inlined rows
+/// without row ids, a `rowid` scan with them. A memo fill reads both.
+const FLUSH_POINTS: &[(&str, &str)] = &[
+    ("plain", "scan_inlined_data_noting_absence"),
+    ("plain", "get_table_file_metadata_page_filtered"),
+    ("rowid", "read_inlined_rows"),
+    ("rowid", "get_table_file_metadata_page_filtered"),
+    ("memo", "scan_inlined_data_noting_absence"),
+    ("memo", "read_inlined_rows"),
+    ("memo", "get_table_file_metadata_page_filtered"),
+];
+
+/// A flush that commits between a scan's reads of the inlined rows and of its
+/// files moves rows from one to the other: the inlined rows 100 and 101 into a
+/// new file, the inlined deletions of rows 3 and 7 into a delete file. The
+/// scan still returns every row of its snapshot once, with its `rowid`, and
+/// `count(*)` counts each once. Official DuckLake reads the inlined rows first
+/// and lists the files again when it finds a file written since.
+async fn flush_between_a_scans_reads(backend: &Backend) -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    for &(scan, before) in FLUSH_POINTS {
+        for sql in [
+            "SELECT id FROM t ORDER BY id",
+            "SELECT rowid, id FROM t ORDER BY rowid",
+            "SELECT count(*) FROM t",
+        ] {
+            let row_lineage = sql.contains("rowid");
+            if (scan == "plain" && row_lineage) || (scan == "rowid" && !row_lineage) {
+                continue;
+            }
+            let lake = backend.lake(10, INLINED).await?;
+            let expected = Caller::new(&lake, None, row_lineage)
+                .await?
+                .query(sql)
+                .await?;
+            let memo =
+                (scan == "memo").then(|| CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES));
+            let caller = Caller::new(&lake, memo, row_lineage).await?;
+            caller.counting.before(before, lake.runner(FLUSH));
+            let rows = caller.query(sql).await?;
+            assert!(caller.counting.hook_ran(), "{scan}, {before}: {sql}");
+            if rows != expected {
+                wrong.push(format!(
+                    "{scan} scan, flush before {before}: {sql}\n{rows}\nexpected\n{expected}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_scans_reads_moves_no_row_out_of_it() -> anyhow::Result<()> {
+    flush_between_a_scans_reads(&Backend::Sqlite).await
+}
+
+const FLUSH: &[&str] = &["CALL ducklake_flush_inlined_data('lake')"];
+
+/// The reads of the inlined rows (with their row ids) and of the files that a
+/// lookup by `rowid` or a mutation makes, in that order.
+const ROW_READS: &[&str] = &["read_inlined_rows", "get_table_files_for_select"];
+
+/// A lookup by `rowid` with a flush between its reads finds each row once:
+/// row 5 in the Parquet file, rows 20 and 21 (ids 100 and 101) inlined or in
+/// the file the flush wrote. Reading the rows returns each once too.
+async fn flush_between_a_rowid_lookups_reads(backend: &Backend) -> anyhow::Result<()> {
+    for &before in ROW_READS {
+        let lake = backend.lake(10, INLINED).await?;
+        let caller = Caller::plain(&lake).await?;
+        let table = caller
+            .table
+            .with_metadata_provider(Arc::new(caller.counting.clone()));
+        let state = SessionContext::new().state();
+
+        caller.counting.before(before, lake.runner(FLUSH));
+        let mut found: Vec<i64> = table
+            .locate_rowids(&state, &[5, 20, 21])
+            .await?
+            .iter()
+            .map(|row| row.row_id)
+            .collect();
+        assert!(caller.counting.hook_ran(), "locate, flush before {before}");
+        found.sort_unstable();
+        assert_eq!(found, [5, 20, 21], "locate, flush before {before}");
+
+        #[cfg(feature = "write")]
+        {
+            let lake = backend.lake(10, INLINED).await?;
+            let caller = Caller::plain(&lake).await?;
+            let table = caller
+                .table
+                .with_metadata_provider(Arc::new(caller.counting.clone()));
+            caller.counting.before(before, lake.runner(FLUSH));
+            let batches = table.read_rows_by_rowid(&state, &[5, 20, 21]).await?;
+            assert!(caller.counting.hook_ran(), "read, flush before {before}");
+            let mut ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .expect("id is Int32")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [5, 100, 101], "read, flush before {before}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_rowid_lookups_reads_finds_each_row_once() -> anyhow::Result<()> {
+    flush_between_a_rowid_lookups_reads(&Backend::Sqlite).await
+}
+
+/// A `DELETE` with a flush between its reads of the inlined rows and of the
+/// files either deletes every matching row, the ones the flush moved too, or
+/// fails with a conflict and deletes none. Read in the other order, the moved
+/// rows were in neither read, and the `DELETE` committed without them: its
+/// deletions of more rows than the inlining limit, from the Parquet file
+/// alone, do not conflict with a flush that only moved inlined rows.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_deletes_reads_leaves_no_row_undeleted() -> anyhow::Result<()> {
+    let matching = "SELECT id FROM t WHERE id < 15 OR id >= 100 ORDER BY id";
+    for &before in ROW_READS {
+        let lake = Lake::new(
+            10,
+            &[
+                "CREATE TABLE lake.t (id INT)",
+                "INSERT INTO lake.t SELECT i FROM range(20) r(i)",
+                "INSERT INTO lake.t VALUES (100), (101)",
+            ],
+        )?;
+        let counting = lake.provider().await?;
+        let url = format!("sqlite:{}", lake.catalog_path().display());
+        let writer = datafusion_ducklake::SqliteMetadataWriter::new(&url).await?;
+        let catalog = DuckLakeCatalog::with_writer(Arc::new(counting.clone()), Arc::new(writer))?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::new(catalog));
+        let before_delete = Caller::plain(&lake).await?.query(matching).await?;
+
+        counting.before(before, lake.runner(FLUSH));
+        let deleted = query(&ctx, "DELETE FROM lake.main.t WHERE id < 15 OR id >= 100").await;
+        assert!(counting.hook_ran(), "flush before {before}");
+        let left = Caller::plain(&lake).await?.query(matching).await?;
+        match deleted {
+            Ok(deleted) => {
+                assert!(
+                    deleted.contains("| 17    |"),
+                    "flush before {before}: {deleted}"
+                );
+                assert_eq!(left, "++\n++", "flush before {before}");
+            },
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("conflict"),
+                    "flush before {before}: {error}"
+                );
+                assert_eq!(left, before_delete, "flush before {before}");
+            },
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PostgreSQL metadata
 // ---------------------------------------------------------------------------
 
@@ -1708,6 +1901,18 @@ mod postgres {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_commit_during_the_fill_does_not_count_from_the_catalog() -> anyhow::Result<()> {
         commit_during_the_fill_does_not_count_from_the_catalog(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flush_between_a_scans_reads_moves_no_row_out_of_it() -> anyhow::Result<()> {
+        flush_between_a_scans_reads(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flush_between_a_rowid_lookups_reads_finds_each_row_once() -> anyhow::Result<()> {
+        flush_between_a_rowid_lookups_reads(&backend().await?).await
     }
 
     #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]

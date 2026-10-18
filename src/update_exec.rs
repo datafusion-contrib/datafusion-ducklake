@@ -66,6 +66,7 @@ use futures::stream::{self, TryStreamExt};
 
 use crate::compaction::sorted_rewrite_batches;
 use crate::delete_exec::{DeletionTarget, FileDeletions};
+use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
     DataFileInfo, DeleteFileEntry, InlinedRowRef, MetadataWriter, StagedTableData, WriteMode,
 };
@@ -93,6 +94,10 @@ pub struct DuckLakeUpdateExec {
     base_snapshot: i64,
     /// Per-source-file positional read plans (built at plan time).
     scans: Vec<UpdateSourceScan>,
+    /// The visible inlined rows, read at plan time before the source files
+    /// ([`DuckLakeTable::inlined_rows_then_files`]); empty for a writer that
+    /// cannot commit inlined row mutations.
+    inlined: Arc<Vec<DuckLakeInlinedData>>,
     /// `(physical_column_index, new_value_expr)` for each assigned column.
     assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
     /// AND of the WHERE predicates, or `None` to update all rows.
@@ -111,6 +116,7 @@ impl DuckLakeUpdateExec {
         table_name: String,
         base_snapshot: i64,
         scans: Vec<UpdateSourceScan>,
+        inlined: Vec<DuckLakeInlinedData>,
         assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
         object_store_url: Arc<ObjectStoreUrl>,
@@ -123,6 +129,7 @@ impl DuckLakeUpdateExec {
             table_name,
             base_snapshot,
             scans,
+            inlined: Arc::new(inlined),
             assignments,
             predicate,
             object_store_url,
@@ -228,6 +235,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let table_name = self.table_name.clone();
         let base_snapshot = self.base_snapshot;
         let scans = self.scans.clone();
+        let inlined = Arc::clone(&self.inlined);
         let assignments = self.assignments.clone();
         let predicate = self.predicate.clone();
         let object_store_url = self.object_store_url.clone();
@@ -296,10 +304,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             }
 
             if inline_capable {
-                let inlined = table
-                    .inlined_data_with_row_ids()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                for rows in &inlined {
+                for rows in inlined.iter() {
                     if let Some((batch, superseded)) =
                         table.apply_update_to_inlined(rows, predicate.as_ref(), &assignments)?
                     {

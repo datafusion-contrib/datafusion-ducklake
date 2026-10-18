@@ -27,8 +27,19 @@ use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::DuckLakeError;
-use crate::metadata_provider::DuckLakeTableFile;
+use crate::metadata_provider::{DuckLakeInlinedData, DuckLakeTableFile};
 use crate::table::DuckLakeTable;
+
+/// What [`DuckLakeTable::locate_rowids`] read: where each row is, and the
+/// inlined rows, the files and their inlined deletions it found them in.
+struct Located {
+    rows: Vec<RowIdLocation>,
+    inlined: Vec<DuckLakeInlinedData>,
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    files: Vec<DuckLakeTableFile>,
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    inlined_deletes: std::collections::HashMap<i64, HashSet<i64>>,
+}
 
 /// Where a Parquet file's rows take their `rowid` from
 /// ([`DuckLakeTable::file_row_id_layout`]).
@@ -103,12 +114,29 @@ impl DuckLakeTable {
         state: &dyn Session,
         row_ids: &[i64],
     ) -> crate::Result<Vec<RowIdLocation>> {
+        Ok(self.locate(state, row_ids).await?.rows)
+    }
+
+    /// [`Self::locate_rowids`], with what it read the rows from. The inlined
+    /// deletions, then the inlined rows, then the files are read, in the
+    /// order a scan reads them, so that a flush between the reads moves no
+    /// row out of all of them or into two
+    /// ([`DuckLakeTable::inlined_rows_then_files`]).
+    async fn locate(&self, state: &dyn Session, row_ids: &[i64]) -> crate::Result<Located> {
         let wanted: HashSet<i64> = row_ids.iter().copied().collect();
-        let mut located = Vec::new();
         if wanted.is_empty() {
-            return Ok(located);
+            return Ok(Located {
+                rows: Vec::new(),
+                inlined: Vec::new(),
+                files: Vec::new(),
+                inlined_deletes: std::collections::HashMap::new(),
+            });
         }
-        for rows in self.inlined_data_with_row_ids()? {
+        let inlined_deletes = self.inlined_deletes_by_file().map_err(df_error)?;
+        let (inlined, files) =
+            self.inlined_rows_then_files(|| self.files(), |file| file.data_file_id)?;
+        let mut located = Vec::new();
+        for rows in &inlined {
             for row_id in &rows.row_ids {
                 if wanted.contains(row_id) {
                     located.push(RowIdLocation {
@@ -120,24 +148,28 @@ impl DuckLakeTable {
                 }
             }
         }
-        let inlined_deletes = self.inlined_deletes_by_file().map_err(df_error)?;
         let snapshot_id = self.snapshot_id();
         let wanted = &wanted;
+        let inlined_deletes_ref = &inlined_deletes;
         let concurrency = state.config().target_partitions().max(1);
-        let pending: Vec<BoxFuture<'_, crate::Result<Vec<RowIdLocation>>>> = self
-            .files()?
-            .into_iter()
+        let pending: Vec<BoxFuture<'_, crate::Result<Vec<RowIdLocation>>>> = files
+            .iter()
             .map(|file| -> BoxFuture<'_, crate::Result<Vec<RowIdLocation>>> {
-                let inlined = inlined_deletes.get(&file.data_file_id);
+                let inlined = inlined_deletes_ref.get(&file.data_file_id);
                 Box::pin(async move {
-                    self.locate_in_file(state, &file, wanted, inlined, snapshot_id)
+                    self.locate_in_file(state, file, wanted, inlined, snapshot_id)
                         .await
                 })
             })
             .collect();
-        let files = bounded(pending, concurrency).await?;
-        located.extend(files.into_iter().flatten());
-        Ok(located)
+        let in_files = bounded(pending, concurrency).await?;
+        located.extend(in_files.into_iter().flatten());
+        Ok(Located {
+            rows: located,
+            inlined,
+            files,
+            inlined_deletes,
+        })
     }
 
     async fn locate_in_file(
@@ -251,11 +283,11 @@ impl DuckLakeTable {
         state: &dyn Session,
         row_ids: &[i64],
     ) -> crate::Result<Vec<arrow::record_batch::RecordBatch>> {
-        let located = self.locate_rowids(state, row_ids).await?;
+        let located = self.locate(state, row_ids).await?;
         let mut inlined_ids = HashSet::new();
         let mut by_file: std::collections::HashMap<i64, HashSet<i64>> =
             std::collections::HashMap::new();
-        for row in &located {
+        for row in &located.rows {
             match &row.location {
                 RowLocation::Inlined {
                     ..
@@ -273,7 +305,7 @@ impl DuckLakeTable {
         }
         let mut batches = Vec::new();
         if !inlined_ids.is_empty() {
-            for rows in self.inlined_data_with_row_ids()? {
+            for rows in &located.inlined {
                 if !rows
                     .row_ids
                     .iter()
@@ -286,7 +318,7 @@ impl DuckLakeTable {
                         datafusion::common::ScalarValue::Boolean(Some(true)),
                     ));
                 if let Some((batch, _)) =
-                    self.apply_update_to_inlined(&rows, Some(&predicate), &[])?
+                    self.apply_update_to_inlined(rows, Some(&predicate), &[])?
                 {
                     let ids = batch
                         .column(batch.num_columns() - 1)
@@ -307,14 +339,13 @@ impl DuckLakeTable {
         if by_file.is_empty() {
             return Ok(batches);
         }
-        let inlined_deletes = self.inlined_deletes_by_file().map_err(df_error)?;
-        let files: Vec<DuckLakeTableFile> = self
-            .files()?
+        let files: Vec<DuckLakeTableFile> = located
+            .files
             .into_iter()
             .filter(|file| by_file.contains_key(&file.data_file_id))
             .collect();
         let by_file = &by_file;
-        let inlined_deletes = &inlined_deletes;
+        let inlined_deletes = &located.inlined_deletes;
         let concurrency = state.config().target_partitions().max(1);
         type Read = datafusion::error::Result<Vec<arrow::record_batch::RecordBatch>>;
         let pending: Vec<BoxFuture<'_, Read>> = files

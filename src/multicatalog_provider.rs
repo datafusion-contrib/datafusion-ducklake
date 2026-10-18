@@ -510,7 +510,14 @@ impl MulticatalogProvider {
             let ledger = caps.ledger();
             self.on_connection(async |connection| {
                 read_inlined_rows_on(
-                    connection, ledger, table_id, columns, selection, filter, shape,
+                    connection,
+                    ledger,
+                    Some(self.catalog_id),
+                    table_id,
+                    columns,
+                    selection,
+                    filter,
+                    shape,
                 )
                 .await
             })
@@ -1995,7 +2002,7 @@ impl MetadataProvider for MulticatalogProvider {
     ) -> Result<crate::inlined_filter::InlinedDataScan> {
         Ok(self
             .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
-            .0)
+            .scan)
     }
 
     fn scan_inlined_data_noting_absence(
@@ -2004,13 +2011,13 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&crate::inlined_filter::InlinedFilter>,
-    ) -> Result<(crate::inlined_filter::InlinedDataScan, Option<i64>)> {
+    ) -> Result<crate::inlined_filter::InlinedScanRead> {
         block_on(async {
             // No registry yet, so no inlined rows. Not an answer to keep: a
             // migration can add the registry, and a later commit inline rows.
             let caps = self.schema_capabilities().await?;
             if !caps.inlined_data_tables {
-                return Ok((crate::inlined_filter::InlinedDataScan::default(), None));
+                return Ok(crate::inlined_filter::InlinedScanRead::default());
             }
             let ledger = caps.ledger();
             // The registry, then each inlined table's rows, all on one

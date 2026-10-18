@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inlined rows, inlined deletions, column metadata and tags; it returns a `TableFork`.
 - `InlinedFlushPolicy`, opt-in and not in official DuckLake: `merge_adjacent_files` and
   `rewrite_data_files` flush a due table's inlined data first (`inlined_flush_snapshot`).
-- `MetadataProvider::scan_inlined_data_noting_absence` also reports the latest snapshot through
-  which a table has no inlined rows. The PostgreSQL and multicatalog providers implement it.
+- `MetadataProvider::scan_inlined_data_noting_absence` returns an `InlinedScanRead`: the rows, the
+  latest snapshot through which a table has none, and the catalog's next data file id.
 - `MulticatalogProvider::begin_read_session` and `with_read_session` run a query's catalog
   reads on one pooled connection (#338).
 - `DuckLakeTable::with_metadata_provider` binds a cached table to a read session per query.
@@ -310,6 +310,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns for the next commit at the same schema version.
 - `ducklake_table_changes` reports a row once per row of the other side sharing its snapshot
   and row id, as official's join does, instead of an update preimage without its postimage.
+- A scan, `rowid` lookup, `DELETE`, `UPDATE`, keyed mutation or fork no longer misses or
+  doubles inlined rows that a concurrent flush moves to a file between its catalog reads.
 
 ## [0.9.0] - 2026-10-07
 

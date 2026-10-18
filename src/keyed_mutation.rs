@@ -430,8 +430,11 @@ impl<'a> KeyedMutation<'a> {
             return Ok(KeyedMutationResult::default());
         }
         let predicate = keys.predicate(&context.physical_schema, &context.key_indices)?;
-        let files = self.table.files_matching(&predicate.range_or_true())?;
         let inlined_deletes = self.table.inlined_deletes_by_file().map_err(from_df)?;
+        let (inlined, files) = self.table.inlined_rows_then_files(
+            || self.table.files_matching(&predicate.range_or_true()),
+            |file| file.data_file_id,
+        )?;
         let task_ctx = state.task_ctx();
         let concurrency = self.concurrency(state);
         let table = self.table;
@@ -483,7 +486,7 @@ impl<'a> KeyedMutation<'a> {
 
         let mut updated_batches = Vec::new();
         let mut superseded_inlined = Vec::new();
-        for rows in self.table.inlined_data_with_row_ids()? {
+        for rows in inlined {
             if let Some((batch, superseded)) =
                 self.table
                     .apply_update_to_inlined(&rows, Some(&combined), &[])?
@@ -630,8 +633,11 @@ impl<'a> KeyedMutation<'a> {
         keys: &KeySet,
     ) -> crate::Result<MatchedRows> {
         let predicate = keys.predicate(&context.physical_schema, &context.key_indices)?;
-        let files = self.table.files_matching(&predicate.range_or_true())?;
         let inlined_deletes = self.table.inlined_deletes_by_file().map_err(from_df)?;
+        let (inlined, files) = self.table.inlined_rows_then_files(
+            || self.table.files_matching(&predicate.range_or_true()),
+            |file| file.data_file_id,
+        )?;
         let combined = predicate.combined();
         let table = self.table;
         let pending: Vec<BoxFuture<'_, DataFusionResult<Option<FileMatch>>>> = files
@@ -684,7 +690,7 @@ impl<'a> KeyedMutation<'a> {
             .collect();
 
         let mut inlined_rows = Vec::new();
-        for rows in self.table.inlined_data_with_row_ids()? {
+        for rows in inlined {
             let batch = coerce_to_schema(&rows.batch, &context.physical_schema)?;
             let mask = keys.contains(&batch)?;
             for (row, row_id) in rows.row_ids.iter().enumerate() {
