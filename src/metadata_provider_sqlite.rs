@@ -2,9 +2,9 @@
 
 use crate::Result;
 use crate::inlined_filter::{
-    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+    InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
+    render_inlined_filter,
 };
-use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -22,6 +22,7 @@ use crate::metadata_provider::{
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
     reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
+use crate::metadata_provider::{SQL_FILE_SCHEMA_VERSION, SQL_NEXT_FILE_ID};
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
@@ -505,6 +506,7 @@ async fn read_sqlite_inlined_table(
         snapshots,
         end_snapshots,
         batch,
+        next_file_id: None,
     }))
 }
 
@@ -973,6 +975,30 @@ impl SqliteMetadataProvider {
             .collect())
     }
 
+    /// The registered inlined-data tables of `table_id`, and the catalog's next
+    /// data file id read in the same statement
+    /// ([`DuckLakeInlinedRows::next_file_id`]); none on a catalog without the
+    /// registry.
+    async fn registered_inlined_tables_and_next_file_id(
+        &self,
+        table_id: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        if !self.schema_capabilities().await?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let tables: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT table_name, {SQL_NEXT_FILE_ID}
+             FROM ducklake_inlined_data_tables WHERE table_id = ?"
+        )))
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(tables
+            .into_iter()
+            .filter(|(name, _)| is_inlined_data_table(name))
+            .collect())
+    }
+
     /// Read the inlined row versions `selection` picks, one entry per physical
     /// inlined-data table with rows. See [`MetadataProvider::read_inlined_rows`].
     async fn read_inlined_rows_sqlite(
@@ -985,12 +1011,16 @@ impl SqliteMetadataProvider {
     ) -> Result<Vec<DuckLakeInlinedRows>> {
         let mut out = Vec::new();
         let ledger = self.schema_version_ledger().await?;
-        for table in self.registered_inlined_tables(table_id).await? {
-            if let Some(rows) = read_sqlite_inlined_table(
+        for (table, next_file_id) in self
+            .registered_inlined_tables_and_next_file_id(table_id)
+            .await?
+        {
+            if let Some(mut rows) = read_sqlite_inlined_table(
                 &self.pool, table_id, &table, ledger, columns, selection, filter, shape,
             )
             .await?
             {
+                rows.next_file_id = Some(next_file_id);
                 out.push(rows);
             }
         }
@@ -2139,6 +2169,18 @@ impl MetadataProvider for SqliteMetadataProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
     ) -> Result<InlinedDataScan> {
+        Ok(self
+            .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
+            .scan)
+    }
+
+    fn scan_inlined_data_noting_absence(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedScanRead> {
         let rows = block_on(self.read_inlined_rows_sqlite(
             table_id,
             columns,
@@ -2146,9 +2188,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             filter,
             InlinedReadShape::Scan,
         ))?;
-        Ok(InlinedDataScan::from_batches(
-            rows.into_iter().map(|rows| rows.batch).collect(),
-        ))
+        Ok(InlinedScanRead::from_rows(rows))
     }
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {

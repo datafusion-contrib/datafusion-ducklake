@@ -26,6 +26,43 @@ impl InlinedDataScan {
     }
 }
 
+/// What [`MetadataProvider::scan_inlined_data_noting_absence`] reads: the
+/// visible inlined rows of a table, and what the read can tell about the
+/// catalog around them.
+///
+/// [`MetadataProvider::scan_inlined_data_noting_absence`]:
+///     crate::metadata_provider::MetadataProvider::scan_inlined_data_noting_absence
+#[derive(Debug, Default)]
+pub struct InlinedScanRead {
+    /// The visible inlined rows.
+    pub scan: InlinedDataScan,
+    /// The latest snapshot through which the catalog holds no inlined rows for
+    /// the table, when the read can tell (see
+    /// [`MetadataProvider::scan_inlined_data_noting_absence`]).
+    ///
+    /// [`MetadataProvider::scan_inlined_data_noting_absence`]:
+    ///     crate::metadata_provider::MetadataProvider::scan_inlined_data_noting_absence
+    pub absent_through: Option<i64>,
+    /// The catalog's next data file id, read no later than the rows: a data
+    /// file committed after the read has an id at least this. `None` when the
+    /// provider does not read it (see
+    /// [`DuckLakeInlinedRows::next_file_id`](crate::metadata_provider::DuckLakeInlinedRows::next_file_id)).
+    pub next_file_id: Option<i64>,
+}
+
+impl InlinedScanRead {
+    /// The rows of `rows`, with the lowest next file id read with them, and no
+    /// answer about absence.
+    pub(crate) fn from_rows(rows: Vec<crate::metadata_provider::DuckLakeInlinedRows>) -> Self {
+        let next_file_id = rows.iter().filter_map(|rows| rows.next_file_id).min();
+        Self {
+            scan: InlinedDataScan::from_batches(rows.into_iter().map(|rows| rows.batch).collect()),
+            absent_through: None,
+            next_file_id,
+        }
+    }
+}
+
 /// Backend-neutral predicate accepted by an inlined metadata scan.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InlinedFilter {

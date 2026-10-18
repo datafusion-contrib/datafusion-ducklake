@@ -1,8 +1,8 @@
 use crate::DuckLakeError;
 use crate::inlined_filter::{
-    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+    InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
+    render_inlined_filter,
 };
-use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -26,6 +26,7 @@ use crate::metadata_provider::{
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
     reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
+use crate::metadata_provider::{SQL_FILE_SCHEMA_VERSION, SQL_NEXT_FILE_ID};
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_filter::{
@@ -1044,14 +1045,44 @@ impl DuckdbMetadataProvider {
         let conn = self.connection();
         let ledger = self.schema_version_ledger(&conn)?;
         let mut out = Vec::new();
-        for table in self.registered_inlined_tables(&conn, table_id)? {
-            if let Some(rows) = read_duckdb_inlined_table(
+        for (table, next_file_id) in
+            self.registered_inlined_tables_and_next_file_id(&conn, table_id)?
+        {
+            if let Some(mut rows) = read_duckdb_inlined_table(
                 &conn, table_id, &table, ledger, columns, selection, filter, shape,
             )? {
+                rows.next_file_id = Some(next_file_id);
                 out.push(rows);
             }
         }
         Ok(out)
+    }
+
+    /// The registered inlined-data tables of `table_id`, and the catalog's next
+    /// data file id read in the same statement
+    /// ([`DuckLakeInlinedRows::next_file_id`]); none on a catalog without the
+    /// registry.
+    fn registered_inlined_tables_and_next_file_id(
+        &self,
+        conn: &Connection,
+        table_id: i64,
+    ) -> crate::Result<Vec<(String, i64)>> {
+        if !self.schema_capabilities(conn)?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let mut registry = conn.prepare(&format!(
+            "SELECT table_name, {SQL_NEXT_FILE_ID}
+             FROM ducklake_inlined_data_tables WHERE table_id = ?"
+        ))?;
+        let tables = registry
+            .query_map([table_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tables
+            .into_iter()
+            .filter(|(table, _)| is_inlined_data_table(table))
+            .collect())
     }
 
     /// What the catalog's `ducklake_schema_versions` ledger records.
@@ -1329,6 +1360,7 @@ fn read_duckdb_inlined_table(
             target_schema,
             columns,
         )?,
+        next_file_id: None,
     }))
 }
 
@@ -2200,6 +2232,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
     ) -> crate::Result<InlinedDataScan> {
+        Ok(self
+            .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
+            .scan)
+    }
+
+    fn scan_inlined_data_noting_absence(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> crate::Result<InlinedScanRead> {
         let rows = self.read_inlined_rows_duckdb(
             table_id,
             columns,
@@ -2207,9 +2251,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             filter,
             InlinedReadShape::Scan,
         )?;
-        Ok(InlinedDataScan::from_batches(
-            rows.into_iter().map(|rows| rows.batch).collect(),
-        ))
+        Ok(InlinedScanRead::from_rows(rows))
     }
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> crate::Result<Option<i64>> {

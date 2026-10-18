@@ -1644,7 +1644,7 @@ async fn an_empty_inlined_registry_answers_up_to_the_head() {
         provider
             .scan_inlined_data_noting_absence(table_id, snapshot_id, &[], None)
             .unwrap()
-            .1
+            .absent_through
     };
 
     assert_eq!(absent_through(head - 1), Some(head - 1));

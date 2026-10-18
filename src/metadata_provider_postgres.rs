@@ -2,7 +2,8 @@
 
 use crate::Result;
 use crate::inlined_filter::{
-    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+    InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
+    render_inlined_filter,
 };
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
@@ -20,9 +21,9 @@ use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange,
     InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedVersionColumn,
-    InlinedVersionLookup, SchemaVersionLedger, inlined_file_delete_change,
+    InlinedVersionLookup, SQL_NEXT_FILE_ID, SchemaVersionLedger, inlined_file_delete_change,
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
-    inlined_version_columns_sql, inlined_version_snapshot_sql,
+    inlined_version_columns_sql, inlined_version_snapshot_sql, next_table_file_id_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -197,6 +198,7 @@ async fn read_postgres_inlined_table(
             schema,
             columns,
         )?,
+        next_file_id: None,
     }))
 }
 
@@ -484,14 +486,53 @@ pub(crate) async fn registered_inlined_tables_on(
         .collect())
 }
 
+/// The catalog's next data file id for the files of `table_id`, as a scalar
+/// subquery whose `$1` is `table_id` ([`DuckLakeInlinedRows::next_file_id`]).
+/// The catalogs of a multicatalog store (`catalog_id`) commit in their own
+/// orders while sharing the data file id sequence, so there it is read over
+/// the table's own files, which only its catalog's commits add.
+fn next_file_id_sql(catalog_id: Option<i64>) -> std::borrow::Cow<'static, str> {
+    match catalog_id {
+        None => SQL_NEXT_FILE_ID.into(),
+        Some(_) => next_table_file_id_sql("$1").into(),
+    }
+}
+
+/// The registered inlined-data tables of `table_id`, read on `connection`,
+/// and the catalog's next data file id read in the same statement (see
+/// [`next_file_id_sql`] for `catalog_id`).
+///
+/// The caller checks first that the catalog has
+/// `ducklake_inlined_data_tables`.
+pub(crate) async fn registered_inlined_tables_and_next_file_id_on(
+    connection: &mut PgConnection,
+    catalog_id: Option<i64>,
+    table_id: i64,
+) -> Result<Vec<(String, i64)>> {
+    let tables: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT table_name::text, {}
+         FROM ducklake_inlined_data_tables WHERE table_id = $1",
+        next_file_id_sql(catalog_id)
+    )))
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(tables
+        .into_iter()
+        .filter(|(name, _)| is_inlined_data_table(name))
+        .collect())
+}
+
 /// Every inlined row of table `table_id` visible at `snapshot_id`, read on one
 /// connection: the table's inlined-data tables from the registry, then each
 /// one's rows. `filter`, when given, narrows the rows in SQL. Also returns the
 /// snapshot through which the catalog holds no inlined row of `table_id`, if
-/// it holds none (see [`MetadataProvider::scan_inlined_data_noting_absence`]).
+/// it holds none (see [`MetadataProvider::scan_inlined_data_noting_absence`]),
+/// and the catalog's next data file id, read with the registry.
 ///
 /// `catalog_id` names the multicatalog catalog whose head bounds that
-/// snapshot. `None` takes the head of a single-catalog store.
+/// snapshot, and scopes the next file id ([`next_file_id_sql`]). `None` takes
+/// the head of a single-catalog store.
 ///
 /// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
 /// session. The caller checks first that the catalog has
@@ -504,29 +545,34 @@ pub(crate) async fn scan_inlined_data_on(
     snapshot_id: i64,
     columns: &[DuckLakeTableColumn],
     filter: Option<&InlinedFilter>,
-) -> Result<(InlinedDataScan, Option<i64>)> {
-    // The head is read in the same statement as the registry, so both describe
-    // one state of the catalog.
+) -> Result<InlinedScanRead> {
+    // The head and the next file id are read in the same statement as the
+    // registry, so all three describe one state of the catalog, which no row
+    // read after it predates.
+    let next_file_id = next_file_id_sql(catalog_id);
     let row = match catalog_id {
-        None => sqlx::query(
+        None => sqlx::query(AssertSqlSafe(format!(
             "SELECT ARRAY(SELECT table_name::text FROM ducklake_inlined_data_tables
                           WHERE table_id = $1),
-                    (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot)",
-        )
+                    (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot),
+                    {next_file_id}"
+        )))
         .bind(table_id),
-        Some(catalog_id) => sqlx::query(
+        Some(catalog_id) => sqlx::query(AssertSqlSafe(format!(
             "SELECT ARRAY(SELECT table_name::text FROM ducklake_inlined_data_tables
                           WHERE table_id = $1),
                     (SELECT COALESCE(MAX(snapshot_id), 0)
                      FROM ducklake_catalog_snapshot_map
-                     WHERE catalog_id = $2)",
-        )
+                     WHERE catalog_id = $2),
+                    {next_file_id}"
+        )))
         .bind(table_id)
         .bind(catalog_id),
     }
     .fetch_one(&mut *connection)
     .await?;
-    let (registry, head): (Vec<String>, i64) = (row.try_get(0)?, row.try_get(1)?);
+    let (registry, head, next_file_id): (Vec<String>, i64, i64) =
+        (row.try_get(0)?, row.try_get(1)?, row.try_get(2)?);
     let through = snapshot_id.min(head);
     let mut batches = Vec::new();
     // `CREATE TABLE` and column changes register an inlined-data table before
@@ -560,22 +606,27 @@ pub(crate) async fn scan_inlined_data_on(
                 .is_none();
         }
     }
-    Ok((
-        InlinedDataScan::from_batches(batches),
-        absent.then_some(through),
-    ))
+    Ok(InlinedScanRead {
+        scan: InlinedDataScan::from_batches(batches),
+        absent_through: absent.then_some(through),
+        next_file_id: Some(next_file_id),
+    })
 }
 
 /// The inlined row versions of `table_id` that `selection` picks, one entry per
-/// registered inlined-data table with rows, all read on `connection`. See
+/// registered inlined-data table with rows, all read on `connection`, each with
+/// the catalog's next data file id read with the registry (scoped by
+/// `catalog_id` as [`next_file_id_sql`] says). See
 /// [`MetadataProvider::read_inlined_rows`].
 ///
 /// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
 /// session. The caller checks first that the catalog has
 /// `ducklake_inlined_data_tables`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_inlined_rows_on(
     connection: &mut PgConnection,
     ledger: InlinedVersionLookup,
+    catalog_id: Option<i64>,
     table_id: i64,
     columns: &[DuckLakeTableColumn],
     selection: InlinedRowSelection,
@@ -583,12 +634,15 @@ pub(crate) async fn read_inlined_rows_on(
     shape: InlinedReadShape,
 ) -> Result<Vec<DuckLakeInlinedRows>> {
     let mut out = Vec::new();
-    for table in registered_inlined_tables_on(connection, table_id).await? {
-        if let Some(rows) = read_postgres_inlined_table(
+    for (table, next_file_id) in
+        registered_inlined_tables_and_next_file_id_on(connection, catalog_id, table_id).await?
+    {
+        if let Some(mut rows) = read_postgres_inlined_table(
             connection, ledger, table_id, &table, columns, selection, filter, shape,
         )
         .await?
         {
+            rows.next_file_id = Some(next_file_id);
             out.push(rows);
         }
     }
@@ -1179,6 +1233,7 @@ impl PostgresMetadataProvider {
         read_inlined_rows_on(
             &mut connection,
             caps.ledger().into(),
+            None,
             table_id,
             columns,
             selection,
@@ -2350,7 +2405,7 @@ impl MetadataProvider for PostgresMetadataProvider {
     ) -> Result<InlinedDataScan> {
         Ok(self
             .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
-            .0)
+            .scan)
     }
 
     fn scan_inlined_data_noting_absence(
@@ -2359,13 +2414,13 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, Option<i64>)> {
+    ) -> Result<InlinedScanRead> {
         block_on(async {
             // No registry yet, so no inlined rows. Not an answer to keep: a
             // migration can add the registry, and a later commit inline rows.
             let caps = self.schema_capabilities().await?;
             if !caps.inlined_data_tables {
-                return Ok((InlinedDataScan::default(), None));
+                return Ok(InlinedScanRead::default());
             }
             let mut connection = self.pool.acquire().await?;
             scan_inlined_data_on(

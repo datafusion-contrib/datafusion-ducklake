@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
-use crate::inlined_filter::{InlinedDataScan, InlinedFilter};
+use crate::inlined_filter::{InlinedDataScan, InlinedFilter, InlinedScanRead};
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData,
     DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -30,6 +30,7 @@ use crate::metadata_provider::{
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_filter::StatsFilter;
+use crate::table::{SCAN_READ_ATTEMPTS, inlined_rows_kept_moving, written_since};
 
 /// The catalog reads of table scans, kept across queries for one catalog.
 ///
@@ -105,7 +106,9 @@ use crate::stats_filter::StatsFilter;
 /// scans, uses the same reads.
 ///
 /// A fill reads in the order of a scan without a memo: the inlined deletions,
-/// then the listing, then the inlined rows. The reads are separate statements,
+/// then the inlined rows, then the listing, which it reads again with the rows
+/// when it lists a file a flush wrote since the rows (see
+/// [`DuckLakeInlinedRows::next_file_id`]). The reads are separate statements,
 /// so a commit between two of them can split them. The memo keeps a fill only
 /// when the head after the fill is still the head that the bind read. So every
 /// kept fill shows the catalog at that one head. A query whose own fill a
@@ -175,6 +178,24 @@ pub struct CatalogReadMemo {
 /// A table id and a snapshot id.
 type TableKey = (i64, i64);
 
+/// The inlined rows a fill reads before its listing.
+struct FillInlined {
+    rows: Vec<RecordBatch>,
+    absent_through: Option<i64>,
+    visible_rows: Option<Vec<DuckLakeInlinedRows>>,
+    /// The catalog's next data file id, read no later than the rows.
+    next_file_id: Option<i64>,
+}
+
+/// The listing a fill reads after its inlined rows.
+enum FillListing {
+    Files(Vec<DuckLakeFileMetadata>),
+    /// A file written since the inlined rows: read both again.
+    WrittenSince,
+    /// The reads exceed the memo's whole budget.
+    OverBudget,
+}
+
 #[derive(Default)]
 struct MemoState {
     /// The newest head a bind read. Every kept fill shows the catalog at it.
@@ -210,6 +231,9 @@ struct TableReads {
     /// this snapshot. `None` when the provider could not read them: a `rowid`
     /// scan then reads the catalog.
     visible_rows: Option<Vec<DuckLakeInlinedRows>>,
+    /// The catalog's next data file id, read no later than the inlined rows;
+    /// the listing holds no file at or above it.
+    next_file_id: Option<i64>,
 }
 
 impl CatalogReadMemo {
@@ -363,14 +387,145 @@ impl MemoizedMetadataProvider {
     ///
     /// The reads run in the order of a scan without a memo, so that a commit
     /// between two of them splits them as it splits such a scan: the inlined
-    /// deletions, then the listing, then the inlined rows.
+    /// deletions, then the inlined rows, then the listing. A listing with a
+    /// file written since the inlined rows reads both again, up to
+    /// [`SCAN_READ_ATTEMPTS`] times.
     fn fill(&self, table_id: i64, snapshot_id: i64) -> Result<Option<(TableReads, usize)>> {
         let max_bytes = self.memo.max_bytes;
         let inlined_deletes = self.inner.get_inlined_deletes(table_id, snapshot_id)?;
-        let mut bytes = inlined_deletes.len() * size_of::<DuckLakeInlinedDelete>();
-        if bytes > max_bytes {
+        let deletes_bytes = inlined_deletes.len() * size_of::<DuckLakeInlinedDelete>();
+        if deletes_bytes > max_bytes {
             return Ok(None);
         }
+        let columns = self.columns(table_id, snapshot_id)?;
+        for _ in 0..SCAN_READ_ATTEMPTS {
+            let mut bytes = deletes_bytes;
+            let Some(inlined) = self.fill_inlined(table_id, snapshot_id, &columns, &mut bytes)?
+            else {
+                return Ok(None);
+            };
+            let listing =
+                match self.fill_listing(table_id, snapshot_id, inlined.next_file_id, &mut bytes)? {
+                    FillListing::Files(listing) => listing,
+                    FillListing::WrittenSince => continue,
+                    FillListing::OverBudget => return Ok(None),
+                };
+            return Ok(Some((
+                TableReads {
+                    inlined_deletes,
+                    listing,
+                    columns,
+                    inlined_rows: inlined.rows,
+                    inlined_absent_through: inlined.absent_through,
+                    visible_rows: inlined.visible_rows,
+                    next_file_id: inlined.next_file_id,
+                },
+                bytes,
+            )));
+        }
+        Err(inlined_rows_kept_moving(table_id))
+    }
+
+    /// The inlined rows of a fill, with and without their row ids, adding
+    /// their size to `bytes`. `None` once `bytes` exceed the memo's budget.
+    fn fill_inlined(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &Arc<Vec<DuckLakeTableColumn>>,
+        bytes: &mut usize,
+    ) -> Result<Option<FillInlined>> {
+        let max_bytes = self.memo.max_bytes;
+        let known_absent = self
+            .memo
+            .lock()
+            .inlined_absent_through
+            .get(&table_id)
+            .copied()
+            .filter(|&through| snapshot_id <= through);
+        if let Some(through) = known_absent {
+            // An earlier fill showed that no inlined row exists at this snapshot.
+            return Ok(Some(FillInlined {
+                rows: Vec::new(),
+                absent_through: Some(through),
+                visible_rows: Some(Vec::new()),
+                next_file_id: None,
+            }));
+        }
+        let read =
+            self.inner
+                .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, None)?;
+        let absent_through = read.absent_through;
+        if let Some(through) = absent_through {
+            let mut state = self.memo.lock();
+            let kept = state
+                .inlined_absent_through
+                .entry(table_id)
+                .or_insert(through);
+            *kept = (*kept).max(through);
+        }
+        *bytes = bytes.saturating_add(
+            read.scan
+                .batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum(),
+        );
+        if *bytes > max_bytes {
+            return Ok(None);
+        }
+        // A `rowid` scan reads the same rows with their row ids. Read them here
+        // too, unless the provider showed that there are none, so that every
+        // read of the scan comes from this fill. A provider that cannot read
+        // them fails the `rowid` scan alone, as it does without a memo.
+        let visible_rows = if absent_through.is_some_and(|through| snapshot_id <= through) {
+            Some(Vec::new())
+        } else {
+            self.inner
+                .read_inlined_rows(
+                    table_id,
+                    columns,
+                    InlinedRowSelection::VisibleAt(snapshot_id),
+                    None,
+                )
+                .ok()
+        };
+        *bytes = bytes.saturating_add(visible_rows.iter().flatten().map(inlined_rows_bytes).sum());
+        if *bytes > max_bytes {
+            return Ok(None);
+        }
+        // The lower of the two reads' next file ids, from a read with rows, so
+        // that the listing holds no file a flush wrote since either of them.
+        let with_rows = read.scan.batches.iter().any(|batch| batch.num_rows() > 0);
+        let next_file_id = with_rows
+            .then_some(read.next_file_id)
+            .flatten()
+            .into_iter()
+            .chain(
+                visible_rows
+                    .iter()
+                    .flatten()
+                    .filter(|rows| rows.batch.num_rows() > 0)
+                    .filter_map(|rows| rows.next_file_id),
+            )
+            .min();
+        Ok(Some(FillInlined {
+            rows: read.scan.batches,
+            absent_through,
+            visible_rows,
+            next_file_id,
+        }))
+    }
+
+    /// The whole listing of a fill, paged as `DuckLakeTable` pages it, adding
+    /// its size to `bytes`.
+    fn fill_listing(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        next_file_id: Option<i64>,
+        bytes: &mut usize,
+    ) -> Result<FillListing> {
         let mut listing = Vec::new();
         let mut after = None;
         // Page as `DuckLakeTable` does, until a short page.
@@ -393,10 +548,13 @@ impl MemoizedMetadataProvider {
                     page.len(),
                 )));
             }
+            if written_since(&page, next_file_id) {
+                return Ok(FillListing::WrittenSince);
+            }
             after = Some(next);
-            bytes = bytes.saturating_add(page.iter().map(file_metadata_bytes).sum());
-            if bytes > max_bytes {
-                return Ok(None);
+            *bytes = bytes.saturating_add(page.iter().map(file_metadata_bytes).sum());
+            if *bytes > self.memo.max_bytes {
+                return Ok(FillListing::OverBudget);
             }
             let short = page.len() < FILE_METADATA_BATCH_SIZE;
             listing.extend(page);
@@ -404,77 +562,7 @@ impl MemoizedMetadataProvider {
                 break;
             }
         }
-        let columns = self.columns(table_id, snapshot_id)?;
-        let known_absent = self
-            .memo
-            .lock()
-            .inlined_absent_through
-            .get(&table_id)
-            .copied()
-            .filter(|&through| snapshot_id <= through);
-        let (inlined_rows, inlined_absent_through, visible_rows) = match known_absent {
-            // An earlier fill showed that no inlined row exists at this snapshot.
-            Some(through) => (Vec::new(), Some(through), Some(Vec::new())),
-            None => {
-                let (inlined, absent_through) = self.inner.scan_inlined_data_noting_absence(
-                    table_id,
-                    snapshot_id,
-                    &columns,
-                    None,
-                )?;
-                if let Some(through) = absent_through {
-                    let mut state = self.memo.lock();
-                    let kept = state
-                        .inlined_absent_through
-                        .entry(table_id)
-                        .or_insert(through);
-                    *kept = (*kept).max(through);
-                }
-                bytes = bytes.saturating_add(
-                    inlined
-                        .batches
-                        .iter()
-                        .map(RecordBatch::get_array_memory_size)
-                        .sum(),
-                );
-                if bytes > max_bytes {
-                    return Ok(None);
-                }
-                // A `rowid` scan reads the same rows with their row ids. Read
-                // them here too, unless the provider showed that there are none,
-                // so that every read of the scan comes from this fill. A provider
-                // that cannot read them fails the `rowid` scan alone, as it does
-                // without a memo.
-                let visible_rows = if absent_through.is_some_and(|through| snapshot_id <= through) {
-                    Some(Vec::new())
-                } else {
-                    self.inner
-                        .read_inlined_rows(
-                            table_id,
-                            &columns,
-                            InlinedRowSelection::VisibleAt(snapshot_id),
-                            None,
-                        )
-                        .ok()
-                };
-                (inlined.batches, absent_through, visible_rows)
-            },
-        };
-        bytes = bytes.saturating_add(visible_rows.iter().flatten().map(inlined_rows_bytes).sum());
-        if bytes > max_bytes {
-            return Ok(None);
-        }
-        Ok(Some((
-            TableReads {
-                inlined_deletes,
-                listing,
-                columns,
-                inlined_rows,
-                inlined_absent_through,
-                visible_rows,
-            },
-            bytes,
-        )))
+        Ok(FillListing::Files(listing))
     }
 
     /// The columns `DuckLakeTable` reads `table_id`'s inlined rows in at
@@ -713,7 +801,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
     ) -> Result<InlinedDataScan> {
         Ok(self
             .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
-            .0)
+            .scan)
     }
 
     fn scan_inlined_data_noting_absence(
@@ -722,7 +810,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, Option<i64>)> {
+    ) -> Result<InlinedScanRead> {
         // The filter is advisory: every visible row is a correct answer. Rows in
         // other columns than the fill's are read from the catalog.
         if let Some(reads) = self.table_reads(table_id, snapshot_id)? {
@@ -731,7 +819,11 @@ impl MetadataProvider for MemoizedMetadataProvider {
                     batches: reads.inlined_rows.clone(),
                     materialized_row_count: 0,
                 };
-                return Ok((scan, reads.inlined_absent_through));
+                return Ok(InlinedScanRead {
+                    scan,
+                    absent_through: reads.inlined_absent_through,
+                    next_file_id: reads.next_file_id,
+                });
             }
             // The next fill reads the rows in the scan's own columns.
             self.keep_columns(table_id, snapshot_id, Arc::new(columns.to_vec()));
@@ -1045,10 +1137,13 @@ mod tests {
             snapshot_id: i64,
             _: &[DuckLakeTableColumn],
             _: Option<&InlinedFilter>,
-        ) -> Result<(InlinedDataScan, Option<i64>)> {
+        ) -> Result<InlinedScanRead> {
             self.count("scan_inlined_data_noting_absence");
             let head = self.head.load(AtomicOrdering::SeqCst);
-            Ok((InlinedDataScan::default(), Some(snapshot_id.min(head))))
+            Ok(InlinedScanRead {
+                absent_through: Some(snapshot_id.min(head)),
+                ..InlinedScanRead::default()
+            })
         }
         fn read_inlined_rows(
             &self,

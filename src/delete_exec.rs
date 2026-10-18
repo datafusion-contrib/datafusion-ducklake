@@ -269,11 +269,8 @@ async fn run_delete(
     base_snapshot: i64,
 ) -> DataFusionResult<u64> {
     let state: &dyn Session = session_state;
-    let table_files = table
-        .files()
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    let inlined_data = table
-        .inlined_data_with_row_ids()
+    let (inlined_data, table_files) = table
+        .inlined_rows_then_files(|| table.files(), |file| file.data_file_id)
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
     // A writer that stages row mutations records each file's deletions as

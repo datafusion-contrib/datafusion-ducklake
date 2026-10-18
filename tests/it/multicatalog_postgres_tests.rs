@@ -10231,7 +10231,7 @@ async fn an_empty_registered_inlined_table_answers_like_an_empty_registry() {
         provider
             .scan_inlined_data_noting_absence(created.table_id, snapshot_id, &columns, None)
             .unwrap()
-            .1
+            .absent_through
     };
     assert_eq!(
         absent_through(created.snapshot_id),
