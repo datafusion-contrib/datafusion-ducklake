@@ -2572,21 +2572,25 @@ mod known {
         }
     }
 
-    /// Official numbers the rows of rowid-adjacent files a merge combines by
-    /// their position in the merged file (duckdb/ducklake#1605, followed by
-    /// this crate), and the rows an `UPDATE` wrote to one file come in the
-    /// order official's scan produced them, which DuckDB does not fix: after a
-    /// merge of an update's rows, two catalogs can give the same rows each
-    /// other's row ids. Whether a merge (or checkpoint) up to `step` followed
-    /// an update; only the updated rows may then differ in their row ids
-    /// ([`row_ids_traded`]), every other row still compares with its row id.
+    /// The pinned official predates duckdb/ducklake#1611: its merge numbers
+    /// the rows of rowid-adjacent files by their position in the merged file,
+    /// so the rows a sort moves, the rows of a file that embeds their row ids
+    /// (an `UPDATE`'s new versions, a flush under a sort order or of a
+    /// partitioned table's interleaved inserts) take new row ids
+    /// (duckdb/ducklake#1602, #1605). This crate keeps every row's row id, as
+    /// upstream main does. Whether a merge (or checkpoint) up to `step` may
+    /// have renumbered rows there; only those rows may then differ in their
+    /// row ids ([`row_ids_traded`]), every other row still compares with its
+    /// row id.
     pub(super) fn merged_update_order(history: &History, step: usize) -> bool {
         merged_update_ids(history, step).is_some()
     }
 
-    /// The `id`s of the rows an update a merge (or checkpoint) followed up to
-    /// `step` may have written: `None` without such an update, `Some(None)`
-    /// when a predicate on a value column leaves them unknown (any row).
+    /// The `id`s of the rows a merge (or checkpoint) up to `step` may have
+    /// renumbered on the pinned official ([`merged_update_order`]): `None`
+    /// without such a merge, `Some(None)` when they are unknown (any row: a
+    /// sorted merge, a merged flush of a sorted or partitioned table, or an
+    /// update whose predicate on a value column leaves its rows unknown).
     pub(super) fn merged_update_ids(
         history: &History,
         step: usize,
@@ -2594,9 +2598,22 @@ mod known {
         let mut inserted = std::collections::BTreeSet::new();
         let mut pending: Option<std::collections::BTreeSet<i64>> = Some(Default::default());
         let mut updated = false;
+        // A live sort order, a live partition spec, and whether a flush wrote
+        // a file whose row ids may not be its range in position order.
+        let (mut sorted, mut partitioned, mut unordered_flush) = (false, false, false);
         let mut merged: Option<Option<std::collections::BTreeSet<i64>>> = None;
         for s in &history.steps[..=step] {
             match s {
+                Step::Sort(spec) => sorted = spec.is_some(),
+                Step::Partition(spec) => partitioned = spec.is_some(),
+                Step::Flush => unordered_flush |= sorted || partitioned,
+                Step::Merge | Step::Checkpoint
+                    if sorted
+                        || unordered_flush
+                        || (partitioned && matches!(s, Step::Checkpoint)) =>
+                {
+                    merged = Some(None);
+                },
                 Step::Insert(rows) => inserted.extend(rows.iter().map(|(id, _)| *id)),
                 Step::Update {
                     pred,
@@ -2641,7 +2658,8 @@ mod known {
     /// The rows of [`merged_update_order`]: whether `official` and `ours`
     /// differ only in the row ids of rows whose `id` is in `updated` (any
     /// row for `None`). Every other row must match with its row id, and the
-    /// rows that differ must match without them.
+    /// rows that differ must match without them, an update pair as a deletion
+    /// and an insertion.
     pub(super) fn row_ids_traded(
         official: &(Vec<String>, Vec<Vec<String>>),
         ours: &(Vec<String>, Vec<Vec<String>>),
@@ -2676,11 +2694,22 @@ mod known {
         if !theirs.iter().chain(&left).all(affected) {
             return false;
         }
+        // A change feed pairs an update's rows by row id, so where official's
+        // merge renumbered the new version an update pair of this crate's is
+        // a deletion and an insertion of official's.
+        let kind = official.0.iter().position(|name| name == "change_type");
         let strip = |rows: &[Vec<String>]| {
             let mut rest: Vec<Vec<String>> = rows
                 .iter()
                 .map(|r| {
                     let mut r = r.clone();
+                    if let Some(kind) = kind {
+                        r[kind] = match r[kind].as_str() {
+                            "\"update_preimage\"" => "\"delete\"".to_string(),
+                            "\"update_postimage\"" => "\"insert\"".to_string(),
+                            _ => r[kind].clone(),
+                        };
+                    }
                     r.remove(rowid);
                     r
                 })
@@ -3472,7 +3501,7 @@ impl Run<'_> {
             && let (Ok(o), Ok(c)) = (official, ours)
             && known::row_ids_traded(o, c, &updated)
         {
-            self.skip(kind, "#1605 row order of a merged update");
+            self.skip(kind, "#1611 merge row ids of the pinned official");
             return Ok(());
         }
         result
@@ -6646,7 +6675,8 @@ async fn regression_rewrite_grouping_compares_live_files() {
 /// Every upstream divergence the harness models, each on its upstream shape,
 /// checked at every snapshot and window: deletions misdated in official's
 /// change feed (#1603), official's rewrite failing on an inlined data table
-/// older than an added column (#1490), merge row numbering (#1605),
+/// older than an added column (#1490), the pinned official's merge row
+/// numbering (#1602 and #1605, fixed upstream by #1611),
 /// official's lost statistics (a partitioned NULL file, an unstorable string
 /// bound, a widened column), the `FLOAT` exponent (#1604) and `DOUBLE`
 /// fixed-point filter constants, signless zeros and NaN in Parquet files, and
@@ -6715,8 +6745,8 @@ async fn regression_modelled_upstream_divergences() {
             ],
         },
         // A merge of rowid-adjacent files, one of them an update's new row
-        // versions, numbers the merged rows from the first file's
-        // `row_id_start`, on both sides.
+        // versions: official numbers the merged rows from the first file's
+        // `row_id_start`, this crate keeps the updated row's embedded id.
         History {
             columns: vec![Col {
                 name: "c0".into(),
@@ -6760,7 +6790,9 @@ async fn regression_modelled_upstream_divergences() {
                 Step::Insert(vec![(35, vec![V::Null, V::Null])]),
             ],
         },
-        // Both change feeds pair updates by the row ids the merge numbered.
+        // Official's merge renumbers the updated rows, so its change feed
+        // reports the update as a deletion and an insertion; this crate keeps
+        // their row ids and reports update pairs.
         History {
             columns: vec![Col {
                 name: "c1".into(),
@@ -6888,16 +6920,29 @@ async fn regression_modelled_upstream_divergences() {
                 Step::Rewrite,
             ],
         },
+        // A sorted merge of rowid-adjacent files: the pinned official gives
+        // the rows the sort moves the row ids of their positions, this crate
+        // keeps them (duckdb/ducklake#1611).
+        History {
+            columns: vec![col("c0", Ty::Int)],
+            limit: Some(0),
+            steps: vec![
+                Step::Insert(vec![(1, vec![V::I(5)])]),
+                Step::Insert(vec![(2, vec![V::I(1)])]),
+                Step::Sort(Some(("c0".into(), false))),
+                Step::Merge,
+            ],
+        },
     ];
     // The model each history exercises, by the reason its skip records;
     // none where the shape is one this crate follows official on.
-    let fired: [&[&str]; 15] = [
+    let fired: [&[&str]; 16] = [
         &["#1603 misdated partial-file deletion"],
         &["#1603 misdated partial-file deletion"],
         &["#1490 official rewrite fails"],
-        &[],
+        &["#1611 merge row ids of the pinned official"],
         &["official stats: partitioned NULL file"],
-        &[],
+        &["#1611 merge row ids of the pinned official"],
         &["#1604 float exponent"],
         &["official stats: rounded inlined DOUBLE", "double fixed-point constant"],
         &[],
@@ -6907,6 +6952,7 @@ async fn regression_modelled_upstream_divergences() {
         &["#1377 rewrite recomputes"],
         &["official stats: widened column"],
         &["official rewrite fails on the greatest TIMESTAMPTZ"],
+        &["#1611 merge row ids of the pinned official"],
     ];
     for (index, (history, models)) in histories.iter().chain(&more).zip(fired).enumerate() {
         let tally = run_history_tallied(history, &Backend::Sqlite, 0, true, false)
@@ -7071,11 +7117,12 @@ async fn float_exponent_filters_find_their_rows() {
     }
 }
 
-/// A merge of rowid-adjacent files numbers the merged rows from the first
-/// file's `row_id_start`, as official's does, including the new row version an
-/// `UPDATE` wrote with its row id embedded (duckdb/ducklake#1605).
+/// A merge keeps the row id the new row version an `UPDATE` wrote embedded,
+/// as upstream main does since duckdb/ducklake#1611. The pinned official
+/// predates that fix and numbers it from the first file's `row_id_start`,
+/// because the files' catalog ranges are adjacent (duckdb/ducklake#1605).
 #[tokio::test(flavor = "multi_thread")]
-async fn merge_numbers_adjacent_updated_rows_as_official() {
+async fn merge_keeps_an_updated_rows_row_id_where_the_pinned_official_renumbers_it() {
     let dir = tempfile::TempDir::new().unwrap();
     let history = History {
         columns: vec![Col {
@@ -7117,8 +7164,10 @@ async fn merge_numbers_adjacent_updated_rows_as_official() {
         .unwrap();
     let (_, theirs) =
         Official::rows(&official.connection, "SELECT rowid, id FROM t ORDER BY id").unwrap();
-    assert_eq!(ours, vec![vec!["1", "12"], vec!["2", "36"]]);
-    assert_eq!(ours, theirs);
+    assert_eq!(ours, vec![vec!["0", "12"], vec!["2", "36"]]);
+    // The pinned official predates duckdb/ducklake#1611; once the pin
+    // includes it, official keeps row id 0 too.
+    assert_eq!(theirs, vec![vec!["1", "12"], vec!["2", "36"]]);
 }
 
 /// duckdb/ducklake#1406: a flush after a rewrite that retired a file with a

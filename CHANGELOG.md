@@ -202,6 +202,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `merge_adjacent_files` keeps every row's `rowid` (sorted tables, flushed and `UPDATE`
+  files) by embedding row ids in its output, as official does since duckdb/ducklake#1611.
 - Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with
   `sort_on_insert` off, rows written to Parquet while inlining is enabled.
 - Expression sort keys order inserts, flushes and compaction, evaluated with DataFusion (layout

@@ -582,12 +582,10 @@ trailing `ago`, and a bare number of seconds; what DuckDB rejects (`'+1 day'`,
 `'.5 days'`) fails. An interval that
 overflows fails with `InvalidConfig`. A negative `expire_older_than` is accepted, as in
 official (its cutoff is in the future, so every snapshot but the latest can expire).
-`merge_adjacent_files` numbers the rows of rowid-adjacent sources from the first
-source's `row_id_start`, as official does, including a source that embeds row ids (the
-new row versions an `UPDATE` wrote). An updated row's `rowid` then changes, and change
-feeds report that update as a `delete` and an `insert` instead of an update pair
-(duckdb/ducklake#1605): with the limit at `0`, insert a row, update it, insert another,
-and merge; the updated row's `rowid` goes from `0` to `1` in both.
+`merge_adjacent_files` (and so `checkpoint`) keeps every row's `rowid`: its output embeds
+the row id column, and a merge of rowid-adjacent files also keeps the first file's
+`row_id_start`, as official does since duckdb/ducklake#1611. The DuckDB extension the
+parity tests pin predates that fix and renumbers the rows of such a merge by position.
 
 Difference from official: a negative `delete_older_than` is refused with
 `InvalidConfig`. Its cutoff would be in the future, so cleanup and orphan deletion
