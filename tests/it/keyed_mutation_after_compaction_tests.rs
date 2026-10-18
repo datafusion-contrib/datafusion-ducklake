@@ -714,11 +714,10 @@ async fn keyed_mutation_after_rewrite_with_rowid_holes() {
     );
 }
 
-/// A merge of rowid-adjacent files keeps the first source's `row_id_start` and
-/// embeds no rowid column, so its rows sit in rowid order and a row's position
-/// is `rowid - row_id_start`. A keyed DELETE and an UPDATE against it must land
-/// on exactly those positions, and every surviving row (the updated one
-/// included) keeps its rowid.
+/// A merge of rowid-adjacent files keeps the first source's `row_id_start`,
+/// writes its rows in source order and embeds their rowids. A keyed DELETE and
+/// an UPDATE against it must land on the right positions, and every surviving
+/// row (the updated one included) keeps its rowid.
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_and_update_after_adjacent_merge() {
     let temp = TempDir::new().unwrap();

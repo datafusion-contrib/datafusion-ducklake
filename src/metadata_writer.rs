@@ -1747,10 +1747,10 @@ pub(crate) fn allocate_row_id_start(next_row_id: i64, file: &DataFileInfo) -> Ro
 
 /// The `row_id_start` a compaction or inlined-flush output is registered with.
 ///
-/// A merge of rowid-adjacent sources writes no rowid column and carries the
-/// first source's range over as [`RowIdStart::Preserved`]; a flush carries the
-/// range of the inlined rows it writes. Every other output embeds its rowids
-/// and records `NULL`. The range was issued already, so nothing is minted and
+/// A merge of rowid-adjacent sources carries the first source's range over as
+/// [`RowIdStart::Preserved`]; a flush carries the range of the inlined rows it
+/// writes. Every other output records `NULL`. Each of these outputs also
+/// embeds its rows' rowids, which a read takes over the range. The range was issued already, so nothing is minted and
 /// `next_row_id` does not move.
 #[cfg_attr(not(feature = "write"), allow(dead_code))]
 pub(crate) fn carried_row_id_start(file: &DataFileInfo) -> Option<i64> {
@@ -2176,11 +2176,10 @@ pub enum SourceRetirement {
 ///
 /// The parquet has already been written (with each row's original rowid, and
 /// for a merged partial file the per-row `_ducklake_internal_snapshot_id`
-/// column); this is the catalog registration. A file that embeds its rowids is
-/// stored with `row_id_start` NULL. A merge of rowid-adjacent sources embeds
-/// none and sets [`DataFileInfo::row_id_start`] to
-/// [`RowIdStart::Preserved`] with the first source's start, so its rowids are
-/// that start plus each row's position.
+/// column); this is the catalog registration, with `row_id_start` NULL. A
+/// merge of rowid-adjacent sources sets [`DataFileInfo::row_id_start`] to
+/// [`RowIdStart::Preserved`] with the first source's start, as official's
+/// does; its rowids still come from the embedded column.
 #[derive(Debug, Clone)]
 pub struct CompactionOutputFile {
     /// The written parquet's location / size / record count.
@@ -4219,8 +4218,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Each output is registered with `end_snapshot` NULL, `row_id_start` from
     /// [`CompactionOutputFile::file`] when it is [`RowIdStart::Preserved`] (a
-    /// merge of rowid-adjacent files, which embeds no rowids) and NULL
-    /// otherwise (rowids come from the embedded column), its
+    /// merge of rowid-adjacent files) and NULL otherwise (rowids come from the
+    /// embedded column either way), its
     /// [`CompactionOutputFile::partial_max`], and `begin_snapshot` =
     /// [`CompactionOutputFile::begin_snapshot`] (or the new snapshot when that is
     /// `None`).

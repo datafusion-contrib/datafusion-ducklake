@@ -1265,13 +1265,14 @@ async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage()
         file_values(&temp, &files[0].file.file.path),
         (0..TOTAL_ROWS).rev().collect::<Vec<_>>(),
     );
-    // The sources are rowid-adjacent, so the merged file keeps their range and
-    // each row's rowid is its sorted position, as in official DuckLake.
+    // The sources are rowid-adjacent, so the merged file keeps their range,
+    // and every row keeps its rowid, as in official DuckLake since
+    // duckdb/ducklake#1611.
     assert_eq!(files[0].file.row_id_start, Some(0));
     assert_eq!(
         read_id_rowid(&temp).await,
         (0..TOTAL_ROWS)
-            .map(|id| (id, i64::from(TOTAL_ROWS - 1 - id)))
+            .map(|id| (id, i64::from(id)))
             .collect::<Vec<_>>(),
     );
     assert_eq!(
@@ -1516,7 +1517,7 @@ async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel()
         "partial_max = max origin snapshot among merged rows"
     );
     // The three sources' rowids are adjacent (0..2, 2..4, 4..6), so the merged
-    // file keeps the first source's range and embeds no rowid column.
+    // file keeps the first source's range.
     let merged_row_id_start = opt_i64(
         &p,
         "SELECT row_id_start FROM ducklake_data_file WHERE end_snapshot IS NULL",
@@ -1711,14 +1712,12 @@ async fn sorted_merge_with_limited_memory_preserves_row_and_snapshot_lineage() {
         file_values(&temp, &live_path),
         (0..ROW_COUNT).collect::<Vec<_>>(),
     );
-    // The sources are rowid-adjacent, so each row's rowid is its sorted
-    // position, as in official DuckLake: here, its `val`.
+    // Every row keeps its rowid through the sort, as in official DuckLake
+    // since duckdb/ducklake#1611.
     assert_eq!(
         read_id_rowid(&temp).await,
-        read_rows(&temp)
-            .await
-            .into_iter()
-            .map(|(id, val)| (id, i64::from(val)))
+        (0..ROW_COUNT)
+            .map(|id| (id, i64::from(id)))
             .collect::<Vec<_>>(),
     );
     assert_eq!(
@@ -2926,15 +2925,15 @@ async fn live_file(p: &SqlitePool) -> (String, Option<i64>, i64) {
     )
 }
 
-/// Official DuckLake's merge writes no rowid column when its sources are
-/// rowid-adjacent: the merged file keeps the first source's `row_id_start`,
-/// and each row's rowid is that start plus its position
+/// Official DuckLake's merge of rowid-adjacent sources keeps the first
+/// source's `row_id_start`, writes the rows in source order and, since
+/// duckdb/ducklake#1611, embeds each row's rowid
 /// (`GenerateCompactionCommand`, `ducklake_compaction_functions.cpp`). The
 /// re-merge below is upstream's `merge_adjacent_partial_file_info.test`: a
 /// merged partial file is itself an adjacent source, so merging it with later
 /// appends still keeps the range.
 #[tokio::test(flavor = "multi_thread")]
-async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
+async fn adjacent_merge_keeps_row_id_start_and_embeds_rowids() {
     let temp = TempDir::new().unwrap();
     seed(&temp, vec![1, 2], vec![10, 20]).await;
     append(&temp, vec![3, 4], vec![30, 40]).await;
@@ -2952,11 +2951,7 @@ async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
         "keeps the first source's row_id_start"
     );
     assert_eq!(record_count, 4);
-    assert!(
-        !embeds_rowids(&temp, &path),
-        "an adjacent merge writes no rowid column"
-    );
-    // Rows are written in rowid order, since position now IS the rowid.
+    // Rows are written in source order, each with its rowid.
     assert_eq!(file_values(&temp, &path), vec![10, 20, 30, 40]);
     // Still a partial file: the snapshot-id column is written as before.
     assert_eq!(
@@ -2964,7 +2959,7 @@ async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
             .into_iter()
             .map(|(rowid, origin)| (rowid, origin.is_some()))
             .collect::<Vec<_>>(),
-        vec![(None, true); 4],
+        (0..4).map(|rowid| (Some(rowid), true)).collect::<Vec<_>>(),
     );
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
     // The range was issued to the sources already; nothing new is minted.
@@ -2982,7 +2977,7 @@ async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
     assert_eq!((result.files_processed, result.files_created), (3, 1));
     let (path, row_id_start, record_count) = live_file(&p).await;
     assert_eq!((row_id_start, record_count), (Some(0), 8));
-    assert!(!embeds_rowids(&temp, &path));
+    assert!(embeds_rowids(&temp, &path));
     assert_eq!(
         file_values(&temp, &path),
         vec![10, 20, 30, 40, 50, 60, 70, 80]
@@ -2994,9 +2989,9 @@ async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
     );
 }
 
-/// A merged file with a `row_id_start` and no rowid column, read at snapshots
-/// before the merge once its sources are physically gone: time travel and the
-/// change feed must serve the same rows with the same rowids as before.
+/// A merged file of rowid-adjacent sources, read at snapshots before the
+/// merge once its sources are physically gone: time travel and the change
+/// feed must serve the same rows with the same rowids as before.
 #[tokio::test(flavor = "multi_thread")]
 async fn adjacent_merge_serves_history_and_changes_after_sources_are_deleted() {
     let temp = TempDir::new().unwrap();
@@ -3021,7 +3016,7 @@ async fn adjacent_merge_serves_history_and_changes_after_sources_are_deleted() {
     run_merge(&temp, MergeOptions::default()).await;
     let (path, row_id_start, _) = live_file(&p).await;
     assert_eq!(row_id_start, Some(0));
-    assert!(!embeds_rowids(&temp, &path));
+    assert!(embeds_rowids(&temp, &path));
 
     let deleted = {
         let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
@@ -3045,8 +3040,9 @@ async fn adjacent_merge_serves_history_and_changes_after_sources_are_deleted() {
     );
 }
 
-/// Adjacency is decided per bin, in the order the bin's rows are written, and
-/// only an unsorted merge of files whose rowids are their ranges keeps one.
+/// Adjacency is decided per bin, in the order the bin's rows are written:
+/// only a bin of adjacent ranges keeps a `row_id_start`, and every merged
+/// file embeds its rowids.
 /// The partitioned case is upstream's `compaction_partitioned_non_adjacent.test`
 /// shape: files of one partition interleaved with another's are not adjacent.
 #[tokio::test(flavor = "multi_thread")]
@@ -3125,7 +3121,7 @@ async fn merge_keeps_row_id_start_only_for_adjacent_bins() {
     assert_eq!(
         shape,
         vec![
-            ("val=1".to_string(), Some(0), 2, false),
+            ("val=1".to_string(), Some(0), 2, true),
             ("val=2".to_string(), None, 2, true),
             ("val=3".to_string(), Some(3), 1, false),
         ],
@@ -3134,12 +3130,11 @@ async fn merge_keeps_row_id_start_only_for_adjacent_bins() {
 }
 
 /// A sorted merge of rowid-adjacent files keeps the first source's
-/// `row_id_start` and writes no rowid column, as official DuckLake's does
-/// (`GenerateCompactionCommand` sorts with no rowid tiebreaker and keeps the
-/// range). Each row's rowid is then its sorted position, at the head and at
-/// every snapshot the merged file serves.
+/// `row_id_start` and writes the rows in sorted order, each with its rowid, as
+/// official DuckLake's does since duckdb/ducklake#1611. Every row keeps its
+/// rowid at the head and at every snapshot the merged file serves.
 #[tokio::test(flavor = "multi_thread")]
-async fn sorted_merge_of_adjacent_files_takes_rowids_from_sorted_position() {
+async fn sorted_merge_of_adjacent_files_keeps_rowids() {
     let temp = TempDir::new().unwrap();
     seed(&temp, vec![1, 2], vec![10, 20]).await;
     append(&temp, vec![3, 4], vec![30, 40]).await;
@@ -3148,7 +3143,7 @@ async fn sorted_merge_of_adjacent_files_takes_rowids_from_sorted_position() {
     run_merge(&temp, MergeOptions::default()).await;
     assert_eq!(live_file(&p).await.1, Some(0));
 
-    // ...and a sorted one keeps the range while the rows move.
+    // ...and so does a sorted one, which keeps the range while the rows move.
     append(&temp, vec![5, 6], vec![50, 60]).await;
     let first_snapshot = scalar_i64(&p, "SELECT MIN(begin_snapshot) FROM ducklake_data_file").await;
     let table_id = scalar_i64(&p, "SELECT table_id FROM ducklake_table LIMIT 1").await;
@@ -3169,18 +3164,18 @@ async fn sorted_merge_of_adjacent_files_takes_rowids_from_sorted_position() {
     run_merge(&temp, MergeOptions::default()).await;
     let (path, row_id_start, record_count) = live_file(&p).await;
     assert_eq!((row_id_start, record_count), (Some(0), 6));
-    assert!(!embeds_rowids(&temp, &path));
+    assert!(embeds_rowids(&temp, &path));
     assert_eq!(file_values(&temp, &path), vec![60, 50, 40, 30, 20, 10]);
     assert_eq!(
         read_id_rowid(&temp).await,
         (1..=6)
-            .map(|id| (id, 6 - i64::from(id)))
+            .map(|id| (id, i64::from(id) - 1))
             .collect::<Vec<_>>()
     );
     // History is served from the same file, so it reads the same rowids.
     assert_eq!(
         read_id_rowid_at(&temp, first_snapshot).await,
-        vec![(1, 5), (2, 4)]
+        vec![(1, 0), (2, 1)]
     );
     assert_eq!(
         read_rows(&temp).await,
@@ -3228,7 +3223,7 @@ async fn merge_orders_an_earlier_merge_output_before_later_appends() {
     run_merge(&temp, MergeOptions::default()).await;
     let (path, row_id_start, record_count) = live_file(&p).await;
     assert_eq!((row_id_start, record_count), (Some(0), 6));
-    assert!(!embeds_rowids(&temp, &path));
+    assert!(embeds_rowids(&temp, &path));
     assert_eq!(file_values(&temp, &path), vec![10, 20, 30, 40, 50, 60]);
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
 }
@@ -3237,7 +3232,13 @@ async fn merge_orders_an_earlier_merge_output_before_later_appends() {
 /// `ducklake` extension): the same statements build two identical catalogs,
 /// official merges one and this crate merges the other, and the merged files'
 /// catalog shape, physical row order and rowids (at the head and at every
-/// earlier snapshot) must agree.
+/// earlier snapshot) are compared.
+///
+/// The pinned extension predates duckdb/ducklake#1611, so its merge of
+/// rowid-adjacent files writes no rowid column and numbers the rows by
+/// position. This crate follows upstream main: the merged file embeds every
+/// row's rowid and keeps the range, and each test asserts that behaviour
+/// beside the pinned extension's.
 #[cfg(feature = "metadata-duckdb")]
 mod official_parity {
     use super::*;
@@ -3419,11 +3420,40 @@ mod official_parity {
         &merged.rowids.last().unwrap().1
     }
 
-    /// Two inserts, then `SET SORTED BY`: official keeps the range and the
-    /// rows the sort moves take the rowids of their new positions, at the head
-    /// and in history.
+    /// Official's merged files as upstream main writes them since
+    /// duckdb/ducklake#1611: the same range, rows and row order, with the
+    /// rowid column embedded. The pinned extension predates that change.
+    fn embedding(official: &Merged) -> Vec<FileShape> {
+        official
+            .files
+            .iter()
+            .map(|file| FileShape {
+                row_id_start: file.row_id_start,
+                record_count: file.record_count,
+                embeds_rowids: true,
+                ids: file.ids.clone(),
+            })
+            .collect()
+    }
+
+    /// Every snapshot's rows of `merged` carry the rowid `before` gives their
+    /// `id`, at the head too, and the head holds `rows` rows.
+    fn keeps_rowids(merged: &Merged, rows: usize, before: impl Fn(i32) -> i64) {
+        for (snapshot, at) in &merged.rowids {
+            assert!(
+                at.iter().all(|&(id, rowid)| rowid == before(id)),
+                "snapshot {snapshot:?}: {at:?}"
+            );
+        }
+        assert_eq!(head(merged).len(), rows);
+    }
+
+    /// Two inserts, then `SET SORTED BY`: both keep the range and sort the
+    /// rows. The pinned extension gives the rows the sort moves the rowids of
+    /// their new positions; upstream main (duckdb/ducklake#1611) and this
+    /// crate keep every row's rowid, at the head and in history.
     #[tokio::test(flavor = "multi_thread")]
-    async fn sorted_merge_matches_official() {
+    async fn sorted_merge_keeps_rowids_where_the_pinned_official_renumbers() {
         let (official, ours) = merge_both(
             0,
             &[
@@ -3434,7 +3464,6 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
         assert_eq!(
             official.files,
             vec![FileShape {
@@ -3450,14 +3479,17 @@ mod official_parity {
                 .map(|id| (id, 9 - i64::from(id)))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(ours.files, embedding(&official));
+        keeps_rowids(&ours, 10, i64::from);
     }
 
     /// Upstream `test/sql/sorted_table/merge_adjacent_sorted_basic.test`: two
     /// flushed files (each embedding its rowids), a two-key sort order and an
     /// unrelated `ADD COLUMN`, then a merge that writes the rows in sorted
-    /// order.
+    /// order. The pinned extension numbers them by sorted position; this crate
+    /// keeps their rowids, as upstream main does since duckdb/ducklake#1611.
     #[tokio::test(flavor = "multi_thread")]
-    async fn sorted_merge_of_flushed_files_matches_official() {
+    async fn sorted_merge_of_flushed_files_keeps_rowids() {
         let (official, ours) = merge_both(
             10,
             &[
@@ -3473,7 +3505,6 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
         assert_eq!(
             official.files,
             vec![FileShape {
@@ -3483,10 +3514,21 @@ mod official_parity {
                 ids: vec![0, 2, 4, 6, 1, 3, 5, 7],
             }]
         );
+        assert_eq!(ours.files, embedding(&official));
+        // Each insert drew its rows' ids in its `ORDER BY i DESC` order.
+        keeps_rowids(&ours, 8, |id| {
+            if id < 4 {
+                3 - i64::from(id)
+            } else {
+                11 - i64::from(id)
+            }
+        });
     }
 
     /// An inlined-data flush writes the rowid column and records a range. The
-    /// merge treats it as adjacent by its range and writes no rowid column.
+    /// merge treats it as adjacent by its range; every rowid is unchanged on
+    /// both sides, and this crate's output embeds them as upstream main's does
+    /// since duckdb/ducklake#1611.
     #[tokio::test(flavor = "multi_thread")]
     async fn flushed_file_merge_matches_official() {
         let (official, ours) = merge_both(
@@ -3500,7 +3542,8 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
+        assert_eq!(ours.rowids, official.rowids);
+        assert_eq!(ours.files, embedding(&official));
         assert_eq!(
             official.files,
             vec![FileShape {
@@ -3517,10 +3560,12 @@ mod official_parity {
     }
 
     /// A flush written under a sort order embeds rowids that are not in file
-    /// order. Once the sort is reset, official's merge writes the flushed
-    /// rows in file order and they take the rowids of their positions.
+    /// order. Once the sort is reset, both merges write the flushed rows in
+    /// file order. The pinned extension gives them the rowids of their
+    /// positions, so their rowids change; this crate keeps every row's rowid,
+    /// as upstream main does since duckdb/ducklake#1611.
     #[tokio::test(flavor = "multi_thread")]
-    async fn sorted_flush_after_sort_reset_matches_official() {
+    async fn sorted_flush_after_sort_reset_keeps_row_ids_where_official_renumbers() {
         let (official, ours) = merge_both(
             10,
             &[
@@ -3534,7 +3579,6 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
         let file = &official.files[0];
         assert_eq!(
             (file.row_id_start, file.record_count, file.embeds_rowids),
@@ -3545,12 +3589,25 @@ mod official_parity {
             &head(&official)[..5],
             &[(0, 3), (1, 1), (2, 2), (3, 0), (4, 4)]
         );
+
+        assert_eq!(ours.files, embedding(&official));
+        // Every row keeps the rowid it had before the merge, at the head and
+        // at every earlier snapshot. The sorted inserts drew their rows' ids
+        // in `val` order: ids 1, 2, 0 took 0, 1, 2 and ids 3, 4 took 3, 4.
+        let before = |id: i32| match id {
+            0 => 2,
+            1 => 0,
+            2 => 1,
+            id => i64::from(id),
+        };
+        keeps_rowids(&ours, 25, before);
     }
 
     /// An earlier merge's output (new, higher id; old `begin_snapshot` and
     /// range) followed by a file appended before that merge ran: official
     /// orders them by `begin_snapshot`, finds them adjacent and keeps the
-    /// range.
+    /// range. Every rowid is unchanged on both sides; this crate's output
+    /// embeds them as upstream main's does since duckdb/ducklake#1611.
     #[tokio::test(flavor = "multi_thread")]
     async fn earlier_merge_output_and_older_file_match_official() {
         let (official, ours) = merge_both(
@@ -3565,7 +3622,8 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
+        assert_eq!(ours.rowids, official.rowids);
+        assert_eq!(ours.files, embedding(&official));
         let file = &official.files[0];
         assert_eq!(
             (
@@ -3582,7 +3640,8 @@ mod official_parity {
     /// Upstream `test/sql/compaction/small_insert_compaction.test`: five
     /// single-row inserts, each flushed to its own file (with an unrelated
     /// table's insert in between), merge into one file that keeps rowids
-    /// 0..5 at the head and at every earlier snapshot.
+    /// 0..5 at the head and at every earlier snapshot. This crate's output also
+    /// embeds them, as upstream main's does since duckdb/ducklake#1611.
     #[tokio::test(flavor = "multi_thread")]
     async fn small_insert_compaction_matches_official() {
         let (official, ours) = merge_both(
@@ -3605,7 +3664,8 @@ mod official_parity {
             ],
         )
         .await;
-        assert_eq!(ours, official);
+        assert_eq!(ours.rowids, official.rowids);
+        assert_eq!(ours.files, embedding(&official));
         assert_eq!(
             official.files,
             vec![FileShape {

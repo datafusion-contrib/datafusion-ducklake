@@ -377,6 +377,331 @@ pub(crate) async fn scenario_partitioned(backend: &Backend) {
     );
 }
 
+/// `(id, rowid)` of every row of `main.<table>` at `snapshot`, by id.
+async fn rowids_at(backend: &Backend, snapshot: i64, table: &str) -> String {
+    let ctx = SessionContext::new();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&backend.provider), snapshot)
+        .unwrap()
+        .with_row_lineage(true);
+    ctx.register_catalog("tt", Arc::new(catalog));
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id, rowid FROM tt.main.{table} ORDER BY id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    pretty_format_batches(&batches).unwrap().to_string()
+}
+
+/// `(id, rowid)` of `main.<table>` at every snapshot from `first` to the head.
+async fn rowid_history(backend: &Backend, first: i64, table: &str) -> Vec<(i64, String)> {
+    let head = backend.provider.get_current_snapshot().unwrap();
+    let mut out = Vec::new();
+    for snapshot in first..=head {
+        out.push((snapshot, rowids_at(backend, snapshot, table).await));
+    }
+    out
+}
+
+/// `merge_adjacent_files` on `main.<table>`, requiring it to write a file.
+async fn merge(backend: &Backend, table: &str) -> datafusion_ducklake::CompactionResult {
+    let (ctx, _handle) = session(backend);
+    let provider = ctx
+        .catalog("lake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table(table)
+        .await
+        .unwrap()
+        .unwrap();
+    let merged = (provider.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<datafusion_ducklake::DuckLakeTable>()
+        .expect("provider is a DuckLakeTable")
+        .merge_adjacent_files(&ctx.state(), datafusion_ducklake::MergeOptions::default())
+        .await
+        .unwrap();
+    assert!(merged.files_created > 0, "{merged:?}");
+    merged
+}
+
+/// The cells of each row of a rendered table, trimmed.
+fn cells(rendered: &str) -> Vec<Vec<String>> {
+    rendered
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// `(id, rowid)` of `main.<table>` at `snapshot`, by id.
+async fn id_rowids(backend: &Backend, snapshot: i64, table: &str) -> Vec<(i32, i64)> {
+    cells(&rowids_at(backend, snapshot, table).await)
+        .into_iter()
+        .map(|row| (row[0].parse().unwrap(), row[1].parse().unwrap()))
+        .collect()
+}
+
+/// Upstream `test/sql/compaction/merge_adjacent_keeps_row_ids.test`
+/// (duckdb/ducklake#1611): a merge keeps the rowids of rows a sort moves and of
+/// rows an `UPDATE` wrote, at the head, in time travel and in the change feed,
+/// through a second merge too, and `checkpoint` runs the same merge.
+pub(crate) async fn scenario_merge_keeps_row_ids_upstream(backend: &Backend) {
+    use datafusion_ducklake::{NullOrder, SortDirection, SortField};
+    let writer = table_writer(backend, 0);
+    let sort_by_id = |table_id: i64| {
+        backend
+            .writer
+            .set_sort_spec(
+                table_id,
+                &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+            )
+            .unwrap();
+    };
+    let (ctx, handle) = session(backend);
+    let head = || backend.provider.get_current_snapshot().unwrap();
+
+    // A sort reorders the rows of adjacent files. The table is sorted before
+    // its rows are written, so their files share a schema version.
+    let created = writer
+        .write_table("main", "s", &[two_columns(&[], &[])])
+        .await
+        .unwrap();
+    sort_by_id(created.table_id);
+    writer
+        .append_table("main", "s", &[two_columns(&[1], &["a"])])
+        .await
+        .unwrap();
+    let s1 = head();
+    writer
+        .append_table("main", "s", &[two_columns(&[0], &["b"])])
+        .await
+        .unwrap();
+    merge(backend, "s").await;
+    assert_eq!(id_rowids(backend, head(), "s").await, vec![(0, 1), (1, 0)]);
+    assert_eq!(id_rowids(backend, s1, "s").await, vec![(1, 0)]);
+    let changes = sql(
+        &ctx,
+        &handle,
+        &format!(
+            "SELECT rowid, change_type, id FROM ducklake_table_changes('main.s', {}, {}) \
+             ORDER BY snapshot_id, rowid",
+            created.snapshot_id,
+            s1 + 1
+        ),
+    )
+    .await;
+    assert_eq!(
+        cells(&changes),
+        vec![vec!["0", "insert", "1"], vec!["1", "insert", "0"]],
+        "{changes}"
+    );
+
+    // An `UPDATE` writes its rows with their rowids, not at its row_id_start.
+    // With no inlining, as upstream's catalog, its rows go to a file.
+    let created = writer
+        .write_table("main", "u", &[two_columns(&[1], &["a"])])
+        .await
+        .unwrap();
+    backend
+        .writer
+        .set_table_setting(created.table_id, "data_inlining_row_limit", "0")
+        .unwrap();
+    sql(
+        &ctx,
+        &handle,
+        "UPDATE lake.main.u SET name = 'x' WHERE id = 1",
+    )
+    .await;
+    let u1 = head();
+    writer
+        .append_table("main", "u", &[two_columns(&[2], &["b"])])
+        .await
+        .unwrap();
+    merge(backend, "u").await;
+    assert_eq!(id_rowids(backend, head(), "u").await, vec![(1, 0), (2, 2)]);
+    assert_eq!(id_rowids(backend, u1, "u").await, vec![(1, 0)]);
+    let changes = sql(
+        &ctx,
+        &handle,
+        &format!(
+            "SELECT rowid, change_type, name FROM ducklake_table_changes('main.u', {u1}, {u1}) \
+             ORDER BY change_type"
+        ),
+    )
+    .await;
+    assert_eq!(
+        cells(&changes),
+        vec![vec!["0", "update_postimage", "x"], vec!["0", "update_preimage", "a"]],
+        "{changes}"
+    );
+    // Merging the merged file again keeps them.
+    writer
+        .append_table("main", "u", &[two_columns(&[3], &["c"])])
+        .await
+        .unwrap();
+    merge(backend, "u").await;
+    assert_eq!(
+        id_rowids(backend, head(), "u").await,
+        vec![(1, 0), (2, 2), (3, 3)]
+    );
+
+    // `checkpoint` runs the same merge, where the writer supports it.
+    let created = writer
+        .write_table("main", "c", &[two_columns(&[], &[])])
+        .await
+        .unwrap();
+    sort_by_id(created.table_id);
+    for (id, name) in [(1, "a"), (0, "b")] {
+        writer
+            .append_table("main", "c", &[two_columns(&[id], &[name])])
+            .await
+            .unwrap();
+    }
+    match handle.checkpoint(&ctx.state()).await {
+        Ok(_) => {
+            let files = backend
+                .provider
+                .get_table_files_for_select(created.table_id, head())
+                .unwrap();
+            assert_eq!(
+                files
+                    .iter()
+                    .filter(|file| file.max_row_count != Some(0))
+                    .count(),
+                1,
+                "the checkpoint merges the two files: {files:?}"
+            );
+            assert_eq!(id_rowids(backend, head(), "c").await, vec![(0, 1), (1, 0)]);
+        },
+        Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) => {},
+        Err(error) => panic!("checkpoint: {error}"),
+    }
+}
+
+/// Merge `main.<table>`, then require every row to keep its `rowid` at every
+/// earlier snapshot and at the head, and no `rowid` to name two rows.
+async fn merge_keeps_row_ids(backend: &Backend, first: i64, table: &str) {
+    let before = rowid_history(backend, first, table).await;
+    let merged = merge(backend, table).await;
+    let head = backend.provider.get_current_snapshot().unwrap();
+    assert_eq!(
+        head,
+        before.last().unwrap().0 + 1,
+        "the merge commits: {merged:?}"
+    );
+    for (snapshot, rows) in &before {
+        assert_eq!(
+            &rowids_at(backend, *snapshot, table).await,
+            rows,
+            "snapshot {snapshot}"
+        );
+    }
+    let now = rowids_at(backend, head, table).await;
+    assert_eq!(&now, &before.last().unwrap().1, "after the merge");
+    let rowids = now
+        .lines()
+        .filter_map(|line| line.split('|').nth(2))
+        .filter_map(|cell| cell.trim().parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    let unique = rowids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), rowids.len(), "duplicate rowids: {now}");
+}
+
+/// A flush of inlined rows that interleave partitions (`x`, `y`, `x`) writes
+/// partition `x`'s rows to one file whose row ids skip the `y` row's, and
+/// records that file's smallest row id as its `row_id_start`. A merge of it
+/// with the `x` file just before its range keeps every row's `rowid`.
+pub(crate) async fn scenario_merge_after_interleaved_partitioned_flush(backend: &Backend) {
+    let created = table_writer(backend, 0)
+        .write_table("main", "m", &[two_columns(&[0], &["a"])])
+        .await
+        .unwrap();
+    backend
+        .writer
+        .set_partition_spec(
+            created.table_id,
+            &[(
+                "name".to_string(),
+                datafusion_ducklake::PartitionTransform::Identity,
+            )],
+        )
+        .unwrap();
+    // Row ids 1..=10 in one Parquet file of partition `x`.
+    let ids = (1..=10).collect::<Vec<_>>();
+    let parquet = table_writer(backend, 0)
+        .append_table("main", "m", &[two_columns(&ids, &["x"; 10])])
+        .await
+        .unwrap();
+    assert_eq!(parquet.files_written, 1);
+    // Row ids 11, 12, 13 inlined, then flushed: `x` holds 11 and 13.
+    let inlined = table_writer(backend, 10)
+        .append_table("main", "m", &[two_columns(&[11, 12, 13], &["x", "y", "x"])])
+        .await
+        .unwrap();
+    assert_eq!(inlined.files_written, 0, "rows must be inlined");
+    let (ctx, handle) = session(backend);
+    sql(
+        &ctx,
+        &handle,
+        "CALL ducklake_flush_inlined_data('lake', table_name => 'm')",
+    )
+    .await;
+    assert_eq!(inlined_row_count(backend, "m"), 0);
+    merge_keeps_row_ids(backend, created.snapshot_id, "m").await;
+    let head = backend.provider.get_current_snapshot().unwrap();
+    let files = backend
+        .provider
+        .get_table_files_for_select(created.table_id, head)
+        .unwrap();
+    // `a`, `y`, and the one merged `x` file.
+    assert_eq!(files.len(), 3, "{files:?}");
+}
+
+/// A flush of a sorted table writes its rows in sort order, so a row's
+/// position is not its row id minus `row_id_start` even though the file's
+/// ids are contiguous. A sorted merge of it with the next flushed file keeps
+/// every row's `rowid`.
+pub(crate) async fn scenario_sorted_merge_after_flush(backend: &Backend) {
+    use datafusion_ducklake::{NullOrder, SortDirection, SortField};
+    let writer = table_writer(backend, 10);
+    let created = writer
+        .write_table("main", "s", &[two_columns(&[1, 2, 3], &["b", "c", "a"])])
+        .await
+        .unwrap();
+    backend
+        .writer
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "name", SortDirection::Desc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    let (ctx, handle) = session(backend);
+    let flush = "CALL ducklake_flush_inlined_data('lake', table_name => 's')";
+    sql(&ctx, &handle, flush).await;
+    writer
+        .append_table("main", "s", &[two_columns(&[4], &["d"])])
+        .await
+        .unwrap();
+    sql(&ctx, &handle, flush).await;
+    merge_keeps_row_ids(backend, created.snapshot_id, "s").await;
+    let head = backend.provider.get_current_snapshot().unwrap();
+    let files = backend
+        .provider
+        .get_table_files_for_select(created.table_id, head)
+        .unwrap();
+    assert_eq!(files.len(), 1, "{files:?}");
+}
+
 /// The flush rolls a partition's rows over into a new file at the table's
 /// `target_file_size`, and each file's delete positions count from its own
 /// first row.
@@ -709,6 +1034,24 @@ mod sqlite {
         let dir = TempDir::new().unwrap();
         let backend = backend(&dir).await;
         scenario_partitioned(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_after_interleaved_partitioned_flush_keeps_row_ids() {
+        let dir = TempDir::new().unwrap();
+        scenario_merge_after_interleaved_partitioned_flush(&backend(&dir).await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_keeps_row_ids_as_upstream() {
+        let dir = TempDir::new().unwrap();
+        scenario_merge_keeps_row_ids_upstream(&backend(&dir).await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sorted_merge_after_flush_keeps_row_ids() {
+        let dir = TempDir::new().unwrap();
+        scenario_sorted_merge_after_flush(&backend(&dir).await).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1875,12 +2218,15 @@ mod sqlite {
 }
 
 /// Every shared scenario, by name.
-const SCENARIOS: [&str; 5] = [
+const SCENARIOS: [&str; 8] = [
     "schema evolution and deletes",
     "many rows",
     "partitioned",
     "rollover",
     "partitioned past target file size",
+    "merge after interleaved partitioned flush",
+    "sorted merge after flush",
+    "merge keeps row ids (upstream)",
 ];
 
 async fn run_scenario(name: &str, backend: &Backend) {
@@ -1892,6 +2238,11 @@ async fn run_scenario(name: &str, backend: &Backend) {
         "partitioned past target file size" => {
             scenario_partitioned_past_target_file_size(backend).await
         },
+        "merge after interleaved partitioned flush" => {
+            scenario_merge_after_interleaved_partitioned_flush(backend).await
+        },
+        "sorted merge after flush" => scenario_sorted_merge_after_flush(backend).await,
+        "merge keeps row ids (upstream)" => scenario_merge_keeps_row_ids_upstream(backend).await,
         other => panic!("unknown scenario {other}"),
     }
 }

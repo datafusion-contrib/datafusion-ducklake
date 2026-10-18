@@ -918,8 +918,8 @@ async fn read_id_rowid(pool: &PgPool, cat_name: &str, snapshot: Option<i64>) -> 
 }
 
 /// A merge of rowid-adjacent files on the multicatalog Postgres backend keeps
-/// the first source's `row_id_start` and embeds no rowid column, as official
-/// DuckLake's merge does. Rowids read back identical at the head and at the
+/// the first source's `row_id_start` and embeds each row's rowid, as official
+/// DuckLake's merge does since duckdb/ducklake#1611. Rowids read back identical at the head and at the
 /// pre-merge snapshots, and a DELETE afterwards lands on the right row.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
@@ -992,8 +992,8 @@ async fn adjacent_merge_keeps_row_id_start_postgres() {
             .unwrap()
             .schema()
             .column_with_name("_ducklake_internal_row_id")
-            .is_none(),
-        "an adjacent merge writes no rowid column"
+            .is_some(),
+        "an adjacent merge embeds its rowids"
     );
     assert_eq!(
         file_values(&data, cat, &files[0].file.path),
