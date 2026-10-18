@@ -579,12 +579,11 @@ async fn fork_of_a_partitioned_source(pool: sqlx::PgPool) {
     assert_eq!(after_merge.rows("t").await, source.rows("t").await);
 }
 
-/// A merge of adjacent files keeps positional row ids (no embedded row id
-/// column) and records each row's snapshot; forked at a snapshot between the
-/// two inserts, the fork masks the merged file's later rows, as the source's
-/// scan does. Guards against masking only the rows of files that embed row
-/// ids.
-async fn historical_fork_of_a_merged_positional_file(pool: sqlx::PgPool) {
+/// A merge of adjacent files keeps the first file's `row_id_start`, embeds
+/// each row's row id, and records each row's snapshot; forked at a snapshot
+/// between the two inserts, the fork masks the merged file's later rows, as
+/// the source's scan does.
+async fn historical_fork_of_a_merged_file(pool: sqlx::PgPool) {
     let manager = MulticatalogManager::new(pool.clone());
     let make = multicatalog(pool);
     let source = make(Some(0)).await;
@@ -609,7 +608,7 @@ async fn historical_fork_of_a_merged_positional_file(pool: sqlx::PgPool) {
             .file_row_id_layout(&ctx.state(), &files[0])
             .await
             .unwrap(),
-        Some(datafusion_ducklake::RowIdLayout::Positional { .. })
+        Some(datafusion_ducklake::RowIdLayout::Embedded)
     ));
     let destination = make(None).await;
     let forked = fork(&manager, &source, first, &destination).await.unwrap();
@@ -2036,7 +2035,7 @@ async fn fork_table_scenarios() {
     let (_container, pool) = store().await;
     fork_carries_inlined_rows_and_deletions(pool.clone()).await;
     fork_of_a_partitioned_source(pool.clone()).await;
-    historical_fork_of_a_merged_positional_file(pool.clone()).await;
+    historical_fork_of_a_merged_file(pool.clone()).await;
     fork_after_a_dropped_column(pool.clone()).await;
     fork_refuses_encrypted_and_name_mapped_sources(pool.clone()).await;
     fork_into_an_independent_destination_is_refused(pool.clone()).await;
