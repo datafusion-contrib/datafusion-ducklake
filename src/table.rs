@@ -7408,7 +7408,7 @@ mod tests {
             )?;
             let ctx = SessionContext::new();
             ctx.runtime_env().register_object_store(
-                &url::Url::parse(table.object_store_url().as_str()).expect("valid url"),
+                &url::Url::parse("memory://").expect("valid url"),
                 Arc::new(object_store::memory::InMemory::new()),
             );
             let scan = table.scan(&ctx.state(), None, &[], None).await;
