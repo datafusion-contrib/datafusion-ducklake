@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
 - A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only
   transaction, so a pooler in statement mode, such as PgBouncer's, is unsupported (#383).
+- **BREAKING**: write a catalog these writers create, or `migrate_to_official_layout` migrates,
+  only with 0.10 or later; upgrade every writer of a catalog, then migrate it.
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
@@ -322,6 +324,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doubles inlined rows that a concurrent flush moves to a file between its catalog reads.
 - A scan, mutation, fork or change feed reads the catalog in one transaction: a merge between
   two listing pages or a flush of only inlined deletions no longer splits its reads (#383).
+- SQLite, DuckDB, and MySQL insert a new table's row at its commit, so a failed write leaves
+  none, and a create of a name another transaction created first conflicts.
+- Official DuckDB can attach and write, renames included, catalogs the DuckDB, SQLite, MySQL,
+  and single-catalog PostgreSQL writers create, or `migrate_to_official_layout` migrates.
+- A commit that inlines rows advances `next_file_id` as official's does, so an official session
+  sees that its table statistics changed.
 
 ## [0.9.0] - 2026-10-07
 

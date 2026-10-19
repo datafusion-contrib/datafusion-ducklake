@@ -1236,36 +1236,6 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// Add the columns and tables DuckDB requires that this crate's SQLite
-/// catalogs omit, so DuckDB can attach the catalog at `path`.
-#[cfg(feature = "write-sqlite")]
-pub(crate) async fn make_sqlite_catalog_duckdb_readable(path: &Path) {
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
-        .await
-        .unwrap();
-    for statement in [
-        "ALTER TABLE ducklake_snapshot ADD COLUMN next_catalog_id BIGINT NOT NULL DEFAULT 1000",
-        "ALTER TABLE ducklake_snapshot ADD COLUMN next_file_id BIGINT NOT NULL DEFAULT 1000",
-        "ALTER TABLE ducklake_schema ADD COLUMN schema_uuid VARCHAR",
-        "UPDATE ducklake_schema SET schema_uuid = '00000000-0000-0000-0000-000000000001'",
-        "ALTER TABLE ducklake_table ADD COLUMN table_uuid VARCHAR",
-        "UPDATE ducklake_table SET table_uuid = '00000000-0000-0000-0000-000000000002'",
-        "ALTER TABLE ducklake_data_file ADD COLUMN file_order BIGINT",
-        "ALTER TABLE ducklake_data_file ADD COLUMN file_format VARCHAR",
-        "ALTER TABLE ducklake_delete_file ADD COLUMN format VARCHAR",
-        "CREATE TABLE ducklake_column_mapping (mapping_id BIGINT, table_id BIGINT, type VARCHAR)",
-        "CREATE TABLE ducklake_file_variant_stats (data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN, extra_stats VARCHAR)",
-        "CREATE TABLE ducklake_macro (schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT)",
-        "CREATE TABLE ducklake_macro_impl (macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, sql VARCHAR, type VARCHAR)",
-        "CREATE TABLE ducklake_macro_parameters (macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR)",
-        "CREATE TABLE ducklake_name_mapping (mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN)",
-        "CREATE TABLE IF NOT EXISTS ducklake_view (view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, sql VARCHAR, column_aliases VARCHAR)",
-    ] {
-        sqlx::query(statement).execute(&pool).await.unwrap();
-    }
-    pool.close().await;
-}
-
 /// A scratch directory, kept after the test when `DUCKLAKE_DIFF_DEBUG` is set.
 fn scratch_dir() -> (Option<tempfile::TempDir>, PathBuf) {
     let temp = tempfile::TempDir::new().unwrap();
@@ -1311,7 +1281,6 @@ mod sqlite {
             || duckdb_attached_rows(Metadata::Sqlite(crate_path.clone())),
         )
         .await;
-        make_sqlite_catalog_duckdb_readable(&crate_path).await;
         checked.duckdb_reads(
             &Metadata::Sqlite(crate_path.clone()),
             &dir.join("crate_data"),

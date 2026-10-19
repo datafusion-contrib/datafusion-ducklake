@@ -184,6 +184,42 @@ pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> 
     })
 }
 
+/// The `ducklake_metadata` counters releases before 0.10 took partition and
+/// sort ids from, where official DuckDB takes them from `next_catalog_id`, as a
+/// SQL list. A writer that takes a catalog id takes it past them and raises
+/// them to it, so a 0.9 writer on a catalog not yet migrated to official's
+/// layout never takes the same id.
+#[cfg_attr(
+    not(any(feature = "write-sqlite", feature = "write-mysql", feature = "write-postgres")),
+    allow(dead_code)
+)]
+pub(crate) const LEGACY_CATALOG_ID_COUNTERS: &str = "('next_partition_id', 'next_sort_id')";
+
+/// The columns of a writer's `POSITIONAL_TABLES` entry, one definition per
+/// line, each with its name, definition and whether it is the table's key.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn positional_columns(columns: &str) -> Vec<(&str, &str, bool)> {
+    columns
+        .split(",\n")
+        .map(|definition| {
+            let definition = definition.trim();
+            let name = definition.split_whitespace().next().unwrap_or_default();
+            (name, definition, definition.contains("PRIMARY KEY"))
+        })
+        .collect()
+}
+
+/// The `inlined_insert` tokens of `changes_made`, one per table whose rows a
+/// commit inlined. Official DuckDB advances `next_file_id` once for each, and
+/// a running session reads that to tell its cached table statistics are stale.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn inlined_inserts(changes_made: &str) -> usize {
+    changes_made
+        .split(',')
+        .filter(|token| token.starts_with("inlined_insert:"))
+        .count()
+}
+
 /// Rewrites a `sort_on_insert` or `hive_file_pattern` stored as a case
 /// variant of `true` (`TRUE`, `True`) to `true`. Releases before this one
 /// stored a setting's value as given and read these two options without
@@ -2496,6 +2532,17 @@ pub(crate) fn rewritten_deletes_snapshot(write: &StagedTableWrite) -> Option<i64
 
 /// What [`rewritten_delete_conflict`] says, after the table id.
 const REWRITTEN_DELETE_CONFLICT: &str = ": the catalog committed a snapshot at or after snapshot";
+
+/// The conflict a write that expects the catalog at `base_snapshot` raises
+/// when its table was created after that snapshot: the writer found the name
+/// free, so another transaction created the table since, and official DuckLake
+/// refuses the create.
+pub(crate) fn created_table_conflict(table_id: i64, base_snapshot: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "table {table_id} was created by another transaction after snapshot {base_snapshot}; \
+         retry the write"
+    ))
+}
 
 /// The conflict a staged write that dates deletions in a rewritten delete file
 /// raises when the catalog committed a snapshot at or after that date. The

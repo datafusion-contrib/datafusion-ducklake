@@ -15,12 +15,11 @@
 //!
 //! ## MySQL dialect adaptations vs the SQLite template
 //!
-//! 1. **No `RETURNING`.** Auto-increment PK ids (`schema_id`, `table_id`) are
-//!    read back with `MySqlQueryResult::last_insert_id()`; counter-allocated ids
-//!    (`column_id`, `snapshot_id`, `data_file_id`, `delete_file_id`) are read
-//!    back with an `UPDATE` followed by a `SELECT` in the same transaction
-//!    (`reserve_ids`). File ids come exclusively from the counters — never from
-//!    auto-increment — so every insert path shares one id space per table.
+//! 1. **No `RETURNING`.** Every id comes from a `ducklake_metadata` counter,
+//!    read back with an `UPDATE` followed by a `SELECT` in the same transaction
+//!    (`reserve_ids`, `reserve_watermark_ids`): `column_id`, `snapshot_id`, one
+//!    `next_catalog_id` for schema, table, partition and sort ids, and one
+//!    `next_file_id` for data and delete file ids, as official allocates them.
 //! 2. **DDL type mapping.** `INTEGER`→`BIGINT`, bounded names→`VARCHAR(1024)`,
 //!    long/path values→`TEXT`, `BOOLEAN`→`TINYINT(1)`. Every table is InnoDB so
 //!    transactions + `SELECT … FOR UPDATE`-style row locks actually serialize.
@@ -54,8 +53,9 @@ use crate::metadata_writer::{
     validate_delete_entries, validate_inlined_flush, validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
-    DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_TABLE_INLINING_COLUMNS,
-    SourceFile, TableChanges, enables_inlining, inlined_deletion_conflict,
+    DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, LEGACY_CATALOG_ID_COUNTERS,
+    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, enables_inlining,
+    inlined_deletion_conflict, inlined_inserts, positional_columns,
     reject_reserved_inlining_columns, rewritten_delete_conflict, rewritten_deletes_snapshot,
     row_mutation_source_files, source_file_id_list, staged_conflict, table_conflict,
     validate_row_mutation_stage,
@@ -369,16 +369,13 @@ fn push_inlined_mysql_value(
 /// (unlike the SQLite driver's multi-statement exec), so — like the Postgres
 /// writer — the DDL must be split rather than sent as one `;`-joined script.
 ///
-/// Columns and their order match the SQLite writer's `SQL_CREATE_SCHEMA` (and so
-/// upstream DuckLake) for catalog compatibility; only the SQL types are mapped
-/// to MySQL. Auto-increment PKs back the ids read via `last_insert_id()`
-/// (`schema_id`/`table_id`). `data_file_id`/`delete_file_id` keep their
-/// auto-increment declarations for pre-existing-catalog compatibility, but every
-/// insert passes an explicit id from the `next_file_id`/`next_delete_file_id`
-/// counters so the update/delete/compaction paths and appends share one id
-/// space. `snapshot_id` is a plain PK assigned from the `next_snapshot_id`
-/// counter, and `ducklake_column` is a bare table (no PK) so a versioned column
-/// can hold multiple rows sharing a `column_id`.
+/// Columns and their order match official DuckLake for catalog compatibility,
+/// with [`POSITIONAL_TABLES`]; only the SQL types are mapped to MySQL. Schema,
+/// table, partition and sort ids come from the `next_catalog_id` counter, data
+/// and delete file ids from `next_file_id`, as official allocates them.
+/// `snapshot_id` is a plain PK assigned from the `next_snapshot_id` counter, and
+/// `ducklake_column` is a bare table (no PK) so a versioned column can hold
+/// multiple rows sharing a `column_id`.
 const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         `key` VARCHAR(1024) NOT NULL,
@@ -389,7 +386,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
         snapshot_time DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
-        schema_version BIGINT NOT NULL DEFAULT 0
+        schema_version BIGINT NOT NULL DEFAULT 0,
+        next_catalog_id BIGINT,
+        next_file_id BIGINT
     ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
@@ -403,23 +402,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         schema_version BIGINT NOT NULL,
         table_id BIGINT NOT NULL,
         UNIQUE (table_id, begin_snapshot)
-    ) ENGINE = InnoDB"#,
-    r#"CREATE TABLE IF NOT EXISTS ducklake_schema (
-        schema_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        schema_name VARCHAR(1024) NOT NULL,
-        path TEXT NOT NULL,
-        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
-        begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
-    ) ENGINE = InnoDB"#,
-    r#"CREATE TABLE IF NOT EXISTS ducklake_table (
-        table_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        schema_id BIGINT NOT NULL,
-        table_name VARCHAR(1024) NOT NULL,
-        path TEXT NOT NULL,
-        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
-        begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
     ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_view (
         view_id BIGINT,
@@ -449,22 +431,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         parent_column BIGINT,
         default_value_type VARCHAR(1024),
         default_value_dialect VARCHAR(1024)
-    ) ENGINE = InnoDB"#,
-    r#"CREATE TABLE IF NOT EXISTS ducklake_data_file (
-        data_file_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        table_id BIGINT NOT NULL,
-        path TEXT NOT NULL,
-        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
-        file_size_bytes BIGINT NOT NULL,
-        footer_size BIGINT,
-        encryption_key VARCHAR(1024),
-        record_count BIGINT,
-        row_id_start BIGINT,
-        mapping_id BIGINT,
-        begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT,
-        partial_max BIGINT,
-        partition_id BIGINT
     ) ENGINE = InnoDB"#,
     // Per-table row-lineage + running totals. `next_row_id` allocates rowids
     // monotonically over the table's lifetime; `record_count`/`file_size_bytes`
@@ -505,22 +471,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         max_value TEXT,
         extra_stats TEXT
     ) ENGINE = InnoDB"#,
-    // Delete files registered by the UPDATE/DELETE paths; ids come from the
-    // next_delete_file_id counter (the auto-increment is never consulted).
-    r#"CREATE TABLE IF NOT EXISTS ducklake_delete_file (
-        delete_file_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        data_file_id BIGINT NOT NULL,
-        table_id BIGINT NOT NULL,
-        path TEXT NOT NULL,
-        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
-        file_size_bytes BIGINT NOT NULL,
-        footer_size BIGINT,
-        encryption_key VARCHAR(1024),
-        delete_count BIGINT,
-        begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT,
-        partial_max BIGINT
-    ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
         data_file_id BIGINT NOT NULL,
         path TEXT NOT NULL,
@@ -551,7 +501,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
         partition_value TEXT
     ) ENGINE = InnoDB"#,
     // Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id
-    // is allocated from the next_sort_id counter (like partition_id).
+    // is allocated from the next_catalog_id counter (like partition_id).
     r#"CREATE TABLE IF NOT EXISTS ducklake_sort_info (
         sort_id BIGINT NOT NULL,
         table_id BIGINT NOT NULL,
@@ -570,6 +520,139 @@ const SQL_CREATE_TABLES: &[&str] = &[
         sort_direction VARCHAR(16) NOT NULL,
         null_order VARCHAR(16) NOT NULL
     ) ENGINE = InnoDB"#,
+    // Tables this crate does not write, which official DuckDB reads when it
+    // attaches.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_tag (
+        object_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        `key` TEXT,
+        `value` TEXT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+        table_id BIGINT,
+        column_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        `key` TEXT,
+        `value` TEXT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+        mapping_id BIGINT,
+        table_id BIGINT,
+        `type` TEXT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+        mapping_id BIGINT,
+        column_id BIGINT,
+        source_name TEXT,
+        target_field_id BIGINT,
+        parent_column BIGINT,
+        is_partition TINYINT(1)
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_file_variant_stats (
+        data_file_id BIGINT,
+        table_id BIGINT,
+        column_id BIGINT,
+        variant_path TEXT,
+        shredded_type TEXT,
+        column_size_bytes BIGINT,
+        value_count BIGINT,
+        null_count BIGINT,
+        min_value TEXT,
+        max_value TEXT,
+        contains_nan TINYINT(1),
+        extra_stats TEXT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro (
+        schema_id BIGINT,
+        macro_id BIGINT,
+        macro_name TEXT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro_impl (
+        macro_id BIGINT,
+        impl_id BIGINT,
+        dialect TEXT,
+        `sql` TEXT,
+        `type` TEXT
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro_parameters (
+        macro_id BIGINT,
+        impl_id BIGINT,
+        column_id BIGINT,
+        parameter_name TEXT,
+        parameter_type TEXT,
+        default_value TEXT,
+        default_value_type TEXT
+    ) ENGINE = InnoDB"#,
+];
+
+/// The catalog tables official DuckDB inserts into by position, with their
+/// columns, keys and order as official has them, and no `AUTO_INCREMENT`:
+/// every id is taken from a counter. `ducklake_table` has no key: official
+/// keeps one row per version of a table, a rename's included. A catalog this
+/// writer created before it followed them keeps its layout, which a release
+/// before 0.10 still writes, until
+/// [`MySqlMetadataWriter::migrate_to_official_layout`] changes it.
+const POSITIONAL_TABLES: [(&str, &str); 4] = [
+    (
+        "ducklake_schema",
+        "schema_id BIGINT NOT NULL PRIMARY KEY,
+        schema_uuid VARCHAR(36),
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        schema_name VARCHAR(1024) NOT NULL,
+        path TEXT NOT NULL,
+        path_is_relative TINYINT(1) NOT NULL DEFAULT 1",
+    ),
+    (
+        "ducklake_table",
+        "table_id BIGINT NOT NULL,
+        table_uuid VARCHAR(36),
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        schema_id BIGINT NOT NULL,
+        table_name VARCHAR(1024) NOT NULL,
+        path TEXT NOT NULL,
+        path_is_relative TINYINT(1) NOT NULL DEFAULT 1",
+    ),
+    (
+        "ducklake_data_file",
+        "data_file_id BIGINT NOT NULL PRIMARY KEY,
+        table_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        file_order BIGINT,
+        path TEXT NOT NULL,
+        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
+        file_format VARCHAR(1024),
+        record_count BIGINT,
+        file_size_bytes BIGINT NOT NULL,
+        footer_size BIGINT,
+        row_id_start BIGINT,
+        partition_id BIGINT,
+        encryption_key VARCHAR(1024),
+        mapping_id BIGINT,
+        partial_max BIGINT",
+    ),
+    (
+        "ducklake_delete_file",
+        "delete_file_id BIGINT NOT NULL PRIMARY KEY,
+        table_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        data_file_id BIGINT NOT NULL,
+        path TEXT NOT NULL,
+        path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
+        format VARCHAR(1024),
+        delete_count BIGINT,
+        file_size_bytes BIGINT NOT NULL,
+        footer_size BIGINT,
+        encryption_key VARCHAR(1024),
+        partial_max BIGINT",
+    ),
 ];
 
 /// MySQL-based metadata writer for DuckLake catalogs.
@@ -611,6 +694,16 @@ impl MySqlMetadataWriter {
         let writer = Self::new(connection_string).await?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+
+    /// Bring the catalog tables official DuckDB inserts into by position to
+    /// official's layout, so official DuckDB can write the catalog; one this
+    /// writer created already has it. A release before 0.10 can no longer
+    /// create a table or add a file in a migrated catalog, so migrate once
+    /// every writer of the catalog runs 0.10 or later. Idempotent.
+    pub fn migrate_to_official_layout(&self) -> Result<()> {
+        self.initialize_schema()?;
+        self.block_on(order_positional_tables(&self.pool))
     }
 
     /// Set the `data_inlining_row_limit` this writer applies where the
@@ -1008,16 +1101,187 @@ async fn reserve_ids(
     Ok(last)
 }
 
-async fn reserve_file_ids(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, n: i64) -> Result<Vec<i64>> {
-    let last = reserve_ids(tx, "next_file_id", n).await?;
-    Ok(((last - n + 1)..=last).collect())
+/// The largest schema, table, view, partition, sort or macro id in use, `-1`
+/// in an empty catalog, so the first id is `0` as in official.
+const SQL_MAX_CATALOG_ID: &str = "SELECT GREATEST(
+     COALESCE((SELECT MAX(schema_id) FROM ducklake_schema), -1),
+     COALESCE((SELECT MAX(table_id) FROM ducklake_table), -1),
+     COALESCE((SELECT MAX(view_id) FROM ducklake_view), -1),
+     COALESCE((SELECT MAX(partition_id) FROM ducklake_partition_info), -1),
+     COALESCE((SELECT MAX(sort_id) FROM ducklake_sort_info), -1),
+     COALESCE((SELECT MAX(macro_id) FROM ducklake_macro), -1),
+     COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
+               ORDER BY snapshot_id DESC LIMIT 1) - 1, -1))";
+
+/// The largest data or delete file id in use, `-1` in an empty catalog.
+const SQL_MAX_FILE_ID: &str = "SELECT GREATEST(
+     COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), -1),
+     COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), -1),
+     COALESCE((SELECT next_file_id FROM ducklake_snapshot
+               ORDER BY snapshot_id DESC LIMIT 1) - 1, -1))";
+
+/// Reserve `n` consecutive ids from `watermark`, the `ducklake_metadata`
+/// counter (`next_catalog_id` or `next_file_id`) official DuckDB allocates the
+/// same ids from, returning the last. The ids are past every id in use and
+/// every id official handed out (below the head snapshot's watermark), and the
+/// head's watermark is raised past them, so official never reuses one; a
+/// reservation made after the commit inserted its snapshot raises that one.
+/// They are also past the `legacy` counters a release before 0.10 took the
+/// same ids from, which are raised to them, so it never takes one either.
+async fn reserve_watermark_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    watermark: &str,
+    n: i64,
+) -> Result<i64> {
+    let (in_use, legacy) = match watermark {
+        "next_catalog_id" => (SQL_MAX_CATALOG_ID, LEGACY_CATALOG_ID_COUNTERS),
+        _ => (SQL_MAX_FILE_ID, "('next_delete_file_id')"),
+    };
+    // Locking the legacy counters first orders this reservation with one an
+    // earlier release makes from them.
+    let legacy_last: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT COALESCE(MAX(CAST(`value` AS SIGNED)), -1) FROM ducklake_metadata
+         WHERE `key` IN {legacy} AND scope IS NULL FOR UPDATE"
+    )))
+    .fetch_one(&mut **tx)
+    .await?;
+    let in_use: i64 = sqlx::query_scalar(in_use).fetch_one(&mut **tx).await?;
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET `value` = CAST(GREATEST(CAST(`value` AS SIGNED), ?) + ? AS CHAR)
+         WHERE `key` = ? AND scope IS NULL",
+    )
+    .bind(in_use.max(legacy_last))
+    .bind(n)
+    .bind(watermark)
+    .execute(&mut **tx)
+    .await?;
+    let last: i64 = sqlx::query_scalar(
+        "SELECT CAST(`value` AS SIGNED) FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL",
+    )
+    .bind(watermark)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE ducklake_metadata SET `value` = CAST(? AS CHAR)
+         WHERE `key` IN {legacy} AND scope IS NULL"
+    )))
+    .bind(last)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE ducklake_snapshot SET {watermark} = GREATEST(COALESCE({watermark}, 0), ?)
+         ORDER BY snapshot_id DESC LIMIT 1"
+    )))
+    .bind(last + 1)
+    .execute(&mut **tx)
+    .await?;
+    Ok(last)
 }
 
-async fn reserve_delete_file_ids(
+/// Take the next schema, table, partition or sort id without inserting a row,
+/// so a write can carry the id from setup and insert the row inside its commit.
+async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<i64> {
+    reserve_watermark_ids(tx, "next_catalog_id", 1).await
+}
+
+/// Insert the schema and table rows of `table_id` at `snapshot_id` when
+/// `begin_write_transaction` only reserved the id. Another transaction that
+/// created the name first, or dropped or renamed the table since the setup,
+/// makes this a conflict, as official DuckLake refuses a create of a table
+/// another transaction created. A table without any row is the setup's
+/// reservation only while `base_snapshot`, the head the setup saw, is kept
+/// (`0`, an empty catalog's, has no table to drop): once that is expired, the
+/// table may have been dropped and expired since, so the write conflicts.
+async fn insert_new_table_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    n: i64,
-) -> Result<Vec<i64>> {
-    let last = reserve_ids(tx, "next_delete_file_id", n).await?;
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    base_snapshot: i64,
+) -> Result<()> {
+    let live: Option<i64> = sqlx::query_scalar(
+        "SELECT t.table_id
+         FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+           AND t.table_name = ? AND t.end_snapshot IS NULL",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match live {
+        Some(live_id) if live_id == table_id => return Ok(()),
+        Some(_) => {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "table {} was created by another transaction; retry the write",
+                quote_snapshot_table(schema_name, table_name)
+            )));
+        },
+        None => {},
+    }
+    let known: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ?)
+             OR (? > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = ?))",
+    )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .bind(base_snapshot)
+    .fetch_one(&mut **tx)
+    .await?;
+    if known > 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "table {} was dropped or renamed by another transaction; retry the write",
+            quote_snapshot_table(schema_name, table_name)
+        )));
+    }
+    let schema_id: i64 = match sqlx::query_scalar(
+        "SELECT schema_id FROM ducklake_schema
+         WHERE schema_name = ? AND end_snapshot IS NULL",
+    )
+    .bind(schema_name)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        Some(id) => id,
+        None => {
+            let schema_id = reserve_catalog_id(tx).await?;
+            sqlx::query(
+                "INSERT INTO ducklake_schema
+                     (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, 1, ?)",
+            )
+            .bind(schema_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(schema_name)
+            .bind(directory_path(schema_name))
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
+            schema_id
+        },
+    };
+    sqlx::query(
+        "INSERT INTO ducklake_table
+             (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, 1, ?)",
+    )
+    .bind(table_id)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(schema_id)
+    .bind(table_name)
+    .bind(directory_path(table_name))
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Data and delete file ids share one counter, as official's `next_file_id`.
+async fn reserve_file_ids(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, n: i64) -> Result<Vec<i64>> {
+    let last = reserve_watermark_ids(tx, "next_file_id", n).await?;
     Ok(((last - n + 1)..=last).collect())
 }
 
@@ -1042,6 +1306,103 @@ async fn add_column(pool: &MySqlPool, table: &str, column: &str, alter: &str) ->
     .await?;
     if exists == 0 {
         return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Add each of [`POSITIONAL_TABLES`]' columns a catalog that predates it lacks,
+/// last, as a release before 0.10, which names the columns it writes, still
+/// writes the table.
+async fn add_missing_positional_columns(pool: &MySqlPool) -> Result<()> {
+    for (table, columns) in POSITIONAL_TABLES {
+        let current: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = ?",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+        for (name, definition, _) in positional_columns(columns) {
+            if !current.iter().any(|column| column == name) {
+                add_column(
+                    pool,
+                    table,
+                    name,
+                    &format!("ALTER TABLE {table} ADD COLUMN {definition}"),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bring each of [`POSITIONAL_TABLES`] whose columns are those official
+/// expects but in another order, with another key or with an
+/// `AUTO_INCREMENT`, as in a catalog this writer created before it followed
+/// official's layout, to official's layout, and give rows without a
+/// `schema_uuid` or `table_uuid` one. Each table changes in one `ALTER TABLE`,
+/// which blocks the table's writers while it runs, so no row a writer commits
+/// meanwhile is lost. Idempotent: a table in official's layout is left alone.
+async fn order_positional_tables(pool: &MySqlPool) -> Result<()> {
+    for (table, columns) in POSITIONAL_TABLES {
+        let expected = positional_columns(columns);
+        let current: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT column_name, column_key = 'PRI', extra LIKE '%auto_increment%'
+             FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = ?
+             ORDER BY ordinal_position",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+        let in_layout = current.len() == expected.len()
+            && current.iter().zip(&expected).all(
+                |((column, key, auto_increment), (name, _, expected_key))| {
+                    column == name && key == expected_key && !auto_increment
+                },
+            );
+        if in_layout
+            || !current
+                .iter()
+                .all(|(column, ..)| expected.iter().any(|(name, ..)| name == column))
+        {
+            continue;
+        }
+        let keyed = current.iter().any(|(_, key, _)| *key);
+        let mut clauses = Vec::new();
+        if keyed {
+            clauses.push("DROP PRIMARY KEY".to_string());
+        }
+        let mut previous: Option<&str> = None;
+        for (name, definition, _) in &expected {
+            let position =
+                previous.map_or_else(|| "FIRST".to_string(), |column| format!("AFTER {column}"));
+            clauses.push(format!(
+                "MODIFY COLUMN {} {position}",
+                definition.replace(" PRIMARY KEY", "")
+            ));
+            previous = Some(name);
+        }
+        if let Some((name, ..)) = expected.iter().find(|(.., key)| *key) {
+            clauses.push(format!("ADD PRIMARY KEY ({name})"));
+        }
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE {table} {}",
+            clauses.join(", ")
+        )))
+        .execute(pool)
+        .await?;
+        if let Some((uuid, ..)) = expected
+            .iter()
+            .find(|(column, ..)| column.ends_with("_uuid"))
+        {
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET {uuid} = UUID() WHERE {uuid} IS NULL"
+            )))
+            .execute(pool)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -1166,6 +1527,29 @@ async fn detect_replace_conflict(
                  snapshot {base_snapshot}; aborting"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Conflict when the row of `table_id` began after `base_snapshot`: a write
+/// that expects the catalog at that snapshot found the table's name free.
+async fn detect_created_table_conflict(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let created: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_table WHERE table_id = ? AND begin_snapshot > ?",
+    )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .fetch_one(&mut **tx)
+    .await?;
+    if created > 0 {
+        return Err(crate::metadata_writer::created_table_conflict(
+            table_id,
+            base_snapshot,
+        ));
     }
     Ok(())
 }
@@ -1314,7 +1698,7 @@ async fn insert_flush_delete_file(
     data_file_id: i64,
     delete: &InlinedFlushDeleteFile,
 ) -> Result<()> {
-    let delete_file_id = reserve_delete_file_ids(tx, 1).await?[0];
+    let delete_file_id = reserve_file_ids(tx, 1).await?[0];
     sqlx::query(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
@@ -1351,7 +1735,22 @@ async fn insert_flush_delete_file(
 /// 1093) and has no `RETURNING`; a counter both serializes writers and hands the
 /// id back directly. A DDL commit follows this with [`bump_schema_version`].
 async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<(i64, i64)> {
-    let snapshot_id = reserve_ids(tx, "next_snapshot_id", 1).await?;
+    // Past every snapshot, as official DuckDB, which takes `MAX(snapshot_id) +
+    // 1`, may have committed some after this counter.
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET `value` = CAST(GREATEST(CAST(`value` AS SIGNED),
+             (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot)) + 1 AS CHAR)
+         WHERE `key` = 'next_snapshot_id' AND scope IS NULL",
+    )
+    .execute(&mut **tx)
+    .await?;
+    let snapshot_id: i64 = sqlx::query_scalar(
+        "SELECT CAST(`value` AS SIGNED) FROM ducklake_metadata
+         WHERE `key` = 'next_snapshot_id' AND scope IS NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
     // Carry the current per-catalog schema_version forward; a DDL commit corrects
     // this to a bump via `bump_schema_version` below. Read before the INSERT so
     // the MAX is over the pre-existing rows only (matches the SQLite writer).
@@ -1360,12 +1759,30 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<
             .fetch_one(&mut **tx)
             .await?
             .try_get(0)?;
+    // The id watermarks official DuckDB allocates from: the previous head's,
+    // raised past every id this writer reserved.
+    let (next_catalog_id, next_file_id): (i64, i64) = sqlx::query_as(
+        "SELECT
+             GREATEST(COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
+                                ORDER BY snapshot_id DESC LIMIT 1), 0),
+                      COALESCE((SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                                WHERE `key` = 'next_catalog_id' AND scope IS NULL), 0)),
+             GREATEST(COALESCE((SELECT next_file_id FROM ducklake_snapshot
+                                ORDER BY snapshot_id DESC LIMIT 1), 0),
+                      COALESCE((SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                                WHERE `key` = 'next_file_id' AND scope IS NULL), 0))",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
     sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
-         VALUES (?, NOW(6), ?)",
+        "INSERT INTO ducklake_snapshot
+             (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+         VALUES (?, NOW(6), ?, ?, ?)",
     )
     .bind(snapshot_id)
     .bind(schema_version)
+    .bind(next_catalog_id)
+    .bind(next_file_id)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -1406,6 +1823,10 @@ async fn record_snapshot_changes(
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
+    let inlined = inlined_inserts(changes_made.unwrap_or_default());
+    if inlined > 0 {
+        reserve_file_ids(tx, inlined as i64).await?;
+    }
     Ok(())
 }
 
@@ -1729,7 +2150,7 @@ async fn apply_delete_entry(
         .execute(&mut **tx)
         .await?;
     }
-    let delete_file_id = reserve_delete_file_ids(tx, 1).await?[0];
+    let delete_file_id = reserve_file_ids(tx, 1).await?[0];
     sqlx::query(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
@@ -2088,15 +2509,27 @@ pub(crate) async fn merge_inlined_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
+    schema_name: &str,
+    table_name: &str,
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
 ) -> Result<i64> {
     let (snapshot_id, _) = insert_snapshot(tx).await?;
+    insert_new_table_rows(
+        tx,
+        snapshot_id,
+        table_id,
+        schema_name,
+        table_name,
+        base_snapshot,
+    )
+    .await?;
     finalize_table_snapshot(
         tx,
         snapshot_id,
@@ -3609,11 +4042,14 @@ impl MetadataWriter for MySqlMetadataWriter {
             }
 
             let schema_path = directory_path(path.unwrap_or(name));
-            // No RETURNING: read the new auto-increment id via last_insert_id().
-            let result = sqlx::query(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, 1, ?)",
+            let schema_id = reserve_catalog_id(&mut tx).await?;
+            sqlx::query(
+                "INSERT INTO ducklake_schema
+                     (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, 1, ?)",
             )
+            .bind(schema_id)
+            .bind(uuid::Uuid::new_v4().to_string())
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
@@ -3628,7 +4064,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             )
             .await?;
             tx.commit().await?;
-            Ok((result.last_insert_id() as i64, true))
+            Ok((schema_id, true))
         })
     }
 
@@ -3663,10 +4099,14 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?;
 
             let table_path = directory_path(path.unwrap_or(name));
-            let result = sqlx::query(
-                "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, ?, 1, ?)",
+            let table_id = reserve_catalog_id(&mut tx).await?;
+            sqlx::query(
+                "INSERT INTO ducklake_table
+                     (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, 1, ?)",
             )
+            .bind(table_id)
+            .bind(uuid::Uuid::new_v4().to_string())
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
@@ -3682,7 +4122,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             )
             .await?;
             tx.commit().await?;
-            Ok((result.last_insert_id() as i64, true))
+            Ok((table_id, true))
         })
     }
 
@@ -3913,9 +4353,17 @@ impl MetadataWriter for MySqlMetadataWriter {
             // fully-populated data.
             let mut tx = self.pool.begin().await?;
 
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
 
             // Partition-spec fence: this file must be consistent with the table's live
             // partition generation at commit time (both directions — see
@@ -4081,9 +4529,17 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.
             // The tx rolls back on a Conflict.
@@ -4355,9 +4811,17 @@ impl MetadataWriter for MySqlMetadataWriter {
         validate_delete_entries(mode, deletes)?;
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
             if !deletes.is_empty() {
                 let ours = TableChanges {
                     inserted_into: true,
@@ -5193,9 +5657,17 @@ impl MetadataWriter for MySqlMetadataWriter {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
             enforce_inline_partition_fence(&mut tx, table_id, base_snapshot).await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
@@ -5367,6 +5839,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                         ConflictScope::of(write),
                     )
                     .await?;
+                    detect_created_table_conflict(&mut tx, write.table_id, expected).await?;
                 }
             }
             for write in writes {
@@ -5402,6 +5875,15 @@ impl MetadataWriter for MySqlMetadataWriter {
             }
             let mut tables = Vec::with_capacity(writes.len());
             for write in writes {
+                insert_new_table_rows(
+                    &mut tx,
+                    snapshot_id,
+                    write.table_id,
+                    &write.schema_name,
+                    &write.table_name,
+                    write.base_snapshot_id,
+                )
+                .await?;
                 let schema_id = validate_staged_table(&mut tx, write).await?;
                 finalize_table_snapshot(
                     &mut tx,
@@ -5618,7 +6100,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let partition_id = reserve_ids(&mut tx, "next_partition_id", 1).await?;
+            let partition_id = reserve_catalog_id(&mut tx).await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
 
             let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
@@ -5797,7 +6279,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let sort_id = reserve_ids(&mut tx, "next_sort_id", 1).await?;
+            let sort_id = reserve_catalog_id(&mut tx).await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
             // Official bumps the schema version on every sort-order change, with no
             // `ducklake_schema_versions` row (checked with the DuckDB CLI).
@@ -5906,9 +6388,17 @@ impl MetadataWriter for MySqlMetadataWriter {
         // making the new head visible atomically.
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
             record_table_write_changes(
                 &mut tx,
                 snapshot_id,
@@ -6048,6 +6538,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             // create each table separately (see SQL_CREATE_TABLES).
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(*ddl).execute(&self.pool).await?;
+            }
+            for (table, columns) in POSITIONAL_TABLES {
+                sqlx::query(AssertSqlSafe(format!(
+                    "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = InnoDB"
+                )))
+                .execute(&self.pool)
+                .await?;
             }
             let default_columns: Vec<String> = sqlx::query_scalar(
                 "SELECT column_name FROM information_schema.columns
@@ -6221,34 +6718,47 @@ impl MetadataWriter for MySqlMetadataWriter {
                 "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
             )
             .await?;
-            seed_counter(
-                &self.pool,
-                "next_file_id",
-                "SELECT COALESCE(MAX(data_file_id), 0) FROM ducklake_data_file",
-            )
-            .await?;
-            seed_counter(
-                &self.pool,
-                "next_delete_file_id",
-                "SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file",
-            )
-            .await?;
-            seed_counter(
-                &self.pool,
-                "next_partition_id",
-                "SELECT COALESCE(MAX(partition_id), 0) FROM ducklake_partition_info",
-            )
-            .await?;
-            seed_counter(
-                &self.pool,
-                "next_sort_id",
-                "SELECT COALESCE(MAX(sort_id), 0) FROM ducklake_sort_info",
-            )
-            .await?;
+            for watermark in ["next_catalog_id", "next_file_id"] {
+                let present: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.columns
+                     WHERE table_schema = DATABASE() AND table_name = 'ducklake_snapshot'
+                       AND column_name = ?",
+                )
+                .bind(watermark)
+                .fetch_one(&self.pool)
+                .await?;
+                if present == 0 {
+                    add_column(
+                        &self.pool,
+                        "ducklake_snapshot",
+                        watermark,
+                        &format!("ALTER TABLE ducklake_snapshot ADD COLUMN {watermark} BIGINT"),
+                    )
+                    .await?;
+                }
+            }
+            add_missing_positional_columns(&self.pool).await?;
+            seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+            seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
             migrate_directory_paths(&self.pool).await?;
             sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS_MYSQL)
                 .execute(&self.pool)
                 .await?;
+            // A catalog this writer created before it kept the id watermarks has
+            // none; raise the head's past the counters, which seeding put past
+            // every id in use.
+            sqlx::query(
+                "UPDATE ducklake_snapshot
+                 SET next_catalog_id = GREATEST(COALESCE(next_catalog_id, 0),
+                         (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                          WHERE `key` = 'next_catalog_id' AND scope IS NULL)),
+                     next_file_id = GREATEST(COALESCE(next_file_id, 0),
+                         (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                          WHERE `key` = 'next_file_id' AND scope IS NULL))
+                 ORDER BY snapshot_id DESC LIMIT 1",
+            )
+            .execute(&self.pool)
+            .await?;
             Ok(())
         })
     }
@@ -6292,56 +6802,32 @@ impl MetadataWriter for MySqlMetadataWriter {
             // commit (finalize_snapshot), so it may differ under concurrency.
             let snapshot_id: i64 = base_snapshot_id + 1;
 
-            let schema_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL",
-                )
-                .bind(schema_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let result = sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, 1, ?)",
-                    )
-                    .bind(schema_name)
-                    .bind(directory_path(schema_name))
-                    .bind(snapshot_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    result.last_insert_id() as i64
-                }
+            // Look up, do not create: a new schema or table gets a reserved id
+            // here and its row at the commit, so a write that fails before the
+            // commit leaves no row behind.
+            let schema_id: i64 = match sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(id) => id,
+                None => reserve_catalog_id(&mut tx).await?,
             };
 
-            let table_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
-                )
-                .bind(schema_id)
-                .bind(table_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let result = sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, ?, 1, ?)",
-                    )
-                    .bind(schema_id)
-                    .bind(table_name)
-                    .bind(directory_path(table_name))
-                    .bind(snapshot_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    result.last_insert_id() as i64
-                }
+            let table_id: i64 = match sqlx::query_scalar(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(id) => id,
+                None => reserve_catalog_id(&mut tx).await?,
             };
 
             // Get existing columns to (a) check schema compatibility for appends

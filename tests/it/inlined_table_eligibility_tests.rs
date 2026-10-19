@@ -204,7 +204,6 @@ async fn geometry_is_never_inlined(metadata: &Metadata, data: &Path, side: &Side
     );
     // Official reads the tables without a GEOMETRY column; it cannot cast the
     // BLOB a Parquet file this crate writes for a GEOMETRY column holds.
-    fill_snapshot_counters(metadata).await;
     assert_eq!(
         duckdb_query(
             metadata,
@@ -246,50 +245,6 @@ async fn crate_rows(side: &Side, sql: &str) -> Vec<String> {
         }
     }
     rows
-}
-
-/// Fill the `next_catalog_id` and `next_file_id` this crate leaves NULL in
-/// the snapshots it commits to an official-created catalog (a known gap),
-/// which official needs to attach it.
-async fn fill_snapshot_counters(metadata: &Metadata) {
-    let statement = "UPDATE ducklake_snapshot \
-                     SET next_catalog_id = COALESCE(next_catalog_id, 1000), \
-                         next_file_id = COALESCE(next_file_id, 1000)";
-    match metadata {
-        Metadata::Sqlite(path) => {
-            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
-                .await
-                .unwrap();
-            sqlx::query(statement).execute(&pool).await.unwrap();
-            pool.close().await;
-        },
-        #[cfg(feature = "metadata-postgres")]
-        Metadata::Postgres(dsn) => {
-            let pool = sqlx::PgPool::connect(&postgres_url(dsn)).await.unwrap();
-            sqlx::query(statement).execute(&pool).await.unwrap();
-            pool.close().await;
-        },
-        _ => {},
-    }
-}
-
-/// The URL of the PostgreSQL database a `key=value` DSN names.
-#[cfg(feature = "metadata-postgres")]
-fn postgres_url(dsn: &str) -> String {
-    let value = |key: &str| {
-        dsn.split_whitespace()
-            .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
-            .unwrap()
-            .to_string()
-    };
-    format!(
-        "postgresql://{}:{}@{}:{}/{}",
-        value("user"),
-        value("password"),
-        value("host"),
-        value("port"),
-        value("dbname")
-    )
 }
 
 fn scratch() -> (tempfile::TempDir, PathBuf) {
@@ -347,7 +302,6 @@ async fn postgres_single_catalog_creates_no_inlined_table_for_geometry() {
     run_sql(&side, "ALTER TABLE lake.main.plain SET PARTITIONED BY (id)").await;
     assert_eq!(storage(&metadata, "g").0, 0);
     assert_eq!(storage(&metadata, "plain").0, 2);
-    fill_snapshot_counters(&metadata).await;
     assert_eq!(
         duckdb_query(
             &metadata,

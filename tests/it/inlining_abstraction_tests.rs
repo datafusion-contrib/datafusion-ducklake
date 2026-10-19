@@ -2979,7 +2979,6 @@ async fn official_reads_what_the_new_paths_wrote() {
         .unwrap();
     let ours = lake.rows("t").await;
     let db = lake._dir.path().join("lake.db");
-    crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&db).await;
     let official = crate::inlined_mutation_differential_tests::duckdb_query(
         &crate::inlined_mutation_differential_tests::Metadata::Sqlite(db.clone()),
         &lake.data,

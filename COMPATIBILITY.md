@@ -406,9 +406,11 @@ session and object-store handling that the registration path does not provide.
 ## Write concurrency
 
 Write commits allocate a snapshot and publish their data and final metadata in
-one database transaction. Write setup retains each backend's existing schema
-and table reservation behavior; PostgreSQL layouts reserve identifiers without
-publishing schema or table rows.
+one database transaction. Write setup reserves the schema and table identifiers
+of a new table and the commit inserts their rows, as official DuckLake does, so
+a write that fails after setup leaves no row. A commit that finds the name
+taken by a table another transaction created conflicts instead of writing into
+it.
 
 `DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
 MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field
@@ -904,6 +906,24 @@ Known edges:
   it forward, matching upstream's `if (SchemaChangesMade()) schema_version++`. These branches
   deliberately retain their existing counter or sequence allocation instead of adding the
   separate Group 9 snapshot-allocator change.
+- **Official DuckDB can write a catalog this crate created.** On DuckDB, SQLite, MySQL, and
+  single-catalog PostgreSQL metadata, the writers lay out `ducklake_schema`, `ducklake_table`,
+  `ducklake_data_file`, and `ducklake_delete_file` with official's columns, order and keys, since
+  official inserts into them by position and keeps one `ducklake_table` row per version of a
+  table, and create every table official reads. Schema, table, partition, and sort ids come from
+  official's `next_catalog_id` namespace and file ids from its `next_file_id` one, which every
+  snapshot carries as the watermarks official allocates from; either side then allocates past
+  the other's ids, and a commit that inlines rows advances `next_file_id` once per table, as
+  official's does. Initialization only adds what an older catalog lacks, so a release before 0.10
+  keeps writing it; `migrate_to_official_layout` then rebuilds it into official's layout
+  (idempotent, lossless, blocking the tables' writers while it runs), after which only 0.10 or
+  later should write it: an older release fails to create a table (and, on DuckDB, to add a
+  file), and its snapshots lack the watermarks official reads. Until then the writers also take
+  ids past the counters and sequences older releases allocate from. The multi-catalog PostgreSQL layout is library-specific and stays
+  unattachable by official. Official DuckDB 1.5.5's MySQL connector cannot append to an existing
+  table on any MySQL catalog, its own included. This crate writes a table's files under its
+  schema and table names, not its stored path, so a file it writes to a table official renamed
+  lands outside the table's directory, and neither side reads it.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

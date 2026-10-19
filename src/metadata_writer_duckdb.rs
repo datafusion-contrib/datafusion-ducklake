@@ -20,16 +20,17 @@
 //!    single-writer — serializes commits, which is exactly the "write lock" the
 //!    SQLite writer leans on. Each mutating method opens one DuckDB transaction
 //!    (`BEGIN`/`COMMIT`, auto-rollback on drop) for atomicity.
-//! 2. **Id allocation.** SQLite relies on `INTEGER PRIMARY KEY` rowid
-//!    autoincrement for `schema_id` / `table_id` / `data_file_id` /
-//!    `delete_file_id`; a plain DuckDB PK does *not* autoincrement, so those
-//!    columns default from DuckDB **sequences** (`nextval(...)`). `snapshot_id`
-//!    keeps SQLite's commit-ordered `MAX(snapshot_id)+1` allocation (assigned at
-//!    the commit, never reserved at begin) and `column_id` keeps SQLite's
-//!    monotonic counter row in `ducklake_metadata` bumped with `UPDATE ...
-//!    RETURNING`. The column *layouts* are otherwise identical to the SQLite
-//!    DDL; only the id-default mechanism and the SQL type spellings
-//!    (BIGINT/VARCHAR/BOOLEAN/TIMESTAMP) change.
+//! 2. **Id allocation, as official DuckDB allocates.** Schema, table,
+//!    partition and sort ids come from one `next_catalog_id` counter, and data
+//!    and delete file ids from one `next_file_id` counter, both rows in
+//!    `ducklake_metadata`; every snapshot row carries them as its
+//!    `next_catalog_id` and `next_file_id`, which official DuckDB reads at the
+//!    head to allocate its own ids. `snapshot_id` keeps SQLite's commit-ordered
+//!    `MAX(snapshot_id)+1` allocation (assigned at the commit, never reserved at
+//!    begin) and `column_id` keeps SQLite's monotonic counter row. The
+//!    `ducklake_schema`, `ducklake_table`, `ducklake_data_file` and
+//!    `ducklake_delete_file` columns follow official's order, since official
+//!    inserts into them by position.
 //! 3. **Ordering + conflict detection preserved.** The snapshot is allocated
 //!    before the table reads, and a `Replace` commit aborts with
 //!    [`crate::DuckLakeError::Conflict`] if any data file of the table has a
@@ -52,9 +53,9 @@ use crate::metadata_writer::{
     StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, carried_row_id_start,
     catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
     catalog_columns_differ, encode_inlined_index_columns, inlined_delete_groups,
-    inlined_flush_changes, inlined_flush_conflict, live_inlined_index_columns,
-    parse_inlined_index_columns, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    inlined_flush_changes, inlined_flush_conflict, inlined_inserts, live_inlined_index_columns,
+    parse_inlined_index_columns, positional_columns, quote_snapshot_name, quote_snapshot_table,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, top_level_column_ids,
     validate_delete_entries, validate_inlined_flush, validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
@@ -519,22 +520,141 @@ const REL_FLAG: &str =
     "(CASE WHEN df.path_is_relative AND t.path_is_relative AND s.path_is_relative
            THEN true ELSE false END)";
 
-/// DuckLake catalog DDL for DuckDB.
+/// The catalog tables official DuckDB inserts into by position, with their
+/// columns, keys and order as official has them. `ducklake_table` has no key:
+/// official keeps one row per version of a table, a rename's included. A
+/// catalog this writer created before it followed them keeps its layout, which
+/// a release before 0.10 still writes, until
+/// [`DuckdbMetadataWriter::migrate_to_official_layout`] rebuilds it.
+const POSITIONAL_TABLES: [(&str, &str); 4] = [
+    (
+        "ducklake_schema",
+        "schema_id BIGINT PRIMARY KEY,
+         schema_uuid UUID,
+         begin_snapshot BIGINT NOT NULL,
+         end_snapshot BIGINT,
+         schema_name VARCHAR NOT NULL,
+         path VARCHAR NOT NULL DEFAULT '',
+         path_is_relative BOOLEAN NOT NULL DEFAULT true",
+    ),
+    (
+        "ducklake_table",
+        "table_id BIGINT NOT NULL,
+         table_uuid UUID,
+         begin_snapshot BIGINT NOT NULL,
+         end_snapshot BIGINT,
+         schema_id BIGINT NOT NULL,
+         table_name VARCHAR NOT NULL,
+         path VARCHAR NOT NULL DEFAULT '',
+         path_is_relative BOOLEAN NOT NULL DEFAULT true",
+    ),
+    (
+        "ducklake_data_file",
+        "data_file_id BIGINT PRIMARY KEY,
+         table_id BIGINT NOT NULL,
+         begin_snapshot BIGINT NOT NULL,
+         end_snapshot BIGINT,
+         file_order BIGINT,
+         path VARCHAR NOT NULL,
+         path_is_relative BOOLEAN NOT NULL DEFAULT true,
+         file_format VARCHAR,
+         record_count BIGINT,
+         file_size_bytes BIGINT NOT NULL,
+         footer_size BIGINT,
+         row_id_start BIGINT,
+         partition_id BIGINT,
+         encryption_key VARCHAR,
+         mapping_id BIGINT,
+         partial_max BIGINT",
+    ),
+    (
+        "ducklake_delete_file",
+        "delete_file_id BIGINT PRIMARY KEY,
+         table_id BIGINT NOT NULL,
+         begin_snapshot BIGINT NOT NULL,
+         end_snapshot BIGINT,
+         data_file_id BIGINT NOT NULL,
+         path VARCHAR NOT NULL,
+         path_is_relative BOOLEAN NOT NULL DEFAULT true,
+         format VARCHAR,
+         delete_count BIGINT,
+         file_size_bytes BIGINT NOT NULL,
+         footer_size BIGINT,
+         encryption_key VARCHAR,
+         partial_max BIGINT",
+    ),
+];
+
+/// The sequences a release before 0.10 took schema, table, partition, sort
+/// and file ids from, by [`IdAllocator`]. A catalog it created keeps them until
+/// [`order_positional_tables`] drops them.
+const LEGACY_SEQUENCES: [(&str, IdAllocator); 6] = [
+    ("ducklake_schema_id_seq", IdAllocator::Catalog),
+    ("ducklake_table_id_seq", IdAllocator::Catalog),
+    ("ducklake_partition_id_seq", IdAllocator::Catalog),
+    ("ducklake_sort_id_seq", IdAllocator::Catalog),
+    ("ducklake_data_file_id_seq", IdAllocator::File),
+    ("ducklake_delete_file_id_seq", IdAllocator::File),
+];
+
+/// Rebuild each of [`POSITIONAL_TABLES`] whose columns are those official
+/// expects but in another order or with another key, as in a catalog this
+/// writer created before it followed official's layout, then drop the
+/// [`LEGACY_SEQUENCES`] the rebuilt tables no longer default from.
+/// Idempotent: a table in official's layout is left alone.
+fn order_positional_tables(conn: &mut duckdb::Connection) -> Result<()> {
+    for (table, columns) in POSITIONAL_TABLES {
+        let expected = positional_columns(columns)
+            .into_iter()
+            .map(|(name, _, key)| (name.to_string(), key))
+            .collect::<Vec<_>>();
+        let current = {
+            let mut statement =
+                conn.prepare("SELECT name, pk FROM pragma_table_info(?) ORDER BY cid")?;
+            statement
+                .query_map(params![table], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut sorted_current = current.iter().map(|(name, _)| name).collect::<Vec<_>>();
+        sorted_current.sort_unstable();
+        let mut sorted_expected = expected.iter().map(|(name, _)| name).collect::<Vec<_>>();
+        sorted_expected.sort_unstable();
+        if current == expected || sorted_current != sorted_expected {
+            continue;
+        }
+        let names = expected
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tx = conn.transaction()?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE {table}__ordered ({columns});
+             INSERT INTO {table}__ordered ({names}) SELECT {names} FROM {table};
+             DROP TABLE {table};
+             ALTER TABLE {table}__ordered RENAME TO {table};"
+        ))?;
+        tx.commit()?;
+    }
+    // A release before 0.10 inserts no UUID once the columns have no default.
+    conn.execute_batch(
+        "UPDATE ducklake_schema SET schema_uuid = uuid() WHERE schema_uuid IS NULL;
+         UPDATE ducklake_table SET table_uuid = uuid() WHERE table_uuid IS NULL;",
+    )?;
+    for (sequence, _) in LEGACY_SEQUENCES {
+        conn.execute_batch(&format!("DROP SEQUENCE IF EXISTS {sequence}"))?;
+    }
+    Ok(())
+}
+
+/// DuckLake catalog DDL for DuckDB, beside [`POSITIONAL_TABLES`].
 ///
 /// Column-for-column identical to `SQL_CREATE_SCHEMA` in the SQLite writer; the
 /// only changes are DuckDB spellings (BIGINT/VARCHAR/BOOLEAN/TIMESTAMP,
-/// `DEFAULT true`) and the id-default mechanism. The `*_id_seq` sequences supply
-/// the autoincrement that a plain DuckDB `PRIMARY KEY` does not; they are created
-/// *before* the tables that reference them via `DEFAULT nextval(...)`. DuckDB
-/// persists a sequence's value in the database file, so re-opening a catalog this
-/// writer created continues handing out fresh, non-overlapping ids.
+/// `DEFAULT true`).
 const SQL_CREATE_SCHEMA: &str = r#"
-CREATE SEQUENCE IF NOT EXISTS ducklake_schema_id_seq START 1;
-CREATE SEQUENCE IF NOT EXISTS ducklake_table_id_seq START 1;
-CREATE SEQUENCE IF NOT EXISTS ducklake_data_file_id_seq START 1;
-CREATE SEQUENCE IF NOT EXISTS ducklake_delete_file_id_seq START 1;
-CREATE SEQUENCE IF NOT EXISTS ducklake_partition_id_seq START 1;
-CREATE SEQUENCE IF NOT EXISTS ducklake_sort_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
@@ -564,27 +684,6 @@ CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
     schema_version BIGINT NOT NULL,
     table_id BIGINT NOT NULL,
     UNIQUE (table_id, begin_snapshot)
-);
-
-CREATE TABLE IF NOT EXISTS ducklake_schema (
-    schema_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_schema_id_seq'),
-    schema_uuid UUID DEFAULT uuid(),
-    schema_name VARCHAR NOT NULL,
-    path VARCHAR NOT NULL DEFAULT '',
-    path_is_relative BOOLEAN NOT NULL DEFAULT true,
-    begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT
-);
-
-CREATE TABLE IF NOT EXISTS ducklake_table (
-    table_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_table_id_seq'),
-    table_uuid UUID DEFAULT uuid(),
-    schema_id BIGINT NOT NULL,
-    table_name VARCHAR NOT NULL,
-    path VARCHAR NOT NULL DEFAULT '',
-    path_is_relative BOOLEAN NOT NULL DEFAULT true,
-    begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT
 );
 
 -- Bare table (no PK, no NOT NULL), upstream's exact column order, so a column
@@ -693,26 +792,6 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     default_value_dialect VARCHAR
 );
 
-CREATE TABLE IF NOT EXISTS ducklake_data_file (
-    data_file_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_data_file_id_seq'),
-    table_id BIGINT NOT NULL,
-    path VARCHAR NOT NULL,
-    path_is_relative BOOLEAN NOT NULL DEFAULT true,
-    file_size_bytes BIGINT NOT NULL,
-    footer_size BIGINT,
-    encryption_key VARCHAR,
-    record_count BIGINT,
-    row_id_start BIGINT,
-    mapping_id BIGINT,
-    begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT,
-    file_order BIGINT,
-    file_format VARCHAR,
-    partial_max BIGINT,
-    -- References ducklake_partition_info.partition_id; NULL when unpartitioned.
-    partition_id BIGINT
-);
-
 CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
     snapshot_id BIGINT PRIMARY KEY,
     changes_made VARCHAR NOT NULL,
@@ -766,22 +845,6 @@ CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
     min_value VARCHAR,
     max_value VARCHAR,
     extra_stats VARCHAR
-);
-
-CREATE TABLE IF NOT EXISTS ducklake_delete_file (
-    delete_file_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_delete_file_id_seq'),
-    data_file_id BIGINT NOT NULL,
-    table_id BIGINT NOT NULL,
-    path VARCHAR NOT NULL,
-    path_is_relative BOOLEAN NOT NULL DEFAULT true,
-    format VARCHAR,
-    file_size_bytes BIGINT NOT NULL,
-    footer_size BIGINT,
-    encryption_key VARCHAR,
-    delete_count BIGINT,
-    begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT,
-    partial_max BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
@@ -900,8 +963,16 @@ impl DuckdbMetadataWriter {
         validate_delete_entries(mode, deletes)?;
         let mut conn = self.connection();
         let tx = conn.transaction()?;
-        let snapshot_id =
-            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id = finalize_snapshot(
+            &tx,
+            table_id,
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            mode,
+            base_snapshot,
+        )?;
         if !deletes.is_empty() {
             let ours = TableChanges {
                 inserted_into: true,
@@ -1008,6 +1079,16 @@ impl DuckdbMetadataWriter {
         let writer = Self::new(path)?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+
+    /// Rebuild the catalog tables official DuckDB inserts into by position
+    /// into official's layout, so official DuckDB can write the catalog; one
+    /// this writer created already has it. A release before 0.10 can no longer
+    /// create a table or add a file in a migrated catalog, so migrate once
+    /// every writer of the catalog runs 0.10 or later. Idempotent.
+    pub fn migrate_to_official_layout(&self) -> Result<()> {
+        self.initialize_schema()?;
+        order_positional_tables(&mut self.connection())
     }
 
     /// Return a metadata provider sharing this writer's DuckDB connection.
@@ -1267,19 +1348,219 @@ fn reserve_ids(tx: &Transaction<'_>, key: &str, n: i64) -> Result<i64> {
     Ok(last)
 }
 
-fn reserve_sequence_ids(tx: &Transaction<'_>, sequence: &str, n: i64) -> Result<Vec<i64>> {
-    let sql = format!("SELECT nextval('{sequence}')");
-    (0..n)
-        .map(|_| tx.query_row(&sql, [], |row| row.get(0)).map_err(Into::into))
-        .collect()
+/// An id namespace official DuckDB allocates from a snapshot watermark.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdAllocator {
+    /// Schema, table, view, partition, sort and macro ids: `next_catalog_id`.
+    Catalog,
+    /// Data and delete file ids: `next_file_id`.
+    File,
+}
+
+impl IdAllocator {
+    /// The `ducklake_metadata` key of this writer's counter, and the
+    /// `ducklake_snapshot` column of official's watermark: both are named
+    /// `next_catalog_id` or `next_file_id`.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Catalog => "next_catalog_id",
+            Self::File => "next_file_id",
+        }
+    }
+
+    /// The largest id in use in this namespace, `-1` in an empty catalog, so
+    /// the first id is `0` as in official.
+    fn max_id_sql(self) -> &'static str {
+        match self {
+            Self::Catalog => {
+                "SELECT COALESCE(GREATEST(
+                     (SELECT MAX(schema_id) FROM ducklake_schema),
+                     (SELECT MAX(table_id) FROM ducklake_table),
+                     (SELECT MAX(view_id) FROM ducklake_view),
+                     (SELECT MAX(partition_id) FROM ducklake_partition_info),
+                     (SELECT MAX(sort_id) FROM ducklake_sort_info),
+                     (SELECT MAX(macro_id) FROM ducklake_macro)), -1)"
+            },
+            Self::File => {
+                "SELECT COALESCE(GREATEST(
+                     (SELECT MAX(data_file_id) FROM ducklake_data_file),
+                     (SELECT MAX(delete_file_id) FROM ducklake_delete_file)), -1)"
+            },
+        }
+    }
+}
+
+/// Reserve `n` consecutive ids of `allocator`, returning the first. The ids
+/// are past every id in use and every id official DuckDB handed out (those are
+/// below the head snapshot's watermark), and that watermark is raised past
+/// them, so official, which allocates from the head watermark, never reuses
+/// one; a reservation made after the commit inserted its snapshot raises that
+/// snapshot's watermark. The [`LEGACY_SEQUENCES`] of a catalog not yet migrated
+/// restart past them, so a release before 0.10 never takes one either.
+fn reserve_ids_of(tx: &Transaction<'_>, allocator: IdAllocator, n: i64) -> Result<i64> {
+    let key = allocator.key();
+    let reserve = format!(
+        "UPDATE ducklake_metadata
+         SET value = CAST(GREATEST(CAST(value AS BIGINT),
+             COALESCE((SELECT {key} FROM ducklake_snapshot
+                       ORDER BY snapshot_id DESC LIMIT 1) - 1, -1),
+             ({max})) + ? AS VARCHAR)
+         WHERE key = ? AND scope IS NULL
+         RETURNING CAST(value AS BIGINT)",
+        max = allocator.max_id_sql()
+    );
+    let reserved = |tx: &Transaction<'_>| {
+        tx.query_row(&reserve, params![n, key], |row| row.get::<_, i64>(0))
+            .optional()
+    };
+    let last = match reserved(tx)? {
+        Some(last) => last,
+        None => {
+            seed_id_allocator(tx, allocator)?;
+            reserved(tx)?.expect("the counter was just seeded")
+        },
+    };
+    tx.execute(
+        &format!(
+            "UPDATE ducklake_snapshot SET {key} = GREATEST({key}, ?)
+             WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)"
+        ),
+        params![last + 1],
+    )?;
+    restart_legacy_sequences(tx, allocator, last)?;
+    Ok(last - n + 1)
+}
+
+/// Restart each of `allocator`'s [`LEGACY_SEQUENCES`] the catalog has past
+/// `last`, unless its next value already is. A reopened catalog reports a
+/// sequence's next value as either its `start_value` or one past its
+/// `last_value`, so the lower is taken; restarting one already past `last`
+/// only reissues ids no row holds, since `last` is past every id in use.
+fn restart_legacy_sequences(tx: &Transaction<'_>, allocator: IdAllocator, last: i64) -> Result<()> {
+    let behind: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT sequence_name FROM duckdb_sequences()
+             WHERE LEAST(start_value, COALESCE(last_value + 1, start_value)) <= ?",
+        )?;
+        statement
+            .query_map(params![last], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    for (sequence, of) in LEGACY_SEQUENCES {
+        if of == allocator && behind.iter().any(|name| name == sequence) {
+            tx.execute_batch(&format!(
+                "CREATE OR REPLACE SEQUENCE {sequence} START {}",
+                last + 1
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Create the counter of `allocator` at the largest id in use, if it does not
+/// exist yet, as on a catalog this writer created before it kept the counter or
+/// one official DuckDB created.
+fn seed_id_allocator(tx: &Transaction<'_>, allocator: IdAllocator) -> Result<()> {
+    let key = allocator.key();
+    tx.execute(
+        &format!(
+            "INSERT INTO ducklake_metadata (key, value, scope)
+             SELECT ?, CAST(GREATEST(({max}),
+                 COALESCE((SELECT {key} FROM ducklake_snapshot
+                           ORDER BY snapshot_id DESC LIMIT 1) - 1, -1)) AS VARCHAR), NULL
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM ducklake_metadata WHERE key = ? AND scope IS NULL
+             )",
+            max = allocator.max_id_sql()
+        ),
+        params![key, key],
+    )?;
+    Ok(())
+}
+
+/// Insert the schema and table rows of `table_id` at `snapshot_id` when
+/// `begin_write_transaction` only reserved the id. Another transaction that
+/// created the name first, or dropped or renamed the table since the setup,
+/// makes this a conflict, as official DuckLake refuses a create of a table
+/// another transaction created. A table without any row is the setup's
+/// reservation only while `base_snapshot`, the head the setup saw, is kept
+/// (`0`, an empty catalog's, has no table to drop): once that is expired, the
+/// table may have been dropped and expired since, so the write conflicts.
+fn insert_new_table_rows(
+    tx: &Transaction<'_>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    base_snapshot: i64,
+) -> Result<()> {
+    let live: Option<i64> = tx
+        .query_row(
+            "SELECT t.table_id
+             FROM ducklake_table t
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+               AND t.table_name = ? AND t.end_snapshot IS NULL",
+            params![schema_name, table_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match live {
+        Some(live_id) if live_id == table_id => return Ok(()),
+        Some(_) => {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "table {} was created by another transaction; retry the write",
+                quote_snapshot_table(schema_name, table_name)
+            )));
+        },
+        None => {},
+    }
+    let known: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ?)
+             OR (? > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = ?))",
+        params![table_id, base_snapshot, base_snapshot],
+        |row| row.get(0),
+    )?;
+    if known {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "table {} was dropped or renamed by another transaction; retry the write",
+            quote_snapshot_table(schema_name, table_name)
+        )));
+    }
+    let schema_id: i64 = match tx
+        .query_row(
+            "SELECT schema_id FROM ducklake_schema
+             WHERE schema_name = ? AND end_snapshot IS NULL",
+            params![schema_name],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        Some(id) => id,
+        None => {
+            let schema_id = reserve_ids_of(tx, IdAllocator::Catalog, 1)?;
+            tx.execute(
+                "INSERT INTO ducklake_schema
+                     (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, uuid(), ?, ?, true, ?)",
+                params![schema_id, schema_name, directory_path(schema_name), snapshot_id],
+            )?;
+            schema_id
+        },
+    };
+    tx.execute(
+        "INSERT INTO ducklake_table
+             (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
+              begin_snapshot)
+         VALUES (?, uuid(), ?, ?, ?, true, ?)",
+        params![table_id, schema_id, table_name, directory_path(table_name), snapshot_id],
+    )?;
+    Ok(())
 }
 
 fn reserve_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
-    reserve_sequence_ids(tx, "ducklake_data_file_id_seq", n)
-}
-
-fn reserve_delete_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
-    reserve_sequence_ids(tx, "ducklake_delete_file_id_seq", n)
+    let first = reserve_ids_of(tx, IdAllocator::File, n)?;
+    Ok((first..first + n).collect())
 }
 
 /// Register a delete file an inlined flush wrote for `data_file_id`.
@@ -1346,7 +1627,7 @@ fn insert_flush_delete_file(
     data_file_id: i64,
     delete: &InlinedFlushDeleteFile,
 ) -> Result<()> {
-    let delete_file_id = reserve_delete_file_ids(tx, 1)?[0];
+    let delete_file_id = reserve_file_ids(tx, 1)?[0];
     tx.execute(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
@@ -1387,9 +1668,22 @@ fn insert_snapshot(tx: &Transaction<'_>) -> Result<(i64, i64)> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    // The id watermarks official DuckDB allocates from: the previous head's,
+    // raised past every id this writer reserved.
     tx.execute(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
-         VALUES (?, CURRENT_TIMESTAMP, ?)",
+        "INSERT INTO ducklake_snapshot
+             (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+         SELECT ?, CURRENT_TIMESTAMP, ?,
+             GREATEST(
+                 COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
+                           ORDER BY snapshot_id DESC LIMIT 1), 0),
+                 COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                           WHERE key = 'next_catalog_id' AND scope IS NULL), 0)),
+             GREATEST(
+                 COALESCE((SELECT next_file_id FROM ducklake_snapshot
+                           ORDER BY snapshot_id DESC LIMIT 1), 0),
+                 COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                           WHERE key = 'next_file_id' AND scope IS NULL), 0))",
         params![snapshot_id, schema_version],
     )?;
     tx.execute(
@@ -1428,6 +1722,10 @@ fn record_snapshot_changes(
             snapshot_id,
         ],
     )?;
+    let inlined = inlined_inserts(changes_made.unwrap_or_default());
+    if inlined > 0 {
+        reserve_ids_of(tx, IdAllocator::File, inlined as i64)?;
+    }
     Ok(())
 }
 
@@ -1668,6 +1966,27 @@ fn detect_replace_conflict(
                  snapshot {base_snapshot}; aborting"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Conflict when the row of `table_id` began after `base_snapshot`: a write
+/// that expects the catalog at that snapshot found the table's name free.
+fn detect_created_table_conflict(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let created: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ? AND begin_snapshot > ?)",
+        params![table_id, base_snapshot],
+        |row| row.get(0),
+    )?;
+    if created {
+        return Err(crate::metadata_writer::created_table_conflict(
+            table_id,
+            base_snapshot,
+        ));
     }
     Ok(())
 }
@@ -2084,7 +2403,7 @@ fn apply_delete_entry(
             params![snapshot_id, delete_file_id],
         )?;
     }
-    let delete_file_id = reserve_delete_file_ids(tx, 1)?[0];
+    let delete_file_id = reserve_file_ids(tx, 1)?[0];
     tx.execute(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
@@ -2196,15 +2515,26 @@ fn apply_inlined_deletes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_snapshot(
     tx: &Transaction<'_>,
     table_id: i64,
+    schema_name: &str,
+    table_name: &str,
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
 ) -> Result<i64> {
     let (snapshot_id, _) = insert_snapshot(tx)?;
+    insert_new_table_rows(
+        tx,
+        snapshot_id,
+        table_id,
+        schema_name,
+        table_name,
+        base_snapshot,
+    )?;
     finalize_table_snapshot(
         tx,
         snapshot_id,
@@ -2567,12 +2897,14 @@ fn commit_staged_files(
     let mut total_bytes = 0i64;
     for file in files {
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
-        let data_file_id: i64 = tx.query_row(
+        let data_file_id = reserve_file_ids(tx, 1)?[0];
+        tx.execute(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes,
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                   footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
+                data_file_id,
                 write.table_id,
                 file.path.as_str(),
                 file.path_is_relative,
@@ -2582,7 +2914,6 @@ fn commit_staged_files(
                 row_ids.stored,
                 snapshot_id
             ],
-            |row| row.get(0),
         )?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats)?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file)?;
@@ -3484,11 +3815,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
 
         let schema_path = directory_path(path.unwrap_or(name));
-        let schema_id: i64 = tx.query_row(
-            "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-             VALUES (?, ?, true, ?) RETURNING schema_id",
-            params![name, schema_path, snapshot_id],
-            |row| row.get(0),
+        let schema_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
+        tx.execute(
+            "INSERT INTO ducklake_schema
+                 (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+             VALUES (?, uuid(), ?, ?, true, ?)",
+            params![schema_id, name, schema_path, snapshot_id],
         )?;
         record_snapshot_changes(
             &tx,
@@ -3532,11 +3864,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
         )?;
 
         let table_path = directory_path(path.unwrap_or(name));
-        let table_id: i64 = tx.query_row(
-            "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-             VALUES (?, ?, ?, true, ?) RETURNING table_id",
-            params![schema_id, name, table_path, snapshot_id],
-            |row| row.get(0),
+        let table_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
+        tx.execute(
+            "INSERT INTO ducklake_table
+                 (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
+                  begin_snapshot)
+             VALUES (?, uuid(), ?, ?, ?, true, ?)",
+            params![table_id, schema_id, name, table_path, snapshot_id],
         )?;
         record_snapshot_changes(
             &tx,
@@ -3761,8 +4095,16 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // Single atomic commit: insert the deferred snapshot row + finalize the
         // column generation + retire the prior generation (Replace), then
         // register this file and advance the monotonic row-lineage counter.
-        let snapshot_id =
-            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id = finalize_snapshot(
+            &tx,
+            table_id,
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            mode,
+            base_snapshot,
+        )?;
 
         // Partition-spec fence: this file must be consistent with the table's live
         // partition generation at commit time (both directions — see
@@ -3787,14 +4129,14 @@ impl MetadataWriter for DuckdbMetadataWriter {
         )?;
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
-        // RETURNING gives us the sequence-allocated data_file_id to tie the
-        // per-column stats rows to, in the same transaction.
-        let data_file_id: i64 = tx.query_row(
+        let data_file_id = reserve_file_ids(&tx, 1)?[0];
+        tx.execute(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes,
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                   footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
+                data_file_id,
                 table_id,
                 file.path.as_str(),
                 file.path_is_relative,
@@ -3804,7 +4146,6 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 row_ids.stored,
                 snapshot_id
             ],
-            |row| row.get(0),
         )?;
 
         insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
@@ -3908,8 +4249,16 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         // One atomic snapshot for all N partition files.
-        let snapshot_id =
-            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id = finalize_snapshot(
+            &tx,
+            table_id,
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            mode,
+            base_snapshot,
+        )?;
         // Partition-spec fence (both directions, every file): each file must be
         // consistent with the table's live partition generation at commit time. The
         // scalar subquery yields NULL (→ None) when unpartitioned; the tx rolls back
@@ -3934,12 +4283,14 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut total_bytes: i64 = 0;
         for file in files {
             let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
-            let data_file_id: i64 = tx.query_row(
+            let data_file_id = reserve_file_ids(&tx, 1)?[0];
+            tx.execute(
                 "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
+                    data_file_id,
                     table_id,
                     file.path.as_str(),
                     file.path_is_relative,
@@ -3949,7 +4300,6 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     row_ids.stored,
                     snapshot_id
                 ],
-                |row| row.get(0),
             )?;
             insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
             insert_partition_metadata(&tx, table_id, data_file_id, file)?;
@@ -4080,8 +4430,16 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         enforce_inline_partition_fence(&tx, table_id, base_snapshot)?;
-        let snapshot_id =
-            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id = finalize_snapshot(
+            &tx,
+            table_id,
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            mode,
+            base_snapshot,
+        )?;
         if mode != WriteMode::Replace
             && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
         {
@@ -4232,6 +4590,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         if let Some(expected) = expected_base_snapshot_id {
             for write in writes {
                 detect_replace_conflict(&tx, write.table_id, expected, ConflictScope::of(write))?;
+                detect_created_table_conflict(&tx, write.table_id, expected)?;
             }
         }
         for write in writes {
@@ -4264,6 +4623,14 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let mut tables = Vec::with_capacity(writes.len());
         for write in writes {
+            insert_new_table_rows(
+                &tx,
+                snapshot_id,
+                write.table_id,
+                &write.schema_name,
+                &write.table_name,
+                write.base_snapshot_id,
+            )?;
             let schema_id = validate_staged_table(&tx, write)?;
             finalize_table_snapshot(
                 &tx,
@@ -5185,10 +5552,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let mut conn = self.connection();
         let tx = conn.transaction()?;
-        let partition_id: i64 =
-            tx.query_row("SELECT nextval('ducklake_partition_id_seq')", [], |row| {
-                row.get(0)
-            })?;
+        let partition_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
         let (new_snapshot, _carried) = insert_snapshot(&tx)?;
 
         // Resolve each partition-key column NAME to its live column_id.
@@ -5344,9 +5708,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let mut conn = self.connection();
         let tx = conn.transaction()?;
-        let sort_id: i64 = tx.query_row("SELECT nextval('ducklake_sort_id_seq')", [], |row| {
-            row.get(0)
-        })?;
+        let sort_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
         let (new_snapshot, _carried) = insert_snapshot(&tx)?;
         // Official bumps the schema version on every sort-order change, with no
         // `ducklake_schema_versions` row (checked with the DuckDB CLI).
@@ -5441,8 +5803,16 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // generation — making the new head visible atomically.
         let mut conn = self.connection();
         let tx = conn.transaction()?;
-        let snapshot_id =
-            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id = finalize_snapshot(
+            &tx,
+            table_id,
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            mode,
+            base_snapshot,
+        )?;
         record_table_write_changes(
             &tx,
             snapshot_id,
@@ -5554,8 +5924,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        let conn = self.connection();
+        let mut conn = self.connection();
         conn.execute_batch(SQL_CREATE_SCHEMA)?;
+        for (table, columns) in POSITIONAL_TABLES {
+            conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({columns})"))?;
+        }
         conn.execute_batch("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")?;
         conn.execute_batch(
             "ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT",
@@ -5565,10 +5938,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                  ADD COLUMN IF NOT EXISTS next_catalog_id BIGINT DEFAULT 1;
              ALTER TABLE ducklake_snapshot
                  ADD COLUMN IF NOT EXISTS next_file_id BIGINT DEFAULT 0;
-             ALTER TABLE ducklake_schema
-                 ADD COLUMN IF NOT EXISTS schema_uuid UUID DEFAULT uuid();
-             ALTER TABLE ducklake_table
-                 ADD COLUMN IF NOT EXISTS table_uuid UUID DEFAULT uuid();
+             ALTER TABLE ducklake_schema ADD COLUMN IF NOT EXISTS schema_uuid UUID;
+             ALTER TABLE ducklake_table ADD COLUMN IF NOT EXISTS table_uuid UUID;
              ALTER TABLE ducklake_data_file
                  ADD COLUMN IF NOT EXISTS file_order BIGINT;
              ALTER TABLE ducklake_data_file
@@ -5588,10 +5959,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
              ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT;
              ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
         )?;
-        // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, and
-        // schema/table/data_file/delete_file ids use sequences, so none of those
-        // need a counter). Idempotent on re-open, and seeded from the current MAX
-        // so a pre-existing catalog continues without reusing ids.
+        // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, so it
+        // needs no counter). Idempotent on re-open, and seeded from the current
+        // MAX so a pre-existing catalog continues without reusing ids.
         conn.execute_batch(
             "INSERT INTO ducklake_metadata (key, value, scope)
              SELECT 'next_column_id',
@@ -5609,6 +5979,25 @@ impl MetadataWriter for DuckdbMetadataWriter {
              UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';",
         )?;
         conn.execute_batch(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)?;
+        // A catalog this writer created before it kept the id watermarks has
+        // them at their defaults; raise the head's past every id in use.
+        let tx = conn.transaction()?;
+        for allocator in [IdAllocator::Catalog, IdAllocator::File] {
+            seed_id_allocator(&tx, allocator)?;
+            let key = allocator.key();
+            tx.execute(
+                &format!(
+                    "UPDATE ducklake_snapshot
+                     SET {key} = (SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                                  WHERE key = '{key}' AND scope IS NULL)
+                     WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+                       AND {key} <= (SELECT CAST(value AS BIGINT) FROM ducklake_metadata
+                                     WHERE key = '{key}' AND scope IS NULL)"
+                ),
+                [],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -5650,45 +6039,28 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // commit (finalize_snapshot), so it may differ under concurrency.
         let snapshot_id: i64 = base_snapshot_id + 1;
 
-        let schema_id: i64 = {
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL",
-                    params![schema_name],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match existing {
-                Some(id) => id,
-                None => tx.query_row(
-                    "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, true, ?) RETURNING schema_id",
-                    params![schema_name, directory_path(schema_name), snapshot_id],
-                    |row| row.get(0),
-                )?,
-            }
-        };
+        // Look up, do not create: a new schema or table gets an id from its
+        // sequence here and its row at the commit, so a write that fails before
+        // the commit leaves no row behind.
+        let schema_id: i64 = tx
+            .query_row(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                params![schema_name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .map_or_else(|| reserve_ids_of(&tx, IdAllocator::Catalog, 1), Ok)?;
 
-        let table_id: i64 = {
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
-                    params![schema_id, table_name],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match existing {
-                Some(id) => id,
-                None => tx.query_row(
-                    "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                    params![schema_id, table_name, directory_path(table_name), snapshot_id],
-                    |row| row.get(0),
-                )?,
-            }
-        };
+        let table_id: i64 = tx
+            .query_row(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                params![schema_id, table_name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .map_or_else(|| reserve_ids_of(&tx, IdAllocator::Catalog, 1), Ok)?;
 
         // Existing columns to (a) check schema compatibility and (b) REUSE each
         // column's id (column_id == parquet field_id == a column's stable
@@ -6783,13 +7155,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let writer = test_writer(&temp);
         let columns = int_column();
-        // Stage the table but never write: it persists with zero live columns.
+        // Stage the table but never write: only its id was reserved.
         let staged = writer
             .begin_write_transaction("main", "t", &columns, WriteMode::Append)
             .unwrap();
         // The next write's commit creates the columns rather than conflicting.
         let (setup, commit) = append(&writer, "a.parquet", 2);
-        assert_eq!(setup.table_id, staged.table_id);
+        assert_ne!(setup.table_id, staged.table_id);
         assert_eq!(commit.snapshot_id, 1, "abandoned staging left no snapshot");
         let live_columns: i64 = writer
             .connection()
