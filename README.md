@@ -222,9 +222,21 @@ DuckLakeCatalog::register(&ctx, "ducklake", catalog);
 ctx.sql("CREATE TABLE ducklake.main.events (id BIGINT)").await?.collect().await?;
 ```
 
-Non-empty `CREATE TABLE AS SELECT` is rejected before publishing metadata.
-After creating an empty table, reopen the catalog before using
-`INSERT INTO ... SELECT` to populate it.
+`CREATE TABLE … AS SELECT` goes through `execute_ducklake_sql`, which commits
+the query rows and the table metadata in one snapshot. It handles a CTAS whose
+name, resolved with the session's default catalog and schema, names the catalog
+it is given, and passes any other to DataFusion:
+
+```rust,ignore
+use datafusion_ducklake::execute_ducklake_sql;
+
+execute_ducklake_sql(&ctx, &catalog,
+    "CREATE TABLE ducklake.main.recent AS SELECT * FROM ducklake.main.events WHERE id > 100",
+).await?;
+```
+
+`SessionContext::sql` rejects a non-empty CTAS, because DataFusion hands the
+materialized rows to a registration hook that cannot write data files.
 
 The multi-catalog path instead looks like this — tables are created through the writer
 API (no CTAS), then appended to with SQL:

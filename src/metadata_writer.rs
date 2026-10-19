@@ -920,7 +920,6 @@ impl ColumnDef {
         })
     }
 
-    #[cfg_attr(not(feature = "write-postgres"), allow(dead_code))]
     /// The column `data_type` named `name` copying the catalog rows `nodes`
     /// (the column's own, then its nested fields', depth first): their types,
     /// nullability and defaults are recorded as they are.

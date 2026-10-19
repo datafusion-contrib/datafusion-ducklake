@@ -226,7 +226,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
 | `SELECT` against DuckLake tables                                                                                                                                                                                                                                                                                                 | ✅        |
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
-| Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
+| `CREATE TABLE [IF NOT EXISTS] … AS SELECT` via `execute_ducklake_sql` — rows and table metadata in one snapshot, nullable columns as in DuckDB, an empty result publishes no data file; SQLite, DuckDB, MySQL, and single-catalog PostgreSQL                                                                                     | ✅        |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional deletes, inlined deletions of Parquet rows under the scoped `data_inlining_row_limit`, and inlined-row deletes, mixed in one snapshot; metadata-only truncate; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                      | ✅        |
@@ -398,10 +398,22 @@ settings, including `execution.time_zone`, are not inherited.
 
 ---
 
-Non-empty `CREATE TABLE AS SELECT` is rejected before any table metadata is
-published. Create an empty table, reopen the catalog to see its committed
-snapshot, and use `INSERT INTO ... SELECT` to write rows. CTAS support requires
-session and object-store handling that the registration path does not provide.
+`CREATE TABLE … AS SELECT` runs through `execute_ducklake_sql` when its name,
+resolved with the session's default catalog and schema, names the DuckLake
+catalog the call runs against; any other CTAS goes to DataFusion. It plans the
+query on the session, derives nullable columns from its schema, and commits the
+rows and the table metadata in one snapshot through the session's object store
+with the same write options as `INSERT`. Columns are named as DuckDB names
+them: a column list such as `CREATE TABLE t (a, b) AS …` renames the leading
+columns, and without one a repeated name, compared ignoring case, takes a `_1`,
+`_2`, … suffix. `IF NOT EXISTS` is a no-op on an existing table or view. A
+table another transaction creates under the name while the query runs makes the
+CTAS conflict, as official refuses the create. `OR REPLACE` and a column list
+with types fail closed. Every column and nested child is nullable, as in
+official. `SessionContext::sql` still rejects a non-empty CTAS before
+publishing metadata, because DataFusion hands the materialized rows to a
+synchronous registration hook that has no object store; an empty CTAS through
+it keeps creating the empty table.
 
 ## Write concurrency
 

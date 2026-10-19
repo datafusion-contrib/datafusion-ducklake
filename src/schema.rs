@@ -17,7 +17,7 @@ use crate::table::DuckLakeTable;
 use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 
 #[cfg(feature = "write")]
-use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode, validate_name};
+use crate::metadata_writer::{ColumnDef, CommitIds, MetadataWriter, WriteMode, validate_name};
 #[cfg(feature = "write")]
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
@@ -28,7 +28,7 @@ use datafusion::error::DataFusionError;
 /// Table names are used to construct file paths, so we must ensure they
 /// don't contain path separators or parent directory references.
 #[cfg(feature = "write")]
-fn validate_table_name(name: &str) -> DataFusionResult<()> {
+pub(crate) fn validate_table_name(name: &str) -> DataFusionResult<()> {
     // Shared name validation (empty, control chars, length)
     validate_name(name, "Table").map_err(|e| DataFusionError::External(Box::new(e)))?;
     if name.contains('/') || name.contains('\\') || name.contains("..") {
@@ -176,25 +176,11 @@ impl DuckLakeSchema {
             .provider
             .get_metadata_settings(Some(self.schema_id), table_id)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let stored =
-            crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings);
-        let stored_limit = stored.data_inlining_row_limit;
-        let stored_sort = stored.sort_on_insert;
-        let mut options = stored.with_overrides(&self.write_options);
-        if settings.contains_key("sort_on_insert") {
-            options.sort_on_insert = stored_sort;
-        }
-        if settings.contains_key("data_inlining_row_limit") {
-            options.data_inlining_row_limit = stored_limit;
-        } else if self.write_options.data_inlining_row_limit.is_none()
-            && let Some(limit) = self
-                .writer
-                .as_ref()
-                .and_then(|writer| writer.data_inlining_row_limit())
-        {
-            options.data_inlining_row_limit = Some(limit);
-        }
-        Ok(options)
+        Ok(scoped_write_options(
+            &settings,
+            &self.write_options,
+            self.writer.as_deref(),
+        ))
     }
 
     fn resolve_snapshot(&self) -> DataFusionResult<i64> {
@@ -443,7 +429,7 @@ impl SchemaProvider for DuckLakeSchema {
                 })?;
                 if batches.iter().any(|batch| batch.num_rows() > 0) {
                     return Err(DataFusionError::NotImplemented(
-                        "CREATE TABLE AS SELECT with rows is not supported; use CREATE TABLE followed by INSERT INTO ... SELECT".to_string(),
+                        "CREATE TABLE AS SELECT with rows is not supported through SessionContext::sql; run it through execute_ducklake_sql".to_string(),
                     ));
                 }
             }
@@ -460,52 +446,14 @@ impl SchemaProvider for DuckLakeSchema {
             })
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        // Official refuses a column named like an inlined data table's system
-        // column while inlining is enabled, before the table exists: the
-        // setup below creates it on some backends. With no stored, configured
-        // or writer limit, official's default applies.
-        let inlining = self
-            .table_write_options(None)?
-            .data_inlining_row_limit
-            .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT);
-        if inlining > 0 {
-            let names = columns
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect::<Vec<_>>();
-            if let Some(column) = writer
-                .reserved_inlining_column(&names)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-            {
-                return Err(DataFusionError::External(Box::new(
-                    crate::metadata_writer::reserved_inlining_column_error(&column),
-                )));
-            }
-        }
-
-        // Create table in metadata (creates snapshot, table, columns in a transaction)
-        let inlining_limit = self.write_options.data_inlining_row_limit;
-        let setup = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
-            writer.begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // CREATE TABLE registers no data file, so publish the head here; without
-        // this the new (empty) table never becomes visible on multicatalog
-        // backends that defer the head advance out of begin_write_transaction.
-        let committed = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
-            writer.publish_snapshot(
-                setup.table_id,
-                &self.schema_name,
-                &name,
-                setup.snapshot_id,
-                WriteMode::Replace,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.field_ids,
-            )
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let committed = publish_empty_table(
+            writer.as_ref(),
+            &self.schema_name,
+            &name,
+            &columns,
+            self.write_options.data_inlining_row_limit,
+            ExistingTable::Replace,
+        )?;
 
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)
@@ -530,6 +478,104 @@ impl SchemaProvider for DuckLakeSchema {
 
         Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))
     }
+}
+
+/// What [`publish_empty_table`] does with a live table of the same name.
+#[cfg(feature = "write")]
+pub(crate) enum ExistingTable {
+    /// Replace it with the empty table, as `register_table` does.
+    Replace,
+    /// Fail with a conflict: the caller found the name free, so another
+    /// transaction created it since, and official DuckLake refuses the create.
+    Conflict,
+}
+
+/// Create `table_name` with `columns` and no data file, publishing the snapshot
+/// so the empty table becomes visible.
+///
+/// `begin_write_transaction` reserves the schema and table ids and the publish
+/// inserts their rows, since without a data file no other commit would.
+/// `inlining_limit` is the writer's configured limit, which applies where the
+/// catalog stores none.
+#[cfg(feature = "write")]
+pub(crate) fn publish_empty_table(
+    writer: &dyn MetadataWriter,
+    schema_name: &str,
+    table_name: &str,
+    columns: &[ColumnDef],
+    inlining_limit: Option<usize>,
+    existing: ExistingTable,
+) -> DataFusionResult<CommitIds> {
+    crate::metadata_writer::with_inlining_limit(inlining_limit, || {
+        // Official refuses a column named like an inlined data table's system
+        // column while inlining is enabled, before the table exists.
+        if writer.table_data_inlining_row_limit(schema_name, table_name)? > 0 {
+            let names = columns
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>();
+            if let Some(column) = writer.reserved_inlining_column(&names)? {
+                return Err(crate::metadata_writer::reserved_inlining_column_error(
+                    &column,
+                ));
+            }
+        }
+        let setup =
+            writer.begin_write_transaction(schema_name, table_name, columns, WriteMode::Replace)?;
+        // Setup reuses a live table of this name. One committed after setup
+        // makes the publish conflict instead.
+        if matches!(existing, ExistingTable::Conflict)
+            && writer
+                .get_table_column_nullability(schema_name, table_name)?
+                .is_some()
+        {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "table {} was created by another transaction; retry the statement",
+                crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
+            )));
+        }
+        writer.publish_snapshot(
+            setup.table_id,
+            schema_name,
+            table_name,
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            columns,
+            &setup.field_ids,
+        )
+    })
+    .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// The write options a write to a table of a schema uses: the stored table,
+/// schema and catalog settings over `configured` (the catalog's
+/// [`crate::DuckLakeCatalog::with_write_options`]), and, where neither sets a
+/// `data_inlining_row_limit`, the writer's own
+/// [`MetadataWriter::data_inlining_row_limit`]. A stored `sort_on_insert`
+/// outranks the configured one, as official has no session override of it.
+#[cfg(feature = "write")]
+pub(crate) fn scoped_write_options(
+    settings: &std::collections::HashMap<String, String>,
+    configured: &crate::table_writer::DuckLakeWriteOptions,
+    writer: Option<&dyn MetadataWriter>,
+) -> crate::table_writer::DuckLakeWriteOptions {
+    let stored =
+        crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(settings);
+    let stored_limit = stored.data_inlining_row_limit;
+    let stored_sort = stored.sort_on_insert;
+    let mut options = stored.with_overrides(configured);
+    if settings.contains_key("sort_on_insert") {
+        options.sort_on_insert = stored_sort;
+    }
+    if settings.contains_key("data_inlining_row_limit") {
+        options.data_inlining_row_limit = stored_limit;
+    } else if configured.data_inlining_row_limit.is_none()
+        && let Some(limit) = writer.and_then(|writer| writer.data_inlining_row_limit())
+    {
+        options.data_inlining_row_limit = Some(limit);
+    }
+    options
 }
 
 #[cfg(all(test, feature = "write"))]
