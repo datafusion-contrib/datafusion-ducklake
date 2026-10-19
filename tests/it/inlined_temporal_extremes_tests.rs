@@ -24,7 +24,7 @@ use datafusion_ducklake::{
 };
 
 use crate::inlined_mutation_differential_tests::{
-    Metadata, attach_lake, duckdb_connection, make_sqlite_catalog_duckdb_readable, query_lines,
+    Metadata, attach_lake, duckdb_connection, query_lines,
 };
 
 /// One inlined row's six temporal columns as the backend's text.
@@ -372,7 +372,6 @@ async fn sqlite_inlines_values_beyond_the_calendar_as_official_does() {
     );
 
     drop(lake);
-    make_sqlite_catalog_duckdb_readable(&crate_path).await;
     assert_eq!(
         duckdb_rows(&crate_path, &crate_data),
         duckdb_rows(&official_path, &official_data),
@@ -654,14 +653,6 @@ async fn postgres_inlined_timetz_table_is_native() {
         )
         .unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
-    // This crate's snapshots leave official's id allocators NULL.
-    sqlx::query(
-        "UPDATE ducklake_snapshot SET next_catalog_id = 1000, next_file_id = 1000
-         WHERE next_catalog_id IS NULL OR next_file_id IS NULL",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
     let (name, declared): (String, String) = sqlx::query_as(
         "SELECT r.table_name, c.data_type::text
          FROM ducklake_inlined_data_tables r

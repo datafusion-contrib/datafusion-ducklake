@@ -25,9 +25,9 @@ use sqlx::Row;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider,
-    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, WriteMode,
-    register_ducklake_functions,
+    ColumnDef, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MetadataProvider, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    TableWriteOptions, WriteMode, register_ducklake_functions,
 };
 
 /// Create a local filesystem object store.
@@ -98,52 +98,10 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
     let conformance_path = catalog_path.with_file_name("duckdb-conformance.db");
     std::fs::copy(catalog_path, &conformance_path).unwrap();
 
-    // This fork's catalog schema predates fields the official DuckLake extension requires. Add
-    // those compatibility fields to a disposable catalog copy before testing the
-    // nested data layout; none of these statements alter ducklake_column, the
-    // source catalog, or the Parquet file.
+    // Official attaches a disposable copy, so it cannot touch the source catalog.
     let setup = format!(
-        "INSTALL sqlite; LOAD sqlite; \
-         ATTACH '{}' AS raw (TYPE sqlite); \
-         ALTER TABLE raw.ducklake_snapshot ADD COLUMN next_catalog_id BIGINT DEFAULT 0; \
-         ALTER TABLE raw.ducklake_snapshot ADD COLUMN next_file_id BIGINT DEFAULT 0; \
-         UPDATE raw.ducklake_snapshot SET next_catalog_id = 0, next_file_id = 0; \
-         ALTER TABLE raw.ducklake_schema ADD COLUMN schema_uuid VARCHAR; \
-         UPDATE raw.ducklake_schema SET \
-             schema_uuid = '00000000-0000-0000-0000-000000000001', path = path || '/'; \
-         ALTER TABLE raw.ducklake_table ADD COLUMN table_uuid VARCHAR; \
-         UPDATE raw.ducklake_table SET \
-             table_uuid = '00000000-0000-0000-0000-000000000002', path = path || '/'; \
-         CREATE TABLE IF NOT EXISTS raw.ducklake_inlined_data_tables( \
-             table_id BIGINT, table_name VARCHAR, schema_version BIGINT \
-         ); \
-         CREATE TABLE raw.ducklake_column_mapping( \
-             mapping_id BIGINT, table_id BIGINT, type VARCHAR \
-         ); \
-         CREATE TABLE raw.ducklake_name_mapping( \
-             mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, \
-             target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN \
-         ); \
-             CREATE TABLE raw.ducklake_macro( \
-             schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, \
-             begin_snapshot BIGINT, end_snapshot BIGINT \
-         ); \
-         CREATE TABLE raw.ducklake_macro_impl( \
-             macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, sql VARCHAR, type VARCHAR \
-         ); \
-         CREATE TABLE raw.ducklake_macro_parameters( \
-             macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, \
-             parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR \
-         ); \
-         ALTER TABLE raw.ducklake_data_file ADD COLUMN file_order BIGINT DEFAULT 0; \
-         ALTER TABLE raw.ducklake_data_file ADD COLUMN file_format VARCHAR DEFAULT 'parquet'; \
-         ALTER TABLE raw.ducklake_data_file ADD COLUMN partial_file_info VARCHAR; \
-         UPDATE raw.ducklake_data_file SET footer_size = NULL; \
-         ALTER TABLE raw.ducklake_delete_file ADD COLUMN format VARCHAR DEFAULT 'parquet'; \
-         DETACH raw; \
-         INSTALL ducklake; LOAD ducklake; \
+        "INSTALL sqlite; LOAD sqlite; INSTALL ducklake; LOAD ducklake; \
          ATTACH 'ducklake:{}' AS official (META_TYPE 'sqlite');",
-        conformance_path.display(),
         conformance_path.display()
     );
     let connection = duckdb::Connection::open_in_memory().unwrap();
@@ -3023,4 +2981,176 @@ async fn test_file_ids_skip_an_older_writers_file_rows() {
         .unwrap()
         .value(0);
     assert_eq!(count, 6);
+}
+
+/// A write set up on a live table conflicts when the table is dropped and its
+/// snapshots expired before the commit, leaving the table dropped, as official
+/// conflicts on an insert into a dropped table.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_a_table_dropped_and_expired_meanwhile_conflicts() {
+    let (writer, temp_dir) = create_test_env().await;
+    let writer = Arc::new(writer);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), create_object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    table_writer
+        .write_table("main", "doomed", from_ref(&batch))
+        .await
+        .unwrap();
+    let mut session = table_writer
+        .begin_write("main", "doomed", &schema, WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+
+    assert!(writer.drop_table("main", "doomed").unwrap());
+    writer
+        .expire_snapshots(datafusion_ducklake::maintenance::ExpireCriteria::OlderThan(
+            chrono::Utc::now() + chrono::Duration::minutes(1),
+        ))
+        .unwrap();
+    let connection = format!("sqlite:{}", temp_dir.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&connection).await.unwrap();
+    let table_rows = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ducklake_table WHERE table_name = 'doomed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let expired_rows = table_rows().await;
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let error = session.finish().await.unwrap_err();
+
+    assert_eq!(expired_rows, 0);
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(provider.get_current_snapshot().unwrap(), head);
+    assert_eq!(table_rows().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_first_write_leaves_no_table_for_later_snapshots() {
+    let (writer, temp_dir) = create_test_env().await;
+    let writer = Arc::new(writer);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), create_object_store()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let connection = format!("sqlite:{}", temp_dir.path().join("test.db").display());
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+
+    // Its root is a regular file, so every upload fails.
+    let root = temp_dir.path().join("not-a-directory");
+    std::fs::write(&root, b"").unwrap();
+    let unwritable = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
+    let failed = DuckLakeTableWriter::new(writer.clone(), unwritable)
+        .unwrap()
+        .write_table("main", "failed", from_ref(&batch))
+        .await;
+    assert!(failed.is_err(), "the upload fails");
+    assert_eq!(provider.get_current_snapshot().unwrap(), head);
+    let pool = sqlx::SqlitePool::connect(&connection).await.unwrap();
+    let table_rows = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ducklake_table WHERE table_name = 'failed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(table_rows().await, 0);
+
+    // The next commit takes the snapshot id the failed write had reserved.
+    let later = table_writer
+        .write_table("main", "later", from_ref(&batch))
+        .await
+        .unwrap();
+    assert_eq!(later.snapshot_id, head + 1);
+    let schema_id = provider
+        .get_schema_by_name("main", later.snapshot_id)
+        .unwrap()
+        .unwrap()
+        .schema_id;
+    assert!(
+        provider
+            .get_table_by_name(schema_id, "failed", later.snapshot_id)
+            .unwrap()
+            .is_none()
+    );
+
+    // Retrying creates the table.
+    let retried = table_writer
+        .write_table("main", "failed", from_ref(&batch))
+        .await
+        .unwrap();
+    assert_eq!(retried.snapshot_id, head + 2);
+    let visible = provider
+        .get_table_by_name(schema_id, "failed", retried.snapshot_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(visible.table_id, retried.table_id);
+    assert_eq!(table_rows().await, 1);
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(retried.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        changes,
+        format!(
+            "created_table:\"main\".\"failed\",inserted_into_table:{}",
+            retried.table_id
+        )
+    );
+}
+
+/// Two writes that create the same table: the one that commits second
+/// conflicts instead of writing into the table the first created, as official
+/// DuckLake refuses a create of a table another transaction created.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_create_of_a_table_conflicts() {
+    let (writer, _temp_dir) = create_test_env().await;
+    let columns = vec![ColumnDef::new("id", "int32", true).unwrap()];
+    let first = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    let second = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    let publish = |setup: &datafusion_ducklake::WriteSetupResult| {
+        writer.publish_snapshot(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+    };
+
+    let committed = publish(&first).unwrap();
+    let error = publish(&second).unwrap_err();
+
+    assert_ne!(first.table_id, second.table_id);
+    assert_eq!(committed.table_id, first.table_id);
+    assert!(
+        matches!(&error, DuckLakeError::Conflict(message)
+            if message == "table \"main\".\"t\" was created by another transaction; retry the write"),
+        "{error}"
+    );
+    assert_eq!(
+        writer.get_table_column_nullability("main", "t").unwrap(),
+        Some(vec![("id".to_string(), true)])
+    );
 }

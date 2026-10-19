@@ -2496,6 +2496,29 @@ pub(crate) async fn detect_replace_conflict(
     detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
+/// Conflict when the row of `table_id` began after `base_snapshot`: a write
+/// that expects the catalog at that snapshot found the table's name free.
+async fn detect_created_table_conflict(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let created: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = $1 AND begin_snapshot > $2)",
+    )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .fetch_one(&mut **tx)
+    .await?;
+    if created {
+        return Err(crate::metadata_writer::created_table_conflict(
+            table_id,
+            base_snapshot,
+        ));
+    }
+    Ok(())
+}
+
 /// Abort with [`crate::DuckLakeError::Conflict`] when the table's inlined
 /// delete table holds a row committed after `base_snapshot`: another writer
 /// deleted rows of the table's data files without writing a delete file.
@@ -6568,6 +6591,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                         &mut tx,
                     )
                     .await?;
+                    detect_created_table_conflict(&mut tx, write.table_id, expected).await?;
                 }
             }
             let mut had_live_data = Vec::with_capacity(writes.len());

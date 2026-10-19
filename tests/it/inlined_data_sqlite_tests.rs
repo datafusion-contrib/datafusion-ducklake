@@ -2438,61 +2438,6 @@ async fn crate_and_duckdb_round_trip_inlined_rows() {
         .write_table("main", "nested", &[nested_batch])
         .await
         .unwrap();
-    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
-    sqlx::query(
-        "ALTER TABLE ducklake_snapshot
-         ADD COLUMN next_catalog_id BIGINT NOT NULL DEFAULT 1000",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "ALTER TABLE ducklake_snapshot
-         ADD COLUMN next_file_id BIGINT NOT NULL DEFAULT 1000",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("ALTER TABLE ducklake_schema ADD COLUMN schema_uuid VARCHAR")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE ducklake_schema SET schema_uuid = '00000000-0000-0000-0000-000000000001'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("ALTER TABLE ducklake_table ADD COLUMN table_uuid VARCHAR")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE ducklake_table SET table_uuid = '00000000-0000-0000-0000-000000000002'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN file_order BIGINT")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN file_format VARCHAR")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("ALTER TABLE ducklake_delete_file ADD COLUMN format VARCHAR")
-        .execute(&pool)
-        .await
-        .unwrap();
-    for ddl in [
-        "CREATE TABLE ducklake_column_mapping (mapping_id BIGINT, table_id BIGINT, type VARCHAR)",
-        "CREATE TABLE ducklake_file_variant_stats (data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN, extra_stats VARCHAR)",
-        "CREATE TABLE ducklake_macro (schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT)",
-        "CREATE TABLE ducklake_macro_impl (macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, sql VARCHAR, type VARCHAR)",
-        "CREATE TABLE ducklake_macro_parameters (macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR)",
-        "CREATE TABLE ducklake_name_mapping (mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN)",
-        "CREATE TABLE IF NOT EXISTS ducklake_view (view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, sql VARCHAR, column_aliases VARCHAR)",
-    ] {
-        sqlx::query(ddl).execute(&pool).await.unwrap();
-    }
-    pool.close().await;
 
     let attach = format!(
         "LOAD ducklake; LOAD sqlite; ATTACH 'ducklake:sqlite:{}' AS lake;",

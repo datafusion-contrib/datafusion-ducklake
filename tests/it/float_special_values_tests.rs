@@ -425,8 +425,6 @@ pub(crate) struct Backend<'a> {
     /// PostgreSQL writer never inlines, and MySQL writes NaN and infinities to
     /// Parquet.
     pub(crate) inlines: bool,
-    /// Run between the crate's writes and DuckDB's reads.
-    pub(crate) before_duckdb: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>,
 }
 
 /// Run `path` on `backend` and official, returning `(passing cells, known
@@ -472,9 +470,6 @@ async fn run_cell(
         }
     }
     drop(backend.side);
-    if let Some(before) = backend.before_duckdb {
-        before.await;
-    }
     if let Some(metadata) = &backend.duckdb_reads {
         let got = duckdb_answers(metadata, backend.data);
         for ((sql, want), got) in QUERIES.iter().zip(&expected).zip(&got) {
@@ -526,7 +521,7 @@ async fn run_cell(
 async fn run_backend<F, Fut>(name: &'static str, inlines: bool, mut open: F)
 where
     F: FnMut(&'static str, usize, std::path::PathBuf) -> Fut,
-    Fut: std::future::Future<Output = (Side, Option<Metadata>, Metadata, BeforeDuckdb)>,
+    Fut: std::future::Future<Output = (Side, Option<Metadata>, Metadata)>,
 {
     let mut passing = Vec::new();
     let mut known = Vec::new();
@@ -536,8 +531,7 @@ where
         let dir = temp.path();
         let data = dir.join("crate_data");
         std::fs::create_dir_all(&data).unwrap();
-        let (side, duckdb_reads, raw, before_duckdb) =
-            open(path.name, index, dir.to_path_buf()).await;
+        let (side, duckdb_reads, raw) = open(path.name, index, dir.to_path_buf()).await;
         let (p, k, f) = run_cell(
             &path,
             dir,
@@ -548,7 +542,6 @@ where
                 raw,
                 data: &data,
                 inlines,
-                before_duckdb,
             },
         )
         .await;
@@ -568,8 +561,6 @@ where
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-type BeforeDuckdb = Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
-
 #[cfg(feature = "write-sqlite")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite() {
@@ -585,12 +576,8 @@ async fn sqlite() {
             writer: Arc::new(writer),
             provider: Arc::new(SqliteMetadataProvider::new(&url).await.unwrap()),
         };
-        let metadata = Metadata::Sqlite(path.clone());
-        let before: BeforeDuckdb = Some(Box::pin(async move {
-            crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&path)
-                .await;
-        }));
-        (side, Some(metadata.clone()), metadata, before)
+        let metadata = Metadata::Sqlite(path);
+        (side, Some(metadata.clone()), metadata)
     })
     .await;
 }
@@ -611,7 +598,7 @@ async fn duckdb() {
             provider: Arc::new(provider),
         };
         let metadata = Metadata::Duckdb(path);
-        (side, Some(metadata.clone()), metadata, None)
+        (side, Some(metadata.clone()), metadata)
     })
     .await;
 }
@@ -645,14 +632,12 @@ async fn mysql() {
                 writer: Arc::new(writer),
                 provider: Arc::new(MySqlMetadataProvider::new(&url).await.unwrap()),
             };
-            // DuckDB 1.5.5 cannot attach this crate's MySQL catalogs (their
-            // `ducklake_snapshot` lacks `next_catalog_id`).
             let metadata = Metadata::Mysql {
                 host: "127.0.0.1".to_string(),
                 port,
                 database,
             };
-            (side, None, metadata, None)
+            (side, Some(metadata.clone()), metadata)
         }
     })
     .await;
@@ -691,11 +676,10 @@ async fn postgres_single_catalog() {
                 writer: Arc::new(writer),
                 provider: Arc::new(PostgresMetadataProvider::new(&url).await.unwrap()),
             };
-            // As for MySQL, DuckDB cannot attach this crate's PostgreSQL catalogs.
             let metadata = Metadata::Postgres(format!(
                 "host=127.0.0.1 port={port} user=postgres password=postgres dbname={database}"
             ));
-            (side, None, metadata, None)
+            (side, Some(metadata.clone()), metadata)
         }
     })
     .await;
@@ -746,7 +730,7 @@ async fn multicatalog() {
             let metadata = Metadata::Postgres(format!(
                 "host=127.0.0.1 port={port} user=postgres password=postgres dbname={database}"
             ));
-            (side, None, metadata, None)
+            (side, None, metadata)
         }
     })
     .await;
@@ -854,7 +838,6 @@ async fn sqlite_double_inlined_table_from_an_earlier_release() {
     pool.close().await;
     drop(side);
 
-    crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&path).await;
     assert_eq!(
         duckdb_answers(&Metadata::Sqlite(path.clone()), &data).remove(0),
         expected,
@@ -1305,8 +1288,6 @@ mod temporal_extremes {
         };
         assert!(check(&side).await, "SQLite stores these values inline");
         drop(side);
-        crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&path)
-            .await;
         duckdb_same(&Metadata::Sqlite(path), &data);
     }
 

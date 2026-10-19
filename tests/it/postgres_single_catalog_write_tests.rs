@@ -593,13 +593,13 @@ async fn initialize_schema_is_idempotent() {
 
     let counters: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ducklake_metadata
-         WHERE key IN ('next_column_id','next_snapshot_id','next_partition_id','next_sort_id')
+         WHERE key IN ('next_column_id','next_snapshot_id','next_catalog_id')
            AND scope IS NULL",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(counters, 4, "each id counter must be seeded exactly once");
+    assert_eq!(counters, 3, "each id counter must be seeded exactly once");
 }
 
 #[tokio::test(flavor = "multi_thread")]
