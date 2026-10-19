@@ -394,6 +394,42 @@ const SQL_MAX_FILE_ID: &str = "SELECT GREATEST(
      COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), -1),
      COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), -1))";
 
+/// The PostgreSQL setting naming the catalog a connection works on, in a
+/// store several catalogs share ([`share_catalog_tables`]). Official DuckDB
+/// sets it through its connection string, as
+/// `options=-c ducklake.catalog_id=<id>`.
+const SETTING_CATALOG_ID: &str = "ducklake.catalog_id";
+
+/// Catalog `c` of a shared store allocates its snapshot, schema, table,
+/// partition, sort and file ids from `[c << SHARED_ID_BITS, (c + 1) <<
+/// SHARED_ID_BITS)`, so the catalogs' ids never collide in the tables they
+/// share, nor in the names of their per-table inlined data tables.
+const SHARED_ID_BITS: u32 = 40;
+
+/// The `ducklake_metadata` counter of the catalog the connection works on,
+/// advanced past the head snapshot's watermark of the same name, as official
+/// DuckDB allocates from it. The id columns of a shared store default from it
+/// in place of their sequence, which every catalog would share.
+const SQL_CREATE_NEXT_ID_FUNCTION: &str = r#"
+CREATE OR REPLACE FUNCTION ducklake_next_id(counter TEXT) RETURNS BIGINT
+LANGUAGE plpgsql AS $$
+DECLARE
+    id BIGINT;
+BEGIN
+    EXECUTE format(
+        'UPDATE ducklake_metadata
+         SET value = CAST(GREATEST(CAST(value AS BIGINT),
+             COALESCE((SELECT %I FROM ducklake_snapshot
+                       ORDER BY snapshot_id DESC LIMIT 1) - 1, -1)) + 1 AS VARCHAR)
+         WHERE key = %L AND scope IS NULL
+         RETURNING CAST(value AS BIGINT)', counter, counter) INTO id;
+    IF id IS NULL THEN
+        RAISE EXCEPTION 'catalog % has no % counter',
+            current_setting('ducklake.catalog_id', true), counter;
+    END IF;
+    RETURN id;
+END $$"#;
+
 /// Single-catalog PostgreSQL metadata writer for standard DuckLake catalogs.
 ///
 /// Use this (not [`crate::metadata_writer_postgres::PostgresMetadataWriter`])
@@ -670,8 +706,9 @@ async fn upgrade_earlier_catalog(pool: &PgPool) -> Result<()> {
     if initialized {
         create_missing_tables(pool).await?;
         add_official_columns(pool).await?;
-        seed_counter(pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-        seed_counter(pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+        let floor = shared_id_floor(catalog_id_setting(pool).await?);
+        seed_counter(pool, "next_catalog_id", SQL_MAX_CATALOG_ID, floor).await?;
+        seed_counter(pool, "next_file_id", SQL_MAX_FILE_ID, floor).await?;
     }
     Ok(())
 }
@@ -965,8 +1002,9 @@ async fn grants(
 
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
 /// catalog keeps allocating without reuse. `WHERE NOT EXISTS` makes a re-open a no-op.
-async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result<()> {
+async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str, floor: i64) -> Result<()> {
     let start: i64 = sqlx::query(max_sql).fetch_one(pool).await?.try_get(0)?;
+    let start = start.max(floor);
     sqlx::query(
         "INSERT INTO ducklake_metadata (key, value, scope)
          SELECT $1, $2, NULL
@@ -978,6 +1016,157 @@ async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result
     .bind(start.to_string())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// The catalog the connection's [`SETTING_CATALOG_ID`] names in a store
+/// several catalogs share, or `None` when it names none.
+async fn catalog_id_setting(pool: &PgPool) -> Result<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT CAST(NULLIF(current_setting($1, true), '') AS BIGINT)")
+            .bind(SETTING_CATALOG_ID)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// The last id before the range of `catalog_id` in a shared store, which its
+/// counters start past, or no floor without one.
+fn shared_id_floor(catalog_id: Option<i64>) -> i64 {
+    catalog_id.map_or(i64::MIN, |catalog_id| (catalog_id << SHARED_ID_BITS) - 1)
+}
+
+/// Make the catalog tables of the database shared by catalogs, each the rows
+/// whose `catalog_id` is the connection's [`SETTING_CATALOG_ID`], and enter
+/// `catalog_id` as one of them. Every table gets a `catalog_id` column that
+/// defaults to the setting and a row-level security policy that keeps the
+/// connection to its catalog's rows, so official DuckDB, which knows nothing
+/// of `catalog_id`, reads and writes one catalog as a standard one. The id
+/// columns default from [`SQL_CREATE_NEXT_ID_FUNCTION`] instead of a
+/// sequence. A per-table inlined data or deletion table belongs to one table,
+/// and so to one catalog, so it is left as it is. Idempotent.
+async fn share_catalog_tables(pool: &PgPool, catalog_id: i64) -> Result<()> {
+    if !(1..1 << (63 - SHARED_ID_BITS)).contains(&catalog_id) {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "{SETTING_CATALOG_ID} {catalog_id} is outside [1, {})",
+            1_i64 << (63 - SHARED_ID_BITS)
+        )));
+    }
+    // Row-level security does not apply to a role that bypasses it, which
+    // would then see and change every catalog.
+    let bypasses: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await?;
+    if bypasses {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "a store shared by catalogs needs a role without SUPERUSER or BYPASSRLS, \
+             since {SETTING_CATALOG_ID} relies on row-level security"
+        )));
+    }
+    sqlx::query(SQL_CREATE_NEXT_ID_FUNCTION)
+        .execute(pool)
+        .await?;
+    let tables: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT c.relname::text,
+                EXISTS (SELECT 1 FROM pg_attribute a
+                        WHERE a.attrelid = c.oid AND a.attname = 'catalog_id'
+                          AND NOT a.attisdropped),
+                EXISTS (SELECT 1 FROM pg_policy p
+                        WHERE p.polrelid = c.oid AND p.polname = 'ducklake_catalog')
+         FROM pg_class c
+         WHERE c.relnamespace = to_regnamespace(current_schema()) AND c.relkind = 'r'
+           AND c.relname LIKE 'ducklake\\_%'
+           AND c.relname !~ '^ducklake_inlined_(data|delete)_[0-9]'",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (table, keyed, policed) in tables {
+        if !keyed {
+            sqlx::query(AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN catalog_id BIGINT NOT NULL
+                     DEFAULT CAST(current_setting('{SETTING_CATALOG_ID}') AS BIGINT)"
+            )))
+            .execute(pool)
+            .await?;
+        }
+        if !policed {
+            for statement in [
+                format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"),
+                format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY"),
+                format!(
+                    "CREATE POLICY ducklake_catalog ON {table}
+                     USING (catalog_id = CAST(current_setting('{SETTING_CATALOG_ID}') AS BIGINT))"
+                ),
+            ] {
+                sqlx::query(AssertSqlSafe(statement)).execute(pool).await?;
+            }
+        }
+    }
+    for (table, column, _) in POSITIONAL_TABLES {
+        let counter = if column.ends_with("file_id") {
+            "next_file_id"
+        } else {
+            "next_catalog_id"
+        };
+        let identity: bool = sqlx::query_scalar(
+            "SELECT attidentity <> '' FROM pg_attribute
+             WHERE attrelid = to_regclass($1) AND attname = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await?;
+        if identity {
+            sqlx::query(AssertSqlSafe(format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} DROP IDENTITY,
+                     ALTER COLUMN {column} SET DEFAULT ducklake_next_id('{counter}')"
+            )))
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Give a catalog of a shared store that has no snapshot its first one, at
+/// `first`, the start of its id range, with a `main` schema, as official
+/// DuckDB creates a catalog; official refuses to attach one without a
+/// snapshot.
+async fn create_first_snapshot(pool: &PgPool, first: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let created: bool = sqlx::query_scalar(
+        "INSERT INTO ducklake_snapshot
+             (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+         SELECT $1, NOW(), 0, $1 + 1, $1
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_snapshot)
+         RETURNING TRUE",
+    )
+    .bind(first)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if created {
+        for statement in [
+            "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES ($1, 'created_schema:\"main\"')",
+            "INSERT INTO ducklake_schema
+                 (schema_id, schema_uuid, begin_snapshot, schema_name, path, path_is_relative)
+             VALUES ($1, $2::uuid, $1, 'main', 'main/', TRUE)",
+            "UPDATE ducklake_metadata SET value = CAST($1 AS VARCHAR)
+             WHERE key IN ('next_snapshot_id', 'next_catalog_id') AND scope IS NULL",
+        ] {
+            let query = sqlx::query(statement).bind(first);
+            let query = if statement.contains("$2") {
+                query.bind(uuid::Uuid::now_v7().to_string())
+            } else {
+                query
+            };
+            query.execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3232,22 +3421,32 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .await?;
             }
             add_official_columns(&self.pool).await?;
+            let shared = catalog_id_setting(&self.pool).await?;
+            if let Some(catalog_id) = shared {
+                share_catalog_tables(&self.pool, catalog_id).await?;
+            }
+            let floor = shared_id_floor(shared);
             // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
             // they are reserved inside a transaction from these counters.
             seed_counter(
                 &self.pool,
                 "next_column_id",
                 "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column",
+                i64::MIN,
             )
             .await?;
             seed_counter(
                 &self.pool,
                 "next_snapshot_id",
                 "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+                floor,
             )
             .await?;
-            seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-            seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+            seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID, floor).await?;
+            seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID, floor).await?;
+            if shared.is_some() {
+                create_first_snapshot(&self.pool, floor + 1).await?;
+            }
             crate::metadata_writer_postgres::migrate_directory_paths(&self.pool).await?;
             sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
                 .execute(&self.pool)

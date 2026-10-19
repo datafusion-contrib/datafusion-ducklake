@@ -41,6 +41,27 @@ writers store `data_path`, schema paths, and table paths with a trailing `/`, as
 DuckDB does, and initialization appends it to legacy rows so DuckDB can resolve
 crate-written files. The multi-catalog layout keeps its paths as given.
 
+**Shared-store catalogs** (PostgreSQL, **experimental**) put many standard catalogs in one
+database's DuckLake tables, which official DuckDB reads and writes. A connection works on the
+catalog its `ducklake.catalog_id` setting names: the crate's connection string carries
+`options=-c ducklake.catalog_id=<id>`, and official DuckDB's
+`ducklake:postgres:… options=-cducklake.catalog_id=<id>`. With the setting,
+`PostgresSingleCatalogMetadataWriter` initialization does the following:
+
+- adds a `catalog_id` column, defaulting to the setting, and a row-level security policy on it
+  to every DuckLake table, so each connection reads and writes only its catalog's rows;
+- makes the id columns default from the catalog's counters instead of a sequence every catalog
+  would share;
+- seeds catalog `c`'s ids at `c << 40`, so ids never collide across catalogs, nor do the names
+  of per-table inlined data tables;
+- creates the catalog's first snapshot and `main` schema, as official requires one.
+
+A catalog costs four rows, not a schema or a database. Both sides must connect as a role
+without `SUPERUSER` or `BYPASSRLS`, which initialization checks, since row-level security does
+not apply to one. The setting isolates catalogs but is no security boundary: any connection may
+name any catalog. Each catalog needs its own connection pool for now, since the setting is a
+connection option. The library-specific multi-catalog layout below is separate and unchanged.
+
 **Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
 multiple independent DuckLake catalogs. Reading multiple catalogs requires
 `multicatalog-postgres` (`MulticatalogProvider`); creating/managing them requires

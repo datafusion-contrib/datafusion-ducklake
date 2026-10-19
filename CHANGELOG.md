@@ -337,6 +337,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and single-catalog PostgreSQL writers create, or `migrate_to_official_layout` migrates.
 - A commit that inlines rows advances `next_file_id` as official's does, so an official session
   sees that its table statistics changed.
+- Experimental: catalogs sharing one PostgreSQL database's tables, chosen per connection by
+  `ducklake.catalog_id`, which official DuckDB reads and writes as standard catalogs.
 
 ## [0.9.0] - 2026-10-07
 
