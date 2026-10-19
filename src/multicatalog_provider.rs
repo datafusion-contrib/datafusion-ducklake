@@ -14,25 +14,27 @@
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
+use crate::catalog_read_transaction::{ReadTransaction, tolerating_failure};
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
-    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, MetadataProvider, MetadataSetting, ObjectTag, SchemaMetadata,
-    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, TagObjectType,
-    TagTarget, ViewMetadata, ViewWithSchema, block_on, reconstruct_columns,
-    reconstruct_columns_with_table, resolve_metadata_settings,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
+    DuckLakeInlinedDelete, DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile,
+    DuckLakeTableStatistics, DuckLakeTag, FileWithTable, MetadataProvider, MetadataSetting,
+    ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, TagObjectType, TagTarget, ViewMetadata, ViewWithSchema, block_on,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     InlinedFileDeleteChange, InlinedReadShape, InlinedRowSelection,
 };
 use crate::metadata_provider_postgres::{
-    PostgresStatsDialect, StatsFilterSql, delete_file_begin_snapshot_on, fetch_data_file_page,
-    first_inlined_snapshot_on, inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on,
-    inlined_table_for_flush_on, inlined_version_snapshot_on, read_inlined_rows_on,
-    registered_inlined_tables_on, scan_inlined_data_on, stats_filter_sql,
+    CONSISTENT_READ_BEGIN, InlinedDeletionTables, PostgresStatsDialect, StatsFilterSql,
+    delete_file_begin_snapshot_on, fetch_data_file_page, first_inlined_snapshot_on,
+    inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on, inlined_table_for_flush_on,
+    inlined_version_snapshot_on, read_inlined_rows_on, registered_inlined_tables_on,
+    scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -44,7 +46,7 @@ use sqlx::postgres::{PgArguments, PgConnection, PgPool, PgPoolOptions, PgRow, Po
 use sqlx::query::Query;
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -183,32 +185,6 @@ impl SchemaCapabilities {
     }
 }
 
-/// What a provider knows about one table's inlined-deletion table,
-/// `ducklake_inlined_delete_<table_id>`, which the table's first inlined
-/// deletion creates.
-///
-/// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
-/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Only two things drop the
-/// table once it exists: expiring snapshots, for a table no surviving snapshot
-/// can see, and dropping its catalog. Table ids are never reused, so a dropped
-/// one is never created again, and "exists" can go stale only for a table no
-/// surviving snapshot reads. A read that finds it gone reads no deletions, and
-/// `get_inlined_deletes` then forgets the entry.
-/// "Absent" holds for reads at or
-/// below the catalog's head at the time of the check: a deletion committed
-/// later takes a snapshot above that head, which such a read does not see.
-///
-/// Official reads only committed snapshots, so its check is always at or below
-/// the head. This crate also accepts a snapshot above the head (for example
-/// from `DuckLakeCatalog::with_snapshot`), and a later commit can still create
-/// that snapshot. So absence is recorded up to the lower of the snapshot read
-/// and the head, never above the head.
-#[derive(Debug, Clone, Copy)]
-enum InlinedDeletionTable {
-    Exists,
-    AbsentThrough(i64),
-}
-
 /// One pooled connection for the catalog reads of one query.
 ///
 /// Take one with [`MulticatalogProvider::begin_read_session`], and bind a
@@ -216,6 +192,13 @@ enum InlinedDeletionTable {
 /// The query then reads the catalog on this connection alone, instead of taking
 /// one from the pool for every statement. One session serves every catalog in
 /// its database.
+///
+/// A provider bound to the session begins its consistent reads
+/// ([`MetadataProvider::begin_consistent_read`]) on this connection too. While
+/// any of them is open, the connection is inside one read-only transaction,
+/// begun by the first and committed by the last to end, so the scans of a query
+/// that read the catalog at once read one snapshot of it, as official DuckLake
+/// reads all of a transaction's metadata in one metadata transaction.
 ///
 /// [`Self::end`] gives the connection back to the pool. A provider still bound
 /// to an ended session reads through the pool again, so a read that comes late
@@ -231,22 +214,56 @@ struct ReadSessionInner {
     // The database the connection reads, which a provider bound to the session
     // must read as well.
     database: DatabaseIdentity,
-    // `None` once the session ends. A lock rather than a plain cell because
-    // DataFusion can plan several scans of one query at once: their statements
-    // take turns on the connection.
-    connection: tokio::sync::Mutex<Option<PoolConnection<Postgres>>>,
+    // A lock rather than a plain cell because DataFusion can plan several
+    // scans of one query at once: their statements take turns on the
+    // connection.
+    connection: tokio::sync::Mutex<SessionConnection>,
+}
+
+/// The connection of a [`MetadataReadSession`], and the consistent reads open
+/// on it.
+#[derive(Debug, Default)]
+struct SessionConnection {
+    // `None` once the session ends.
+    connection: Option<PoolConnection<Postgres>>,
+    // The consistent reads open on the connection. While there is one, the
+    // connection is inside the transaction the first of them began.
+    open_reads: usize,
+}
+
+impl SessionConnection {
+    /// End the transaction of the open reads, if any: the session ends.
+    async fn end_reads(&mut self) -> std::result::Result<(), sqlx::Error> {
+        if std::mem::take(&mut self.open_reads) == 0 {
+            return Ok(());
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(());
+        };
+        if let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut **connection).await {
+            // A connection that may still be inside the transaction is not
+            // pooled again.
+            if let Some(mut connection) = self.connection.take() {
+                connection.close_on_drop();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 impl MetadataReadSession {
     /// End the session and give its connection back to the pool. Reads through
     /// a provider bound to this session use the pool from now on. Ending an
     /// ended session does nothing.
+    ///
+    /// A consistent read still open on the session ends with it: its
+    /// transaction commits here, and its later reads use the pool.
     pub async fn end(&self) -> Result<()> {
-        // Fallible so that a session that also holds a transaction can report
-        // a failed commit here without a change to this signature.
-        let connection = self.inner.connection.lock().await.take();
-        drop(connection);
-        Ok(())
+        let mut session = self.inner.connection.lock().await;
+        let ended = session.end_reads().await;
+        drop(session.connection.take());
+        Ok(ended?)
     }
 }
 
@@ -288,8 +305,21 @@ impl Drop for ReadSessionInner {
         // sqlx returns a connection to its pool from a task it spawns, which
         // needs a runtime. The catalog runtime always has one; the thread that
         // drops the last handle might not.
-        if let Some(connection) = self.connection.get_mut().take() {
-            crate::metadata_provider::catalog_runtime().spawn(async move { drop(connection) });
+        let session = std::mem::take(self.connection.get_mut());
+        if session.connection.is_some() {
+            crate::metadata_provider::catalog_runtime().spawn(async move {
+                let mut session = session;
+                if session.open_reads > 0
+                    && let Some(connection) = session.connection.as_mut()
+                    && sqlx::raw_sql("ROLLBACK")
+                        .execute(&mut **connection)
+                        .await
+                        .is_err()
+                {
+                    connection.close_on_drop();
+                }
+                drop(session);
+            });
         }
     }
 }
@@ -307,10 +337,71 @@ pub struct MulticatalogProvider {
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
     // Each table's inlined-deletion table, by table id, as far as this provider
     // has looked (see `InlinedDeletionTable`). Shared across clones.
-    inlined_deletion_tables: Arc<Mutex<HashMap<i64, InlinedDeletionTable>>>,
+    inlined_deletion_tables: Arc<InlinedDeletionTables>,
     // The read session every catalog read runs on, when this provider is bound
     // to one (see `MetadataReadSession`).
     read_session: Option<Arc<ReadSessionInner>>,
+    // The consistent read every catalog read runs in, when this provider is
+    // bound to one (see `MetadataProvider::begin_consistent_read`).
+    consistent: Option<Arc<MulticatalogRead>>,
+}
+
+/// A consistent read of a [`MulticatalogProvider`]: a transaction on a pooled
+/// connection of its own, or on the provider's read session.
+#[derive(Debug)]
+enum MulticatalogRead {
+    Pooled(ReadTransaction<Postgres>),
+    Session(SessionRead),
+}
+
+/// A consistent read open on a read session's connection, counted in its
+/// `open_reads`.
+#[derive(Debug)]
+struct SessionRead {
+    session: Arc<ReadSessionInner>,
+    ended: std::sync::atomic::AtomicBool,
+}
+
+impl SessionRead {
+    /// Count this read out of the session's open reads, and commit their
+    /// transaction when it was the last. Ending an ended read does nothing.
+    async fn end(&self) -> std::result::Result<(), sqlx::Error> {
+        if self.ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut session = self.session.connection.lock().await;
+        if session.open_reads > 1 {
+            session.open_reads -= 1;
+            return Ok(());
+        }
+        session.end_reads().await
+    }
+}
+
+impl Drop for SessionRead {
+    fn drop(&mut self) {
+        if !*self.ended.get_mut() {
+            let read = Self {
+                session: Arc::clone(&self.session),
+                ended: std::sync::atomic::AtomicBool::new(false),
+            };
+            *self.ended.get_mut() = true;
+            crate::metadata_provider::catalog_runtime().spawn(async move {
+                // The transaction ends when its last read does; a failed commit
+                // has no caller left to report to.
+                let _ = read.end().await;
+            });
+        }
+    }
+}
+
+impl MulticatalogRead {
+    async fn end(&self) -> std::result::Result<(), sqlx::Error> {
+        match self {
+            Self::Pooled(read) => read.commit().await,
+            Self::Session(read) => read.end().await,
+        }
+    }
 }
 
 impl MulticatalogProvider {
@@ -355,6 +446,7 @@ impl MulticatalogProvider {
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
             read_session: None,
+            consistent: None,
         })
     }
 
@@ -377,6 +469,7 @@ impl MulticatalogProvider {
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
             read_session: None,
+            consistent: None,
         })
     }
 
@@ -400,7 +493,10 @@ impl MulticatalogProvider {
         Ok(MetadataReadSession {
             inner: Arc::new(ReadSessionInner {
                 database: DatabaseIdentity::of(&self.pool),
-                connection: tokio::sync::Mutex::new(Some(connection)),
+                connection: tokio::sync::Mutex::new(SessionConnection {
+                    connection: Some(connection),
+                    open_reads: 0,
+                }),
             }),
         })
     }
@@ -425,20 +521,38 @@ impl MulticatalogProvider {
         })
     }
 
-    /// Run `read` on the read session's connection while the session is open,
-    /// else on one connection from the pool.
+    /// Run `read` on the consistent read's connection while this provider is
+    /// bound to an open one, else on the read session's connection while the
+    /// session is open, else on one connection from the pool.
     async fn on_connection<T, E: From<sqlx::Error>>(
         &self,
         read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
+        self.on_connection_in_transaction(async |connection, _| read(connection).await)
+            .await
+    }
+
+    /// [`Self::on_connection`], telling `read` whether its connection is
+    /// inside a consistent read's transaction: a read session's connection is
+    /// while any read is open on it, whichever provider began it.
+    async fn on_connection_in_transaction<T, E: From<sqlx::Error>>(
+        &self,
+        read: impl AsyncFnOnce(&mut PgConnection, bool) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        if let Some(MulticatalogRead::Pooled(transaction)) = self.consistent.as_deref()
+            && let Some(mut connection) = transaction.connection().await
+        {
+            return read(&mut connection, true).await;
+        }
         if let Some(session) = &self.read_session {
-            let mut connection = session.connection.lock().await;
-            if let Some(connection) = connection.as_mut() {
-                return read(connection).await;
+            let mut session = session.connection.lock().await;
+            let in_transaction = session.open_reads > 0;
+            if let Some(connection) = session.connection.as_mut() {
+                return read(connection, in_transaction).await;
             }
         }
         let mut connection = self.pool.acquire().await?;
-        read(&mut connection).await
+        read(&mut connection, false).await
     }
 
     /// Every row `query` returns, read as [`Self::on_connection`] reads.
@@ -469,23 +583,28 @@ impl MulticatalogProvider {
     }
 
     /// One page of the file listing, read as [`Self::on_connection`] reads.
+    /// A `narrowed` page's failure is tolerated: inside a transaction, it runs
+    /// under a savepoint.
     async fn read_page(
         &self,
         sql: &str,
-        table_id: i64,
-        snapshot_id: i64,
+        narrowed: bool,
+        (table_id, snapshot_id): (i64, i64),
         after_data_file_id: i64,
         limit: i64,
     ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
-        self.on_connection(async |connection| {
-            fetch_data_file_page(
-                connection,
-                sql,
-                table_id,
-                snapshot_id,
-                after_data_file_id,
-                limit,
-            )
+        self.on_connection_in_transaction(async |connection, in_transaction| {
+            tolerating_failure(connection, narrowed && in_transaction, async |connection| {
+                fetch_data_file_page(
+                    connection,
+                    sql,
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                )
+                .await
+            })
             .await
         })
         .await
@@ -531,18 +650,10 @@ impl MulticatalogProvider {
         self.schema_capabilities.get().is_some()
     }
 
-    /// This provider's memo of inlined-deletion tables, locked. It is never
-    /// held across a catalog read.
-    fn inlined_deletion_tables(&self) -> MutexGuard<'_, HashMap<i64, InlinedDeletionTable>> {
-        self.inlined_deletion_tables
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// Whether `table_id`'s inlined-deletion table, named `table`, exists for a
     /// read at `snapshot_id`.
     ///
-    /// The memo answers when it can (see [`InlinedDeletionTable`]). Otherwise
+    /// The memo answers when it can (see `InlinedDeletionTable`). Otherwise
     /// `to_regclass` is asked. Unlike a read of a missing table, it raises no
     /// error, so reading a table without inlined deletions never issues a
     /// failing statement.
@@ -552,13 +663,8 @@ impl MulticatalogProvider {
         table: &str,
         snapshot_id: i64,
     ) -> Result<bool> {
-        let known = self.inlined_deletion_tables().get(&table_id).copied();
-        match known {
-            Some(InlinedDeletionTable::Exists) => return Ok(true),
-            Some(InlinedDeletionTable::AbsentThrough(seen)) if snapshot_id <= seen => {
-                return Ok(false);
-            },
-            _ => {},
+        if let Some(exists) = self.inlined_deletion_tables.known(table_id, snapshot_id) {
+            return Ok(exists);
         }
         // The head is read in the same statement as the check, so both describe
         // one state of the catalog.
@@ -575,21 +681,8 @@ impl MulticatalogProvider {
             )
             .await?;
         let (exists, head): (bool, i64) = (row.try_get(0)?, row.try_get(1)?);
-        // Commits to one catalog take their snapshots in commit order, each
-        // above the last, so any deletion committed after this check has a
-        // snapshot above `head`.
-        let absent_through = snapshot_id.min(head);
-        let mut tables = self.inlined_deletion_tables();
-        let entry = tables
-            .entry(table_id)
-            .or_insert(InlinedDeletionTable::AbsentThrough(absent_through));
-        *entry = match (*entry, exists) {
-            // A read beside this one may already have seen the table.
-            (_, true) | (InlinedDeletionTable::Exists, false) => InlinedDeletionTable::Exists,
-            (InlinedDeletionTable::AbsentThrough(seen), false) => {
-                InlinedDeletionTable::AbsentThrough(seen.max(absent_through))
-            },
-        };
+        self.inlined_deletion_tables
+            .record(table_id, snapshot_id, exists, head);
         Ok(exists)
     }
 
@@ -770,18 +863,22 @@ impl MulticatalogProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let fetch = |sql: String| async move {
-                self.read_page(&sql, table_id, snapshot_id, after, limit)
+            let narrowed = stats_sql.is_some();
+            let fetch = |sql: String, narrowed: bool| async move {
+                self.read_page(&sql, narrowed, (table_id, snapshot_id), after, limit)
                     .await
             };
-            let first = fetch(page_sql(caps, stats_sql.as_ref())).await;
+            let first = fetch(page_sql(caps, stats_sql.as_ref()), narrowed).await;
             // A table the memoized probe saw can be gone by now. Probe again,
             // past the memo, and read the page from the tables there are, so a
             // missing table costs only what it held, as the separate reads did.
             let (caps, first) = match first {
                 Err(error) if memoized && is_missing_statistics_table(&error) => {
                     let current = self.probe_schema_capabilities().await?;
-                    (current, fetch(page_sql(current, stats_sql.as_ref())).await)
+                    (
+                        current,
+                        fetch(page_sql(current, stats_sql.as_ref()), narrowed).await,
+                    )
                 },
                 first => (caps, first),
             };
@@ -798,7 +895,7 @@ impl MulticatalogProvider {
                 // surfaces from it.
                 Err(error) if stats_sql.is_some() => {
                     crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
-                    fetch(page_sql(caps, None)).await?
+                    fetch(page_sql(caps, None), false).await?
                 },
                 Err(error) => return Err(error.into()),
             };
@@ -1011,6 +1108,45 @@ fn decode_page_statistics(
 }
 
 impl MetadataProvider for MulticatalogProvider {
+    /// A read-only `REPEATABLE READ` transaction, whose snapshot the first read
+    /// fixes: on the read session's connection while this provider is bound to
+    /// an open session (see [`MetadataReadSession`]), else on a pooled
+    /// connection of its own.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        if self.consistent.is_some() {
+            return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
+        }
+        let read = block_on(async {
+            if let Some(session) = &self.read_session {
+                let mut connection = session.connection.lock().await;
+                let open_reads = connection.open_reads;
+                if let Some(pooled) = connection.connection.as_mut() {
+                    if open_reads == 0 {
+                        sqlx::raw_sql(CONSISTENT_READ_BEGIN)
+                            .execute(&mut **pooled)
+                            .await?;
+                    }
+                    connection.open_reads += 1;
+                    return Ok::<_, sqlx::Error>(MulticatalogRead::Session(SessionRead {
+                        session: Arc::clone(session),
+                        ended: std::sync::atomic::AtomicBool::new(false),
+                    }));
+                }
+            }
+            Ok(MulticatalogRead::Pooled(
+                ReadTransaction::begin(&self.pool, &[CONSISTENT_READ_BEGIN]).await?,
+            ))
+        })?;
+        let read = Arc::new(read);
+        let provider = Self {
+            consistent: Some(Arc::clone(&read)),
+            ..self.clone()
+        };
+        Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
+            Ok(block_on(read.end())?)
+        })))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = self
@@ -2234,7 +2370,7 @@ impl MetadataProvider for MulticatalogProvider {
                 // (see `InlinedDeletionTable`). A missing table holds no
                 // deletions to apply.
                 Err(error) if is_missing_statistics_table(&error) => {
-                    self.inlined_deletion_tables().remove(&table_id);
+                    self.inlined_deletion_tables.forget(table_id);
                     Ok(Vec::new())
                 },
                 Err(error) => Err(error.into()),

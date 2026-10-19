@@ -1326,6 +1326,21 @@ async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> 
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+             data_file_id BIGINT NOT NULL, table_id BIGINT NOT NULL, column_id BIGINT NOT NULL,
+             column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT,
+             min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+             data_file_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             partition_key_index BIGINT NOT NULL, partition_value VARCHAR)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

@@ -900,8 +900,11 @@ impl DuckLakeTable {
         // (`GetFilesForCompaction`). Excluding them instead strands every merge
         // output on a table taking appends between merge passes, leaving each
         // partition a floor of files nothing can reduce.
-        let table_files = self.files()?;
-        let inlined_deletes = self.inlined_deletes_by_file()?;
+        // Read in one consistent read of the catalog, so that a flush of
+        // inlined deletions meanwhile cannot show a file without its deletions.
+        let (table_files, inlined_deletes) = self.read_consistently(|table| {
+            Ok::<_, DuckLakeError>((table.files()?, table.inlined_deletes_by_file()?))
+        })?;
         let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
@@ -1514,8 +1517,11 @@ impl DuckLakeTable {
         let selected_ids = opts
             .data_file_ids
             .map(|ids| ids.into_iter().collect::<HashSet<_>>());
-        let table_files = self.files()?;
-        let inlined_deletes = self.inlined_deletes_by_file()?;
+        // Read in one consistent read of the catalog, so that a flush of
+        // inlined deletions meanwhile cannot show a file without its deletions.
+        let (table_files, inlined_deletes) = self.read_consistently(|table| {
+            Ok::<_, DuckLakeError>((table.files()?, table.inlined_deletes_by_file()?))
+        })?;
         let candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|tf| match &selected_ids {

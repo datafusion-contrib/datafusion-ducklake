@@ -4,15 +4,15 @@ use crate::inlined_filter::{
     render_inlined_filter,
 };
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
-    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
-    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, INLINED_DATA_REMEDIATION, INLINED_SYSTEM_SELECT_WIDTH,
-    InlinedColumnMapping, InlinedFileDeleteChange, InlinedReadShape, InlinedRowSelection,
-    InlinedTableLayout, MetadataProvider, MetadataSetting, ObjectTag, SQL_GET_COLUMN_TAGS,
-    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
+    DuckLakeInlinedDelete, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
+    DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile,
+    DuckLakeTableStatistics, DuckLakeTag, FileWithTable, INLINED_DATA_REMEDIATION,
+    INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange, InlinedReadShape,
+    InlinedRowSelection, InlinedTableLayout, MetadataProvider, MetadataSetting, ObjectTag,
+    SQL_GET_COLUMN_TAGS, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_NAME_MAPPING,
     SQL_GET_OBJECT_TAGS, SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC,
@@ -39,6 +39,7 @@ use duckdb::AccessMode::ReadOnly;
 use duckdb::types::{TimeUnit as DuckdbTimeUnit, Value, ValueRef};
 use duckdb::{Config, Connection, OptionalExt, params, params_from_iter};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
@@ -985,6 +986,10 @@ pub struct DuckdbMetadataProvider {
     /// Positive-only memo of the optional-schema capability probes. `Arc` so
     /// derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    /// Whether `conn` is inside the transaction of an open consistent read
+    /// (see [`MetadataProvider::begin_consistent_read`]); `None` for a provider
+    /// not bound to one.
+    read_open: Option<Arc<AtomicBool>>,
 }
 
 impl DuckdbMetadataProvider {
@@ -997,6 +1002,7 @@ impl DuckdbMetadataProvider {
             conn: Arc::new(Mutex::new(conn)),
             catalog_path,
             schema_capabilities: Arc::new(OnceLock::new()),
+            read_open: None,
         })
     }
 
@@ -1008,6 +1014,7 @@ impl DuckdbMetadataProvider {
             conn,
             catalog_path,
             schema_capabilities: Arc::new(OnceLock::new()),
+            read_open: None,
         }
     }
 
@@ -1365,6 +1372,44 @@ fn read_duckdb_inlined_table(
 }
 
 impl MetadataProvider for DuckdbMetadataProvider {
+    /// A connection of its own to the catalog's database, cloned from the
+    /// shared one, inside `BEGIN TRANSACTION`: DuckDB reads a transaction at
+    /// the snapshot it began with. The shared connection, and a writer on it,
+    /// are not held.
+    ///
+    /// DuckDB has no savepoints, and a statement that fails while it runs (not
+    /// one that names a missing table) ends the transaction. So inside a
+    /// consistent read, a statistics-narrowed listing that fails while it runs
+    /// fails the read; outside one, the page is listed again unnarrowed.
+    fn begin_consistent_read(&self) -> crate::Result<Option<ConsistentRead>> {
+        if self
+            .read_open
+            .as_ref()
+            .is_some_and(|open| open.load(Ordering::Acquire))
+        {
+            return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
+        }
+        let conn = self.connection().try_clone()?;
+        conn.execute_batch("BEGIN TRANSACTION")?;
+        let conn = Arc::new(Mutex::new(conn));
+        let open = Arc::new(AtomicBool::new(true));
+        let provider = Self {
+            conn: Arc::clone(&conn),
+            read_open: Some(Arc::clone(&open)),
+            ..self.clone()
+        };
+        // Dropping the read without ending it drops the connection, which
+        // rolls the transaction back.
+        Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
+            if open.swap(false, Ordering::AcqRel) {
+                conn.lock()
+                    .expect("DuckDB connection mutex poisoned")
+                    .execute_batch("COMMIT")?;
+            }
+            Ok(())
+        })))
+    }
+
     fn get_current_snapshot(&self) -> crate::Result<i64> {
         let conn = self.connection();
         let snapshot_id: i64 = conn.query_row(SQL_GET_LATEST_SNAPSHOT, [], |row| row.get(0))?;

@@ -269,9 +269,14 @@ async fn run_delete(
     base_snapshot: i64,
 ) -> DataFusionResult<u64> {
     let state: &dyn Session = session_state;
-    let (inlined_data, table_files) = table
-        .inlined_rows_then_files(|| table.files(), |file| file.data_file_id)
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    // The inlined rows, the files and the inlined deletions, read in one
+    // consistent read of the catalog (`DuckLakeTable::read_consistently`).
+    let (inlined_data, table_files, inlined_deletes) = table.read_consistently(|table| {
+        let (inlined_data, table_files) = table
+            .inlined_rows_then_files(|| table.files(), |file| file.data_file_id)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        Ok::<_, DataFusionError>((inlined_data, table_files, table.inlined_deletes_by_file()?))
+    })?;
 
     // A writer that stages row mutations records each file's deletions as
     // official DuckLake's `DuckLakeDelete::FlushDelete` does (see
@@ -308,8 +313,6 @@ async fn run_delete(
     } else {
         0
     };
-    let inlined_deletes = table.inlined_deletes_by_file()?;
-
     let predicate = match predicate {
         None => {
             return delete_all(

@@ -27,7 +27,7 @@ use datafusion_ducklake::metadata_provider::{
 };
 use datafusion_ducklake::stats_filter::StatsFilter;
 use datafusion_ducklake::{
-    CatalogReadMemo, ColumnTag, DuckLakeCatalog, DuckLakeInlinedFileDeleteForFlush,
+    CatalogReadMemo, ColumnTag, ConsistentRead, DuckLakeCatalog, DuckLakeInlinedFileDeleteForFlush,
     DuckLakeInlinedFlushData, DuckLakeReadOptions, DuckLakeTable, DuckLakeTag,
     MemoizedMetadataProvider, MetadataProvider, ObjectTag, Result, SnapshotChangeMetadata,
     SqliteMetadataProvider, TagTarget,
@@ -395,6 +395,21 @@ impl MetadataProvider for CountingProvider {
         self.inner
             .get_delete_files_added_between_snapshots(table_id, start_snapshot, end_snapshot)
     }
+    /// The read of `inner`, through a provider that counts its calls and runs
+    /// the hook with this one. Not counted itself.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        let Some(read) = self.inner.begin_consistent_read()? else {
+            return Ok(None);
+        };
+        let counting = Self {
+            inner: Arc::clone(read.provider()),
+            calls: Arc::clone(&self.calls),
+            hook: Arc::clone(&self.hook),
+        };
+        Ok(Some(ConsistentRead::new(Arc::new(counting), move || {
+            read.end()
+        })))
+    }
 }
 
 /// An object store over the local filesystem that counts the reads of each
@@ -551,7 +566,18 @@ impl Lake {
             metadata,
         };
         std::fs::create_dir_all(lake.data_path())?;
-        lake.run(inlining_rows, statements)?;
+        // In this process: no connection of a provider is open yet.
+        let (extension, attach) = lake.attach();
+        run_duckdb(
+            extension,
+            &attach,
+            &lake.data_path(),
+            inlining_rows,
+            statements,
+        )?;
+        if let Metadata::Sqlite = lake.metadata {
+            use_write_ahead_log(&lake.catalog_path())?;
+        }
         Ok(lake)
     }
 
@@ -579,10 +605,18 @@ impl Lake {
         }
     }
 
-    /// Run `statements` through DuckDB with the catalog attached as `lake`.
+    /// Run `statements` through DuckDB with the catalog attached as `lake`:
+    /// for SQLite metadata, in a child process (see [`run_duckdb_apart`]).
     fn run(&self, inlining_rows: usize, statements: &[&str]) -> anyhow::Result<()> {
         let (extension, attach) = self.attach();
-        run_duckdb(
+        let run = match self.metadata {
+            Metadata::Sqlite => run_duckdb_apart,
+            #[cfg(feature = "metadata-postgres")]
+            Metadata::Postgres {
+                ..
+            } => run_duckdb,
+        };
+        run(
             extension,
             &attach,
             &self.data_path(),
@@ -594,7 +628,14 @@ impl Lake {
     /// [`Self::run`], as a closure to hand a [`CountingProvider`] hook.
     fn runner(&self, statements: &'static [&'static str]) -> impl FnOnce() + Send + 'static {
         let ((extension, attach), data) = (self.attach(), self.data_path());
-        move || run_duckdb(extension, &attach, &data, 0, statements).expect("DuckDB statements")
+        let run = match self.metadata {
+            Metadata::Sqlite => run_duckdb_apart,
+            #[cfg(feature = "metadata-postgres")]
+            Metadata::Postgres {
+                ..
+            } => run_duckdb,
+        };
+        move || run(extension, &attach, &data, 0, statements).expect("DuckDB statements")
     }
 
     async fn provider(&self) -> anyhow::Result<CountingProvider> {
@@ -631,6 +672,103 @@ impl Backend {
         };
         Lake::with_metadata(metadata, inlining_rows, statements)
     }
+}
+
+/// Put the SQLite catalog at `path` in WAL mode, which the file keeps.
+///
+/// A test commits from inside a scan's catalog reads. A consistent read holds
+/// a SQLite read transaction for them, and in rollback-journal mode a commit
+/// cannot land until that transaction ends; in WAL mode it lands, and the read
+/// keeps its snapshot.
+pub(crate) fn use_write_ahead_log(path: &std::path::Path) -> anyhow::Result<()> {
+    let url = format!("sqlite:{}", path.display());
+    // On a thread of its own: callers run inside a runtime, which cannot block
+    // on another.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                use sqlx::Connection;
+                let mut connection = sqlx::SqliteConnection::connect(&url).await?;
+                let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+                    .fetch_one(&mut connection)
+                    .await?;
+                anyhow::ensure!(mode == "wal", "journal mode {mode}");
+                Ok(())
+            })
+    })
+    .join()
+    .expect("the journal-mode thread")
+}
+
+/// The environment variable that hands [`duckdb_child`] its work.
+const DUCKDB_CHILD: &str = "DUCKLAKE_MEMO_TESTS_DUCKDB_CHILD";
+
+/// [`run_duckdb`], in a child process: this test binary, running only
+/// [`duckdb_child`].
+///
+/// The DuckDB SQLite extension links its own copy of SQLite, and sqlx links
+/// another. SQLite coordinates the connections of one process to a database
+/// file inside its own copy, since POSIX file locks do not tell apart two
+/// holders in one process. So the copies in one process do not see each
+/// other's locks: a DuckDB commit lands under a transaction the provider holds
+/// open, and in WAL mode the provider's connections can miss it. A commit from
+/// another process is coordinated as SQLite documents.
+fn run_duckdb_apart(
+    extension: &str,
+    attach: &str,
+    data: &std::path::Path,
+    inlining_rows: usize,
+    statements: &[&str],
+) -> anyhow::Result<()> {
+    let work = [
+        extension.to_string(),
+        attach.to_string(),
+        data.display().to_string(),
+        inlining_rows.to_string(),
+    ]
+    .into_iter()
+    .chain(statements.iter().map(|statement| statement.to_string()))
+    .collect::<Vec<_>>()
+    .join("\u{1e}");
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "catalog_read_memo_tests::duckdb_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DUCKDB_CHILD, work)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        output.status.success() && stdout.contains("1 passed"),
+        "DuckDB child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// The child process of [`run_duckdb_apart`]; passes at once in any other run.
+#[test]
+fn duckdb_child() {
+    let Ok(work) = std::env::var(DUCKDB_CHILD) else {
+        return;
+    };
+    let mut work = work.split('\u{1e}');
+    let mut next = || work.next().expect("the child's work");
+    let (extension, attach, data) = (next(), next(), next());
+    let inlining_rows = next().parse().expect("an inlining limit");
+    let statements: Vec<&str> = work.collect();
+    run_duckdb(
+        extension,
+        attach,
+        std::path::Path::new(data),
+        inlining_rows,
+        &statements,
+    )
+    .expect("DuckDB statements");
 }
 
 fn run_duckdb(
@@ -1815,6 +1953,179 @@ async fn a_flush_between_a_deletes_reads_leaves_no_row_undeleted() -> anyhow::Re
 }
 
 // ---------------------------------------------------------------------------
+// A commit between two pages of a scan's listing
+// ---------------------------------------------------------------------------
+
+/// The listing read whose second call a merge commits just before.
+const PAGE: &str = "get_table_file_metadata_page_filtered";
+
+/// One more file than a page of the listing holds, and a few more.
+const LISTED_FILES: i64 = FILE_METADATA_BATCH_SIZE as i64 + 4;
+
+const MERGE: &[&str] = &["CALL ducklake_merge_adjacent_files('lake')"];
+
+/// Table `t` of [`LISTED_FILES`] one-row files, the rows `0..LISTED_FILES`,
+/// which official DuckLake registers in one commit.
+async fn many_files_lake(backend: &Backend) -> anyhow::Result<Lake> {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let lake = backend
+        .lake(0, &["CREATE TABLE lake.t (id BIGINT)"])
+        .await?;
+    let staged = lake.dir.path().join("staged");
+    std::fs::create_dir_all(&staged)?;
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    for id in 0..LISTED_FILES {
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id]))])?;
+        let file = std::fs::File::create(staged.join(format!("{id:05}.parquet")))?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+    lake.run(
+        0,
+        &[&format!(
+            "CALL ducklake_add_data_files('lake', 't', '{}/*.parquet')",
+            staged.display()
+        )],
+    )?;
+    Ok(lake)
+}
+
+/// The ids `SELECT id FROM t` returns, in the order read.
+async fn scanned_ids(caller: &Caller) -> anyhow::Result<Vec<i64>> {
+    let batches = caller
+        .session()?
+        .sql("SELECT id FROM t")
+        .await?
+        .collect()
+        .await?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("id is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect())
+}
+
+/// A merge of every file of the table commits between the first and the
+/// second page of a scan's listing. The merge deletes its sources from the
+/// catalog and registers its output at their snapshot, with a higher id, so a
+/// listing read in two states of the catalog holds the sources of the first
+/// page and the output on the second, and the scan returns the rows of the
+/// first page twice. The table has no inlined rows, so no next file id guards
+/// the listing. Official DuckLake reads a table's files in one statement, in
+/// one metadata transaction.
+///
+/// The scan returns each row once, with or without a memo, whose fill reads
+/// the same pages.
+async fn merge_between_listing_pages(backend: &Backend) -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    for memo in [false, true] {
+        let lake = many_files_lake(backend).await?;
+        let memo = memo.then(|| CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES));
+        let caller = Caller::new(&lake, memo.clone(), false).await?;
+        let counting = caller.counting.clone();
+        let merge = lake.runner(MERGE);
+        caller
+            .counting
+            .before(PAGE, move || counting.before(PAGE, merge));
+        let ids = scanned_ids(&caller).await?;
+        assert!(caller.counting.hook_ran(), "memo {}", memo.is_some());
+        let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+        if ids.len() != distinct.len() || distinct != (0..LISTED_FILES).collect() {
+            wrong.push(format!(
+                "memo {}: {} rows, {} distinct ids, of {LISTED_FILES}",
+                memo.is_some(),
+                ids.len(),
+                distinct.len()
+            ));
+        }
+        // The merge committed: one file now holds every row.
+        let provider = lake.provider().await?;
+        let head = provider.get_current_snapshot()?;
+        let schema = provider
+            .get_schema_by_name("main", head)?
+            .expect("schema main");
+        let table = provider
+            .get_table_by_name(schema.schema_id, "t", head)?
+            .expect("table t");
+        assert_eq!(
+            provider
+                .get_table_files_for_select(table.table_id, head)?
+                .len(),
+            1
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_between_listing_pages_lists_each_row_once() -> anyhow::Result<()> {
+    merge_between_listing_pages(&Backend::Sqlite).await
+}
+
+// ---------------------------------------------------------------------------
+// A flush between a change feed's reads
+// ---------------------------------------------------------------------------
+
+/// 20 rows in a Parquet file, and the deletion of rows 3 and 7 inlined in the
+/// catalog. No inlined rows.
+const INLINED_DELETIONS: &[&str] = &[
+    "CREATE TABLE lake.t (id INT)",
+    "INSERT INTO lake.t SELECT i FROM range(20) r(i)",
+    "DELETE FROM lake.t WHERE id IN (3, 7)",
+];
+
+/// The change feeds over every snapshot of `t`, each as the deletions it shows.
+const DELETION_FEEDS: &[&str] = &[
+    "SELECT id, change_type FROM ducklake_table_deletions('main.t', 0, 1000) ORDER BY id",
+    "SELECT id, change_type FROM ducklake_table_changes('main.t', 0, 1000) \
+     WHERE change_type = 'delete' ORDER BY id",
+];
+
+/// A flush that moves only inlined deletions commits between a change feed's
+/// read of the delete files and its read of the inlined deletions. It writes a
+/// delete file and no data file, so no next data file id can show that it
+/// committed: read in two states of the catalog, the feed finds the deletions
+/// in neither place. Read in one, the feed shows each deletion once.
+async fn flush_between_a_change_feeds_reads(backend: &Backend) -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    for feed in DELETION_FEEDS {
+        let lake = backend.lake(10, INLINED_DELETIONS).await?;
+        let counting = lake.provider().await?;
+        let ctx = SessionContext::new();
+        datafusion_ducklake::register_ducklake_functions(&ctx, Arc::new(counting.clone()));
+        let expected = query(&ctx, feed).await?;
+        assert!(expected.contains("| 3  "), "{feed}\n{expected}");
+        assert!(expected.contains("| 7  "), "{feed}\n{expected}");
+
+        counting.before("get_inlined_file_deletes_between", lake.runner(FLUSH));
+        let rows = query(&ctx, feed).await?;
+        assert!(counting.hook_ran(), "{feed}");
+        if rows != expected {
+            wrong.push(format!("{feed}\n{rows}\nexpected\n{expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_change_feeds_reads_keeps_every_deletion() -> anyhow::Result<()> {
+    flush_between_a_change_feeds_reads(&Backend::Sqlite).await
+}
+
+// ---------------------------------------------------------------------------
 // PostgreSQL metadata
 // ---------------------------------------------------------------------------
 
@@ -1913,6 +2224,18 @@ mod postgres {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_flush_between_a_rowid_lookups_reads_finds_each_row_once() -> anyhow::Result<()> {
         flush_between_a_rowid_lookups_reads(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_between_listing_pages_lists_each_row_once() -> anyhow::Result<()> {
+        merge_between_listing_pages(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flush_between_a_change_feeds_reads_keeps_every_deletion() -> anyhow::Result<()> {
+        flush_between_a_change_feeds_reads(&backend().await?).await
     }
 
     #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]

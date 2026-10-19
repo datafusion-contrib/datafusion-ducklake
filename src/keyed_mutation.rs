@@ -229,12 +229,16 @@ impl DuckLakeTable {
             by_position: true,
         };
         let context = mutation.context(state)?;
-        let mut live: HashMap<i64, DuckLakeTableFile> = self
-            .files()?
+        let (files, inlined_deletes) = self.read_consistently(|table| {
+            Ok::<_, DuckLakeError>((
+                table.files()?,
+                table.inlined_deletes_by_file().map_err(from_df)?,
+            ))
+        })?;
+        let mut live: HashMap<i64, DuckLakeTableFile> = files
             .into_iter()
             .map(|file| (file.data_file_id, file))
             .collect();
-        let inlined_deletes = self.inlined_deletes_by_file().map_err(from_df)?;
         let mut targets = Vec::with_capacity(positions.len());
         let mut seen = std::collections::HashSet::with_capacity(positions.len());
         for (data_file_id, positions) in positions {
@@ -430,11 +434,7 @@ impl<'a> KeyedMutation<'a> {
             return Ok(KeyedMutationResult::default());
         }
         let predicate = keys.predicate(&context.physical_schema, &context.key_indices)?;
-        let inlined_deletes = self.table.inlined_deletes_by_file().map_err(from_df)?;
-        let (inlined, files) = self.table.inlined_rows_then_files(
-            || self.table.files_matching(&predicate.range_or_true()),
-            |file| file.data_file_id,
-        )?;
+        let (inlined_deletes, (inlined, files)) = self.read_rows_and_files(&predicate)?;
         let task_ctx = state.task_ctx();
         let concurrency = self.concurrency(state);
         let table = self.table;
@@ -624,6 +624,31 @@ impl<'a> KeyedMutation<'a> {
         })
     }
 
+    /// The table's inlined deletions, its visible inlined rows, and the files
+    /// whose statistics `predicate`'s key range may match, read in one
+    /// consistent read of the catalog (`DuckLakeTable::read_consistently`).
+    #[allow(clippy::type_complexity)]
+    fn read_rows_and_files(
+        &self,
+        predicate: &KeyPredicate,
+    ) -> crate::Result<(
+        HashMap<i64, std::collections::HashSet<i64>>,
+        (
+            Vec<crate::metadata_provider::DuckLakeInlinedData>,
+            Vec<DuckLakeTableFile>,
+        ),
+    )> {
+        self.table.read_consistently(|table| {
+            Ok((
+                table.inlined_deletes_by_file().map_err(from_df)?,
+                table.inlined_rows_then_files(
+                    || table.files_matching(&predicate.range_or_true()),
+                    |file| file.data_file_id,
+                )?,
+            ))
+        })
+    }
+
     /// Every live row of the table whose key is in `keys`: per data file the
     /// positions not deleted already, and the inlined rows.
     async fn match_rows(
@@ -633,11 +658,7 @@ impl<'a> KeyedMutation<'a> {
         keys: &KeySet,
     ) -> crate::Result<MatchedRows> {
         let predicate = keys.predicate(&context.physical_schema, &context.key_indices)?;
-        let inlined_deletes = self.table.inlined_deletes_by_file().map_err(from_df)?;
-        let (inlined, files) = self.table.inlined_rows_then_files(
-            || self.table.files_matching(&predicate.range_or_true()),
-            |file| file.data_file_id,
-        )?;
+        let (inlined_deletes, (inlined, files)) = self.read_rows_and_files(&predicate)?;
         let combined = predicate.combined();
         let table = self.table;
         let pending: Vec<BoxFuture<'_, DataFusionResult<Option<FileMatch>>>> = files

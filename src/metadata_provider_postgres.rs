@@ -1,19 +1,22 @@
 //! PostgreSQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::catalog_read_transaction::{
+    CatalogConnection, ReadTransaction, catalog_connection, tolerating_failure,
+};
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
     render_inlined_filter,
 };
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
-    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout, MetadataProvider,
-    MetadataSetting, ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, block_on,
-    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
+    DuckLakeInlinedDelete, DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile,
+    DuckLakeTableStatistics, DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout,
+    MetadataProvider, MetadataSetting, ObjectTag, SchemaMetadata, SnapshotChangeMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
+    block_on, inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
     parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
     resolve_metadata_settings,
 };
@@ -38,7 +41,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
@@ -201,6 +204,9 @@ async fn read_postgres_inlined_table(
         next_file_id: None,
     }))
 }
+
+/// The statement that begins a consistent read's transaction on PostgreSQL.
+pub(crate) const CONSISTENT_READ_BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY";
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -391,6 +397,12 @@ struct SchemaCapabilities {
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
     views: bool,
+    /// The `ducklake_file_column_stats` table exists. A listing page carries
+    /// each file's column statistics only when it does.
+    file_column_stats: bool,
+    /// The `ducklake_file_partition_value` table exists. A listing carries
+    /// each file's partition values only when it does.
+    file_partition_values: bool,
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
@@ -417,6 +429,8 @@ impl SchemaCapabilities {
             && self.data_file_partition_id
             && self.inlined_data_tables
             && self.views
+            && self.file_column_stats
+            && self.file_partition_values
     }
 
     /// What the catalog's `ducklake_schema_versions` ledger records.
@@ -1161,6 +1175,84 @@ pub(crate) fn stats_filter_sql(
     })
 }
 
+/// What a provider knows about one table's inlined-deletion table,
+/// `ducklake_inlined_delete_<table_id>`, which the table's first inlined
+/// deletion creates.
+///
+/// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
+/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Only two things drop the
+/// table once it exists: expiring snapshots, for a table no surviving snapshot
+/// can see, and dropping its catalog from a multicatalog store. Table ids are
+/// never reused, so a dropped one is never created again, and "exists" can go
+/// stale only for a table no surviving snapshot reads. A read that finds it
+/// gone reads no deletions, and `get_inlined_deletes` then forgets the entry.
+/// "Absent" holds for reads at or below the catalog's head at the time of the
+/// check: a deletion committed later takes a snapshot above that head, which
+/// such a read does not see.
+///
+/// Official reads only committed snapshots, so its check is always at or below
+/// the head. This crate also accepts a snapshot above the head (for example
+/// from `DuckLakeCatalog::with_snapshot`), and a later commit can still create
+/// that snapshot. So absence is recorded up to the lower of the snapshot read
+/// and the head, never above the head.
+#[derive(Debug, Clone, Copy)]
+enum InlinedDeletionTable {
+    Exists,
+    AbsentThrough(i64),
+}
+
+/// A provider's memo of [`InlinedDeletionTable`]s, by table id.
+///
+/// It lets a read of a table without inlined deletions skip the table instead
+/// of reading a missing one, a statement that fails: inside a consistent read,
+/// a failed statement ends the read's transaction.
+#[derive(Debug, Default)]
+pub(crate) struct InlinedDeletionTables(Mutex<HashMap<i64, InlinedDeletionTable>>);
+
+impl InlinedDeletionTables {
+    /// The memo, locked. It is never held across a catalog read.
+    fn tables(&self) -> MutexGuard<'_, HashMap<i64, InlinedDeletionTable>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `table_id`'s inlined-deletion table exists for a read at
+    /// `snapshot_id`, when the memo can tell.
+    pub(crate) fn known(&self, table_id: i64, snapshot_id: i64) -> Option<bool> {
+        match self.tables().get(&table_id).copied() {
+            Some(InlinedDeletionTable::Exists) => Some(true),
+            Some(InlinedDeletionTable::AbsentThrough(seen)) if snapshot_id <= seen => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Record a check that found the table, or did not, for a read at
+    /// `snapshot_id`, with the catalog's head read in the same statement.
+    pub(crate) fn record(&self, table_id: i64, snapshot_id: i64, exists: bool, head: i64) {
+        // Commits take their snapshots in commit order, each above the last,
+        // so any deletion committed after the check has a snapshot above
+        // `head`.
+        let absent_through = snapshot_id.min(head);
+        let mut tables = self.tables();
+        let entry = tables
+            .entry(table_id)
+            .or_insert(InlinedDeletionTable::AbsentThrough(absent_through));
+        *entry = match (*entry, exists) {
+            // A read beside this one may already have seen the table.
+            (_, true) | (InlinedDeletionTable::Exists, false) => InlinedDeletionTable::Exists,
+            (InlinedDeletionTable::AbsentThrough(seen), false) => {
+                InlinedDeletionTable::AbsentThrough(seen.max(absent_through))
+            },
+        };
+    }
+
+    /// Forget `table_id`'s table: a read found it gone.
+    pub(crate) fn forget(&self, table_id: i64) {
+        self.tables().remove(&table_id);
+    }
+}
+
 /// PostgreSQL-based metadata provider for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct PostgresMetadataProvider {
@@ -1168,6 +1260,12 @@ pub struct PostgresMetadataProvider {
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    // Each table's inlined-deletion table, by table id, as far as this provider
+    // has looked (see `InlinedDeletionTable`). Shared across clones.
+    inlined_deletion_tables: Arc<InlinedDeletionTables>,
+    // The consistent read every catalog read runs on, when this provider is
+    // bound to one (see `MetadataProvider::begin_consistent_read`).
+    read: Option<Arc<ReadTransaction<Postgres>>>,
 }
 
 impl PostgresMetadataProvider {
@@ -1182,6 +1280,8 @@ impl PostgresMetadataProvider {
         Ok(Self {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
+            inlined_deletion_tables: Arc::default(),
+            read: None,
         })
     }
 
@@ -1202,7 +1302,48 @@ impl PostgresMetadataProvider {
         Self {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
+            inlined_deletion_tables: Arc::default(),
+            read: None,
         }
+    }
+
+    /// The connection for one catalog statement: the consistent read's while
+    /// this provider is bound to an open one, else one from the pool. See
+    /// [`catalog_connection`] for how long to hold it.
+    async fn connection(
+        &self,
+    ) -> std::result::Result<CatalogConnection<'_, Postgres>, sqlx::Error> {
+        catalog_connection(self.read.as_deref(), &self.pool).await
+    }
+
+    /// Whether `table_id`'s inlined-deletion table, named `table`, exists for a
+    /// read at `snapshot_id`.
+    ///
+    /// The memo answers when it can (see `InlinedDeletionTable`). Otherwise
+    /// `to_regclass` is asked. Unlike a read of a missing table, it raises no
+    /// error, so reading a table without inlined deletions never issues a
+    /// failing statement.
+    async fn inlined_deletion_table_exists(
+        &self,
+        table_id: i64,
+        table: &str,
+        snapshot_id: i64,
+    ) -> Result<bool> {
+        if let Some(exists) = self.inlined_deletion_tables.known(table_id, snapshot_id) {
+            return Ok(exists);
+        }
+        // The head is read in the same statement as the check, so both describe
+        // one state of the catalog.
+        let (exists, head): (bool, i64) = sqlx::query_as(
+            "SELECT to_regclass($1) IS NOT NULL,
+                    (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot)",
+        )
+        .bind(table)
+        .fetch_one(&mut *self.connection().await?)
+        .await?;
+        self.inlined_deletion_tables
+            .record(table_id, snapshot_id, exists, head);
+        Ok(exists)
     }
 
     /// The registered inlined-data tables of `table_id`; none on a catalog
@@ -1211,7 +1352,7 @@ impl PostgresMetadataProvider {
         if !self.schema_capabilities().await?.inlined_data_tables {
             return Ok(Vec::new());
         }
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.connection().await?;
         registered_inlined_tables_on(&mut connection, table_id).await
     }
 
@@ -1229,7 +1370,7 @@ impl PostgresMetadataProvider {
         if !caps.inlined_data_tables {
             return Ok(Vec::new());
         }
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.connection().await?;
         read_inlined_rows_on(
             &mut connection,
             caps.ledger().into(),
@@ -1270,7 +1411,19 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -1285,9 +1438,11 @@ impl PostgresMetadataProvider {
                current_setting('server_version_num')::int >= 120000,
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_schema_versions'
-                         AND column_name = 'table_id')",
+                         AND column_name = 'table_id'),
+               to_regclass('ducklake_file_column_stats') IS NOT NULL,
+               to_regclass('ducklake_file_partition_value') IS NOT NULL",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *self.connection().await?)
         .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.0,
@@ -1297,6 +1452,8 @@ impl PostgresMetadataProvider {
             data_file_partition_id: row.3,
             inlined_data_tables: row.4,
             views: row.5,
+            file_column_stats: row.9,
+            file_partition_values: row.10,
             soft_input_validation: row.6,
             materialized_cte: row.7,
         };
@@ -1401,16 +1558,18 @@ impl PostgresMetadataProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let rows = match fetch_data_file_page(
-                &self.pool,
-                &listing_sql(stats_sql.as_ref()),
-                table_id,
-                snapshot_id,
-                after,
-                limit,
-            )
-            .await
-            {
+            let first = {
+                let sql = listing_sql(stats_sql.as_ref());
+                let mut connection = self.connection().await?;
+                // Only the narrowed query's failure is tolerated below.
+                let savepoint = stats_sql.is_some() && connection.in_read();
+                tolerating_failure(&mut connection, savepoint, async |connection| {
+                    fetch_data_file_page(connection, &sql, table_id, snapshot_id, after, limit)
+                        .await
+                })
+                .await
+            };
+            let rows = match first {
                 Ok(rows) => rows,
                 // The filter is advisory, so a catalog the narrowed query
                 // cannot run — one predating `ducklake_file_column_stats`,
@@ -1424,7 +1583,7 @@ impl PostgresMetadataProvider {
                 Err(error) if stats_sql.is_some() => {
                     crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                     fetch_data_file_page(
-                        &self.pool,
+                        &mut *self.connection().await?,
                         &listing_sql(None),
                         table_id,
                         snapshot_id,
@@ -1489,7 +1648,15 @@ impl PostgresMetadataProvider {
             if let Some(ids) = page_ids.as_deref() {
                 statistics_query = statistics_query.bind(ids);
             }
-            let statistics = match statistics_query.fetch_all(&self.pool).await {
+            // A catalog without the table has no statistics. Asking for them
+            // would fail, which inside a consistent read ends its transaction.
+            let statistics = match if caps.file_column_stats {
+                statistics_query
+                    .fetch_all(&mut *self.connection().await?)
+                    .await
+            } else {
+                Ok(Vec::new())
+            } {
                 Ok(rows) => rows
                     .into_iter()
                     .map(|row| {
@@ -1532,7 +1699,13 @@ impl PostgresMetadataProvider {
             if let Some(ids) = page_ids.as_deref() {
                 partition_values_query = partition_values_query.bind(ids);
             }
-            match partition_values_query.fetch_all(&self.pool).await {
+            match if caps.file_partition_values {
+                partition_values_query
+                    .fetch_all(&mut *self.connection().await?)
+                    .await
+            } else {
+                Ok(Vec::new())
+            } {
                 Ok(rows) => {
                     for row in rows {
                         let data_file_id: i64 = row.try_get(0)?;
@@ -1567,10 +1740,29 @@ impl PostgresMetadataProvider {
 }
 
 impl MetadataProvider for PostgresMetadataProvider {
+    /// One pooled connection inside `BEGIN ISOLATION LEVEL REPEATABLE READ,
+    /// READ ONLY`, whose snapshot the first read fixes.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        if self.read.is_some() {
+            return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
+        }
+        let read = Arc::new(block_on(ReadTransaction::begin(
+            &self.pool,
+            &[CONSISTENT_READ_BEGIN],
+        ))?);
+        let provider = Self {
+            read: Some(Arc::clone(&read)),
+            ..self.clone()
+        };
+        Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
+            Ok(block_on(read.commit())?)
+        })))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *self.connection().await?)
                 .await?;
             Ok(row.try_get(0)?)
         })
@@ -1600,11 +1792,11 @@ impl MetadataProvider for PostgresMetadataProvider {
                  AND table_name = 'ducklake_metadata' \
                  AND column_name IN ('scope', 'scope_id')",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
             let rows = if has_scope_columns {
                 sqlx::query("SELECT key, value, scope, scope_id FROM ducklake_metadata")
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await?
                     .into_iter()
                     .map(|row| {
@@ -1618,7 +1810,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .collect::<Result<Vec<_>>>()?
             } else {
                 sqlx::query("SELECT key, value FROM ducklake_metadata")
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await?
                     .into_iter()
                     .map(|row| {
@@ -1642,7 +1834,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  FROM ducklake_snapshot s
                  ORDER BY s.snapshot_id",
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1678,7 +1870,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(from_snapshot)
             .bind(through_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?)
         })
     }
@@ -1703,7 +1895,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(after_snapshot)
             .bind(through_snapshot)
             .bind(pattern)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?)
         })
     }
@@ -1722,7 +1914,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                    ON changes.snapshot_id = snapshot.snapshot_id
                  ORDER BY snapshot.snapshot_id",
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1757,7 +1949,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(needle)
             .bind(needle)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
@@ -1772,7 +1964,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1799,7 +1991,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(schema_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1830,7 +2022,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(schema_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter().map(|row| decode_view(&row)).collect()
@@ -1855,7 +2047,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             let raw: Result<Vec<(DuckLakeTableColumn, Option<i64>)>> = rows
@@ -1897,7 +2089,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             rows.into_iter()
                 .map(|row| {
@@ -1926,7 +2118,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  ORDER BY name.parent_column NULLS FIRST, name.column_id",
             )
             .bind(mapping_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             decode_name_mapping_rows(mapping_id, &rows)
         })
@@ -2006,7 +2198,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await?;
 
             let mut files: Vec<DuckLakeTableFile> = rows
@@ -2018,8 +2210,9 @@ impl MetadataProvider for PostgresMetadataProvider {
             // through this path and must group by, and preserve, each file's exact
             // partition — without the values it would merge across partitions and
             // strip the assignment. Scoped by the fetched id range; a catalog
-            // predating partition support simply yields no rows.
-            if let (Some(min), Some(max)) = (
+            // predating partition support has no values to read.
+            if let (true, Some(min), Some(max)) = (
+                caps.file_partition_values,
                 files.iter().map(|f| f.data_file_id).min(),
                 files.iter().map(|f| f.data_file_id).max(),
             ) {
@@ -2032,7 +2225,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                 .bind(table_id)
                 .bind(min)
                 .bind(max)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await
                 {
                     Ok(rows) => {
@@ -2069,7 +2262,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                 "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1",
             )
             .bind(table_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await
             {
                 Ok(count) => count,
@@ -2090,7 +2283,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows,
@@ -2128,7 +2321,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows,
@@ -2184,7 +2377,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  FROM ducklake_table_stats WHERE table_id = $1",
             )
             .bind(table_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await
             {
                 Ok(row) => row
@@ -2225,7 +2418,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -2250,14 +2443,14 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
             let columns = match sqlx::query(
                 "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
             )
             .bind(table_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -2293,7 +2486,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  FROM ducklake_table_stats WHERE table_id = $1",
             )
             .bind(table_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await
             {
                 Ok(row) => row
@@ -2313,7 +2506,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  FROM ducklake_table_column_stats WHERE table_id = $1",
             )
             .bind(table_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -2355,7 +2548,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -2422,7 +2615,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             if !caps.inlined_data_tables {
                 return Ok(InlinedScanRead::default());
             }
-            let mut connection = self.pool.acquire().await?;
+            let mut connection = self.connection().await?;
             scan_inlined_data_on(
                 &mut connection,
                 caps.ledger().into(),
@@ -2472,7 +2665,7 @@ impl MetadataProvider for PostgresMetadataProvider {
         let tables = block_on(self.registered_inlined_tables(table_id))?;
         let ledger: InlinedVersionLookup = block_on(self.schema_capabilities())?.ledger().into();
         block_on(async {
-            let mut connection = self.pool.acquire().await?;
+            let mut connection = self.connection().await?;
             let mut oldest: Option<i64> = None;
             for table in &tables {
                 let first = first_inlined_snapshot_on(&mut connection, table, snapshot_id).await?;
@@ -2500,7 +2693,7 @@ impl MetadataProvider for PostgresMetadataProvider {
         let mut flushed = Vec::new();
         for table in tables {
             let version = block_on(async {
-                let mut connection = self.pool.acquire().await?;
+                let mut connection = self.connection().await?;
                 if first_inlined_snapshot_on(&mut connection, &table, snapshot_id)
                     .await?
                     .is_none()
@@ -2514,7 +2707,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             };
             let columns = self.get_table_structure(table_id, version)?;
             let rows = block_on(async {
-                let mut connection = self.pool.acquire().await?;
+                let mut connection = self.connection().await?;
                 inlined_table_for_flush_on(
                     &mut connection,
                     ledger,
@@ -2541,8 +2734,15 @@ impl MetadataProvider for PostgresMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+        let table = inlined_delete_table_name(table_id)?;
         block_on(async {
-            let mut connection = self.pool.acquire().await?;
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, snapshot_id)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            let mut connection = self.connection().await?;
             inlined_file_deletes_for_flush_on(&mut connection, table_id, snapshot_id).await
         })
     }
@@ -2553,8 +2753,15 @@ impl MetadataProvider for PostgresMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
+        let table = inlined_delete_table_name(table_id)?;
         block_on(async {
-            let mut connection = self.pool.acquire().await?;
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            let mut connection = self.connection().await?;
             inlined_file_deletes_between_on(&mut connection, table_id, start_snapshot, end_snapshot)
                 .await
         })
@@ -2562,7 +2769,7 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
         block_on(async {
-            let mut connection = self.pool.acquire().await?;
+            let mut connection = self.connection().await?;
             delete_file_begin_snapshot_on(&mut connection, delete_file_id).await
         })
     }
@@ -2574,15 +2781,21 @@ impl MetadataProvider for PostgresMetadataProvider {
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
         block_on(async {
             let table = inlined_delete_table_name(table_id)?;
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, snapshot_id)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
             let sql = format!(
                 "SELECT file_id, row_id FROM {} WHERE begin_snapshot <= $1 ORDER BY file_id, row_id",
                 quote_ident(&table)
             );
-            match sqlx::query(AssertSqlSafe(sql.as_str()))
+            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
-                .await
-            {
+                .fetch_all(&mut *self.connection().await?)
+                .await;
+            match rows {
                 Ok(rows) => rows
                     .into_iter()
                     .map(|row| {
@@ -2592,7 +2805,13 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .collect(),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                // The table was seen, and is gone: expire dropped it with a
+                // table no surviving snapshot sees (see `InlinedDeletionTable`).
+                // A missing table holds no deletions to apply.
+                Err(error) if is_missing_statistics_table(&error) => {
+                    self.inlined_deletion_tables.forget(table_id);
+                    Ok(Vec::new())
+                },
                 Err(error) => Err(error.into()),
             }
         })
@@ -2609,7 +2828,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             match row {
@@ -2642,7 +2861,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             match row {
@@ -2679,7 +2898,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             row.map(|row| decode_view(&row)).transpose()
@@ -2701,7 +2920,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
 
             Ok(row.try_get(0)?)
@@ -2725,7 +2944,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         .bind(object_id)
                         .bind(snapshot_id)
                         .bind(snapshot_id)
-                        .fetch_all(&self.pool)
+                        .fetch_all(&mut *self.connection().await?)
                         .await
                     },
                     TagTarget::Column {
@@ -2741,7 +2960,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .bind(column_id)
                     .bind(snapshot_id)
                     .bind(snapshot_id)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await,
                 };
             let rows = match result {
@@ -2778,7 +2997,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await;
             match result {
                 Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
@@ -2805,7 +3024,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                 snapshot_id,
                 4
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -2843,7 +3062,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                  ORDER BY s.schema_name, v.view_name",
             )
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             rows.into_iter()
                 .map(|row| {
@@ -2887,7 +3106,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             let raw: Result<Vec<(ColumnWithTable, Option<i64>)>> = rows
@@ -2935,7 +3154,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await;
             let rows = match result {
                 Ok(rows) => rows,
@@ -2970,7 +3189,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await;
             let rows = match result {
                 Ok(rows) => rows,
@@ -3037,7 +3256,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -3124,7 +3343,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -3258,7 +3477,7 @@ WHERE data.table_id = $1
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()

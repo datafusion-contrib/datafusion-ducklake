@@ -593,30 +593,44 @@ impl TableProvider for TableDeletionsTable {
         _filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Get delete files added between snapshots
-        let delete_files = self
-            .provider
-            .get_delete_files_added_between_snapshots(
-                self.table_id,
-                self.start_snapshot,
-                self.end_snapshot,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
         // The columns as of the window's END snapshot, carrying the field ids the
         // per-file read schemas are built from — official DuckLake resolves a
         // change feed against exactly that generation of the schema.
         let columns = self.resolve_columns()?;
 
-        // Deletions stored in the catalog: inlined rows deleted or superseded in
-        // the window, and inlined deletions of Parquet-resident rows.
+        // The delete files added in the window, and the deletions stored in the
+        // catalog (inlined rows deleted or superseded in the window, and
+        // inlined deletions of Parquet-resident rows), read in one consistent
+        // read of the catalog (`MetadataProvider::begin_consistent_read`): a
+        // flush that commits meanwhile moves inlined deletions into delete
+        // files, and separate reads could see them in both places or in
+        // neither.
         let window = (self.start_snapshot, self.end_snapshot);
-        let inlined_rows =
-            InlinedChanges::read_deletes(self.provider.as_ref(), self.table_id, &columns, window)?;
-        let inlined_file_deletes = self
-            .provider
-            .get_inlined_file_deletes_between(self.table_id, self.start_snapshot, self.end_snapshot)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let (delete_files, inlined_rows, inlined_file_deletes) =
+            crate::metadata_provider::read_consistently(&self.provider, |provider| {
+                let external = |e| DataFusionError::External(Box::new(e));
+                let delete_files = provider
+                    .get_delete_files_added_between_snapshots(
+                        self.table_id,
+                        self.start_snapshot,
+                        self.end_snapshot,
+                    )
+                    .map_err(external)?;
+                let inlined_rows = InlinedChanges::read_deletes(
+                    provider.as_ref(),
+                    self.table_id,
+                    &columns,
+                    window,
+                )?;
+                let inlined_file_deletes = provider
+                    .get_inlined_file_deletes_between(
+                        self.table_id,
+                        self.start_snapshot,
+                        self.end_snapshot,
+                    )
+                    .map_err(external)?;
+                Ok::<_, DataFusionError>((delete_files, inlined_rows, inlined_file_deletes))
+            })?;
 
         // Handle empty case
         if delete_files.is_empty() && inlined_rows.is_empty() && inlined_file_deletes.is_empty() {

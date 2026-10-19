@@ -18,7 +18,7 @@ use arrow::record_batch::RecordBatch;
 use crate::Result;
 use crate::inlined_filter::{InlinedDataScan, InlinedFilter, InlinedScanRead};
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange, DuckLakeFileData,
     DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     DuckLakeNameMapping, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableField,
@@ -106,15 +106,22 @@ use crate::table::{SCAN_READ_ATTEMPTS, inlined_rows_kept_moving, written_since};
 /// scans, uses the same reads.
 ///
 /// A fill reads in the order of a scan without a memo: the inlined deletions,
-/// then the inlined rows, then the listing, which it reads again with the rows
-/// when it lists a file a flush wrote since the rows (see
-/// [`DuckLakeInlinedRows::next_file_id`]). The reads are separate statements,
-/// so a commit between two of them can split them. The memo keeps a fill only
-/// when the head after the fill is still the head that the bind read. So every
-/// kept fill shows the catalog at that one head. A query whose own fill a
-/// commit split uses a fill that another query kept at its head, when there is
-/// one. Otherwise it uses its own fill, which then has the same split as a scan
-/// without a memo.
+/// then the inlined rows, then the listing. It reads them in one consistent
+/// read of the wrapped provider ([`MetadataProvider::begin_consistent_read`]):
+/// the scan's, when a scan began one on the bound provider, else one of its
+/// own. So a commit between two of the reads does not split them. A provider
+/// that cannot begin one reads each statement on its own; the fill then reads
+/// the listing again with the rows when it lists a file a flush wrote since
+/// the rows (see [`DuckLakeInlinedRows::next_file_id`]), as a scan does.
+///
+/// The memo keeps a fill only when the head after the fill is still the head
+/// that the bind read. So every kept fill shows the catalog at that one head. A
+/// query whose own fill read another state uses a fill that another query kept
+/// at its head, when there is one, else its own.
+///
+/// A scan's consistent read on the bound provider begins on the wrapped
+/// provider at the first read the memo does not serve, so a scan that the memo
+/// serves whole reads the catalog not at all.
 ///
 /// # One bound provider per query
 ///
@@ -275,7 +282,8 @@ impl CatalogReadMemo {
             memo: Arc::clone(self),
             inner: provider,
             head,
-            picked: Mutex::default(),
+            picked: Arc::default(),
+            consistent: None,
         })
     }
 
@@ -307,8 +315,59 @@ pub struct MemoizedMetadataProvider {
     /// The head the bind read.
     head: i64,
     /// The reads this query uses for each table, or `None` where it reads the
-    /// catalog for that table.
-    picked: Mutex<HashMap<TableKey, Option<Arc<TableReads>>>>,
+    /// catalog for that table. Shared with the providers of the query's
+    /// consistent reads.
+    picked: Arc<Mutex<HashMap<TableKey, Option<Arc<TableReads>>>>>,
+    /// The consistent read of the scan this provider serves, when it serves
+    /// one (see [`MetadataProvider::begin_consistent_read`]).
+    consistent: Option<Arc<LazyRead>>,
+}
+
+/// The consistent read of the wrapped provider that a scan's reads through a
+/// [`MemoizedMetadataProvider`] run in, begun at the first of them.
+struct LazyRead {
+    inner: Arc<dyn MetadataProvider>,
+    state: Mutex<LazyState>,
+}
+
+enum LazyState {
+    NotBegun,
+    Open(ConsistentRead),
+    /// The wrapped provider cannot begin one, or the read has ended: reads go
+    /// to the wrapped provider itself.
+    Direct,
+}
+
+impl LazyRead {
+    /// The provider the scan's reads go through, beginning the read at the
+    /// first call.
+    fn provider(&self) -> Result<Arc<dyn MetadataProvider>> {
+        let mut state = self.state();
+        if let LazyState::NotBegun = *state {
+            *state = match self.inner.begin_consistent_read()? {
+                Some(read) => LazyState::Open(read),
+                None => LazyState::Direct,
+            };
+        }
+        Ok(match &*state {
+            LazyState::Open(read) => Arc::clone(read.provider()),
+            LazyState::NotBegun | LazyState::Direct => Arc::clone(&self.inner),
+        })
+    }
+
+    /// End the read, if it began.
+    fn end(&self) -> Result<()> {
+        match std::mem::replace(&mut *self.state(), LazyState::Direct) {
+            LazyState::Open(read) => read.end(),
+            LazyState::NotBegun | LazyState::Direct => Ok(()),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, LazyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl fmt::Debug for MemoizedMetadataProvider {
@@ -322,6 +381,26 @@ impl fmt::Debug for MemoizedMetadataProvider {
 }
 
 impl MemoizedMetadataProvider {
+    /// The provider a read that the memo does not serve goes to: the wrapped
+    /// provider, inside the consistent read of the scan this provider serves.
+    fn reader(&self) -> Result<Arc<dyn MetadataProvider>> {
+        match &self.consistent {
+            Some(read) => read.provider(),
+            None => Ok(Arc::clone(&self.inner)),
+        }
+    }
+
+    /// This provider, serving the consistent read `consistent`.
+    fn with_consistent(&self, consistent: Option<Arc<LazyRead>>) -> Self {
+        Self {
+            memo: Arc::clone(&self.memo),
+            inner: Arc::clone(&self.inner),
+            head: self.head,
+            picked: Arc::clone(&self.picked),
+            consistent,
+        }
+    }
+
     /// The reads this query uses for `table_id` at `snapshot_id`, or `None`
     /// when the query reads the catalog for that table. The first call of the
     /// query for the table picks them, and later calls get the same answer.
@@ -391,25 +470,46 @@ impl MemoizedMetadataProvider {
     /// file written since the inlined rows reads both again, up to
     /// [`SCAN_READ_ATTEMPTS`] times.
     fn fill(&self, table_id: i64, snapshot_id: i64) -> Result<Option<(TableReads, usize)>> {
+        // Inside a scan's consistent read, the fill reads in it; otherwise in
+        // one of its own.
+        let reader = self.reader()?;
+        crate::metadata_provider::read_consistently(&reader, |reader| {
+            self.fill_from(reader.as_ref(), table_id, snapshot_id)
+        })
+    }
+
+    /// [`Self::fill`], reading through `reader`.
+    fn fill_from(
+        &self,
+        reader: &dyn MetadataProvider,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Option<(TableReads, usize)>> {
         let max_bytes = self.memo.max_bytes;
-        let inlined_deletes = self.inner.get_inlined_deletes(table_id, snapshot_id)?;
+        let inlined_deletes = reader.get_inlined_deletes(table_id, snapshot_id)?;
         let deletes_bytes = inlined_deletes.len() * size_of::<DuckLakeInlinedDelete>();
         if deletes_bytes > max_bytes {
             return Ok(None);
         }
-        let columns = self.columns(table_id, snapshot_id)?;
+        let columns = self.columns(reader, table_id, snapshot_id)?;
         for _ in 0..SCAN_READ_ATTEMPTS {
             let mut bytes = deletes_bytes;
-            let Some(inlined) = self.fill_inlined(table_id, snapshot_id, &columns, &mut bytes)?
+            let Some(inlined) =
+                self.fill_inlined(reader, table_id, snapshot_id, &columns, &mut bytes)?
             else {
                 return Ok(None);
             };
-            let listing =
-                match self.fill_listing(table_id, snapshot_id, inlined.next_file_id, &mut bytes)? {
-                    FillListing::Files(listing) => listing,
-                    FillListing::WrittenSince => continue,
-                    FillListing::OverBudget => return Ok(None),
-                };
+            let listing = match self.fill_listing(
+                reader,
+                table_id,
+                snapshot_id,
+                inlined.next_file_id,
+                &mut bytes,
+            )? {
+                FillListing::Files(listing) => listing,
+                FillListing::WrittenSince => continue,
+                FillListing::OverBudget => return Ok(None),
+            };
             return Ok(Some((
                 TableReads {
                     inlined_deletes,
@@ -430,6 +530,7 @@ impl MemoizedMetadataProvider {
     /// their size to `bytes`. `None` once `bytes` exceed the memo's budget.
     fn fill_inlined(
         &self,
+        reader: &dyn MetadataProvider,
         table_id: i64,
         snapshot_id: i64,
         columns: &Arc<Vec<DuckLakeTableColumn>>,
@@ -452,9 +553,7 @@ impl MemoizedMetadataProvider {
                 next_file_id: None,
             }));
         }
-        let read =
-            self.inner
-                .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, None)?;
+        let read = reader.scan_inlined_data_noting_absence(table_id, snapshot_id, columns, None)?;
         let absent_through = read.absent_through;
         if let Some(through) = absent_through {
             let mut state = self.memo.lock();
@@ -481,7 +580,7 @@ impl MemoizedMetadataProvider {
         let visible_rows = if absent_through.is_some_and(|through| snapshot_id <= through) {
             Some(Vec::new())
         } else {
-            self.inner
+            reader
                 .read_inlined_rows(
                     table_id,
                     columns,
@@ -521,6 +620,7 @@ impl MemoizedMetadataProvider {
     /// its size to `bytes`.
     fn fill_listing(
         &self,
+        reader: &dyn MetadataProvider,
         table_id: i64,
         snapshot_id: i64,
         next_file_id: Option<i64>,
@@ -530,7 +630,7 @@ impl MemoizedMetadataProvider {
         let mut after = None;
         // Page as `DuckLakeTable` does, until a short page.
         loop {
-            let page = self.inner.get_table_file_metadata_page_filtered(
+            let page = reader.get_table_file_metadata_page_filtered(
                 table_id,
                 snapshot_id,
                 after,
@@ -567,7 +667,12 @@ impl MemoizedMetadataProvider {
 
     /// The columns `DuckLakeTable` reads `table_id`'s inlined rows in at
     /// `snapshot_id`: kept from an earlier fill, else read from the catalog.
-    fn columns(&self, table_id: i64, snapshot_id: i64) -> Result<Arc<Vec<DuckLakeTableColumn>>> {
+    fn columns(
+        &self,
+        reader: &dyn MetadataProvider,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Arc<Vec<DuckLakeTableColumn>>> {
         let kept = self
             .memo
             .lock()
@@ -578,7 +683,7 @@ impl MemoizedMetadataProvider {
         if let Some(columns) = kept {
             return Ok(columns);
         }
-        let columns = Arc::new(self.inner.get_table_structure(table_id, snapshot_id)?);
+        let columns = Arc::new(reader.get_table_structure(table_id, snapshot_id)?);
         self.keep_columns(table_id, snapshot_id, Arc::clone(&columns));
         Ok(columns)
     }
@@ -659,12 +764,31 @@ fn file_data_heap_bytes(file: &DuckLakeFileData) -> usize {
 }
 
 impl MetadataProvider for MemoizedMetadataProvider {
+    /// A provider for the reads of one scan, sharing this one's picked reads.
+    /// Its reads of the wrapped provider run in one consistent read of it,
+    /// begun at the first of them: a scan the memo serves whole begins none.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        if self.consistent.is_some() {
+            return Ok(Some(ConsistentRead::within(Arc::new(
+                self.with_consistent(self.consistent.clone()),
+            ))));
+        }
+        let read = Arc::new(LazyRead {
+            inner: Arc::clone(&self.inner),
+            state: Mutex::new(LazyState::NotBegun),
+        });
+        let provider = self.with_consistent(Some(Arc::clone(&read)));
+        Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
+            read.end()
+        })))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
-        self.inner.get_current_snapshot()
+        self.reader()?.get_current_snapshot()
     }
 
     fn get_data_path(&self) -> Result<String> {
-        self.inner.get_data_path()
+        self.reader()?.get_data_path()
     }
 
     fn get_metadata_settings(
@@ -672,31 +796,31 @@ impl MetadataProvider for MemoizedMetadataProvider {
         schema_id: Option<i64>,
         table_id: Option<i64>,
     ) -> Result<HashMap<String, String>> {
-        self.inner.get_metadata_settings(schema_id, table_id)
+        self.reader()?.get_metadata_settings(schema_id, table_id)
     }
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
-        self.inner.list_snapshots()
+        self.reader()?.list_snapshots()
     }
 
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
-        self.inner.list_snapshot_changes()
+        self.reader()?.list_snapshot_changes()
     }
 
     fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
-        self.inner.find_snapshot_by_commit_extra_info(needle)
+        self.reader()?.find_snapshot_by_commit_extra_info(needle)
     }
 
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
-        self.inner.list_schemas(snapshot_id)
+        self.reader()?.list_schemas(snapshot_id)
     }
 
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>> {
-        self.inner.list_tables(schema_id, snapshot_id)
+        self.reader()?.list_tables(schema_id, snapshot_id)
     }
 
     fn list_views(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
-        self.inner.list_views(schema_id, snapshot_id)
+        self.reader()?.list_views(schema_id, snapshot_id)
     }
 
     fn get_table_structure(
@@ -704,15 +828,15 @@ impl MetadataProvider for MemoizedMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableColumn>> {
-        self.inner.get_table_structure(table_id, snapshot_id)
+        self.reader()?.get_table_structure(table_id, snapshot_id)
     }
 
     fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
-        self.inner.get_table_fields(table_id, snapshot_id)
+        self.reader()?.get_table_fields(table_id, snapshot_id)
     }
 
     fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
-        self.inner.get_name_mapping(mapping_id)
+        self.reader()?.get_name_mapping(mapping_id)
     }
 
     fn get_table_files_for_select(
@@ -720,19 +844,20 @@ impl MetadataProvider for MemoizedMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>> {
-        self.inner.get_table_files_for_select(table_id, snapshot_id)
+        self.reader()?
+            .get_table_files_for_select(table_id, snapshot_id)
     }
 
     fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
-        self.inner.get_partition_spec(table_id, snapshot_id)
+        self.reader()?.get_partition_spec(table_id, snapshot_id)
     }
 
     fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
-        self.inner.get_sort_spec(table_id, snapshot_id)
+        self.reader()?.get_sort_spec(table_id, snapshot_id)
     }
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
-        self.inner.get_table_statistics(table_id, snapshot_id)
+        self.reader()?.get_table_statistics(table_id, snapshot_id)
     }
 
     fn get_table_summary_statistics(
@@ -740,7 +865,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
-        self.inner
+        self.reader()?
             .get_table_summary_statistics(table_id, snapshot_id)
     }
 
@@ -753,7 +878,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
     ) -> Result<Vec<DuckLakeFileMetadata>> {
         match self.table_reads(table_id, snapshot_id)? {
             Some(reads) => Ok(listing_page(&reads.listing, after_data_file_id, limit)),
-            None => self.inner.get_table_file_metadata_page(
+            None => self.reader()?.get_table_file_metadata_page(
                 table_id,
                 snapshot_id,
                 after_data_file_id,
@@ -773,7 +898,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
         // The filter is advisory: the whole listing is a correct answer.
         match self.table_reads(table_id, snapshot_id)? {
             Some(reads) => Ok(listing_page(&reads.listing, after_data_file_id, limit)),
-            None => self.inner.get_table_file_metadata_page_filtered(
+            None => self.reader()?.get_table_file_metadata_page_filtered(
                 table_id,
                 snapshot_id,
                 after_data_file_id,
@@ -789,7 +914,8 @@ impl MetadataProvider for MemoizedMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
-        self.inner.get_inlined_data(table_id, snapshot_id, columns)
+        self.reader()?
+            .get_inlined_data(table_id, snapshot_id, columns)
     }
 
     fn scan_inlined_data(
@@ -828,7 +954,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
             // The next fill reads the rows in the scan's own columns.
             self.keep_columns(table_id, snapshot_id, Arc::new(columns.to_vec()));
         }
-        self.inner
+        self.reader()?
             .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)
     }
 
@@ -839,12 +965,13 @@ impl MetadataProvider for MemoizedMetadataProvider {
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
         match self.table_reads(table_id, snapshot_id)? {
             Some(reads) => Ok(reads.inlined_deletes.clone()),
-            None => self.inner.get_inlined_deletes(table_id, snapshot_id),
+            None => self.reader()?.get_inlined_deletes(table_id, snapshot_id),
         }
     }
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
-        self.inner.get_delete_file_begin_snapshot(delete_file_id)
+        self.reader()?
+            .get_delete_file_begin_snapshot(delete_file_id)
     }
 
     fn get_inlined_data_with_row_ids(
@@ -853,7 +980,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        self.inner
+        self.reader()?
             .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)
     }
 
@@ -862,7 +989,8 @@ impl MetadataProvider for MemoizedMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFlushData>> {
-        self.inner.get_inlined_data_for_flush(table_id, snapshot_id)
+        self.reader()?
+            .get_inlined_data_for_flush(table_id, snapshot_id)
     }
 
     fn get_inlined_file_deletes_for_flush(
@@ -870,7 +998,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
-        self.inner
+        self.reader()?
             .get_inlined_file_deletes_for_flush(table_id, snapshot_id)
     }
 
@@ -892,7 +1020,7 @@ impl MetadataProvider for MemoizedMetadataProvider {
                 return Ok(rows.clone());
             }
         }
-        self.inner
+        self.reader()?
             .read_inlined_rows(table_id, columns, selection, filter)
     }
 
@@ -902,16 +1030,16 @@ impl MetadataProvider for MemoizedMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
-        self.inner
+        self.reader()?
             .get_inlined_file_deletes_between(table_id, start_snapshot, end_snapshot)
     }
 
     fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
-        self.inner.get_table_row_count(table_id, snapshot_id)
+        self.reader()?.get_table_row_count(table_id, snapshot_id)
     }
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
-        self.inner.get_schema_by_name(name, snapshot_id)
+        self.reader()?.get_schema_by_name(name, snapshot_id)
     }
 
     fn get_table_by_name(
@@ -920,7 +1048,8 @@ impl MetadataProvider for MemoizedMetadataProvider {
         name: &str,
         snapshot_id: i64,
     ) -> Result<Option<TableMetadata>> {
-        self.inner.get_table_by_name(schema_id, name, snapshot_id)
+        self.reader()?
+            .get_table_by_name(schema_id, name, snapshot_id)
     }
 
     fn get_view_by_name(
@@ -929,15 +1058,16 @@ impl MetadataProvider for MemoizedMetadataProvider {
         name: &str,
         snapshot_id: i64,
     ) -> Result<Option<ViewMetadata>> {
-        self.inner.get_view_by_name(schema_id, name, snapshot_id)
+        self.reader()?
+            .get_view_by_name(schema_id, name, snapshot_id)
     }
 
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
-        self.inner.table_exists(schema_id, name, snapshot_id)
+        self.reader()?.table_exists(schema_id, name, snapshot_id)
     }
 
     fn get_tags(&self, target: TagTarget, snapshot_id: i64) -> Result<Vec<DuckLakeTag>> {
-        self.inner.get_tags(target, snapshot_id)
+        self.reader()?.get_tags(target, snapshot_id)
     }
 
     fn get_view_id_by_name(
@@ -946,31 +1076,32 @@ impl MetadataProvider for MemoizedMetadataProvider {
         name: &str,
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
-        self.inner.get_view_id_by_name(schema_id, name, snapshot_id)
+        self.reader()?
+            .get_view_id_by_name(schema_id, name, snapshot_id)
     }
 
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
-        self.inner.list_all_tables(snapshot_id)
+        self.reader()?.list_all_tables(snapshot_id)
     }
 
     fn list_all_views(&self, snapshot_id: i64) -> Result<Vec<ViewWithSchema>> {
-        self.inner.list_all_views(snapshot_id)
+        self.reader()?.list_all_views(snapshot_id)
     }
 
     fn list_all_columns(&self, snapshot_id: i64) -> Result<Vec<ColumnWithTable>> {
-        self.inner.list_all_columns(snapshot_id)
+        self.reader()?.list_all_columns(snapshot_id)
     }
 
     fn list_all_object_tags(&self, snapshot_id: i64) -> Result<Vec<ObjectTag>> {
-        self.inner.list_all_object_tags(snapshot_id)
+        self.reader()?.list_all_object_tags(snapshot_id)
     }
 
     fn list_all_column_tags(&self, snapshot_id: i64) -> Result<Vec<ColumnTag>> {
-        self.inner.list_all_column_tags(snapshot_id)
+        self.reader()?.list_all_column_tags(snapshot_id)
     }
 
     fn list_all_files(&self, snapshot_id: i64) -> Result<Vec<FileWithTable>> {
-        self.inner.list_all_files(snapshot_id)
+        self.reader()?.list_all_files(snapshot_id)
     }
 
     fn get_data_files_added_between_snapshots(
@@ -979,8 +1110,11 @@ impl MetadataProvider for MemoizedMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>> {
-        self.inner
-            .get_data_files_added_between_snapshots(table_id, start_snapshot, end_snapshot)
+        self.reader()?.get_data_files_added_between_snapshots(
+            table_id,
+            start_snapshot,
+            end_snapshot,
+        )
     }
 
     fn get_delete_files_added_between_snapshots(
@@ -989,8 +1123,11 @@ impl MetadataProvider for MemoizedMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<DeleteFileChange>> {
-        self.inner
-            .get_delete_files_added_between_snapshots(table_id, start_snapshot, end_snapshot)
+        self.reader()?.get_delete_files_added_between_snapshots(
+            table_id,
+            start_snapshot,
+            end_snapshot,
+        )
     }
 
     fn list_table_snapshot_changes(
@@ -999,12 +1136,12 @@ impl MetadataProvider for MemoizedMetadataProvider {
         after_snapshot: i64,
         through_snapshot: i64,
     ) -> Result<Vec<(i64, Option<String>)>> {
-        self.inner
+        self.reader()?
             .list_table_snapshot_changes(table_id, after_snapshot, through_snapshot)
     }
 
     fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
-        self.inner
+        self.reader()?
             .snapshot_ids_between(from_snapshot, through_snapshot)
     }
 
@@ -1013,11 +1150,11 @@ impl MetadataProvider for MemoizedMetadataProvider {
     }
 
     fn table_first_snapshot(&self, table_id: i64) -> Result<Option<i64>> {
-        self.inner.table_first_snapshot(table_id)
+        self.reader()?.table_first_snapshot(table_id)
     }
 
     fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
-        self.inner
+        self.reader()?
             .oldest_inlined_row_snapshot(table_id, snapshot_id)
     }
 }

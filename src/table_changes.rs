@@ -1466,43 +1466,51 @@ impl TableProvider for TableChangesTable {
         // change feed against exactly that generation of the schema.
         let columns = self.resolve_columns()?;
 
-        // Get data files added between snapshots (INSERT changes)
-        let data_files = self
-            .provider
-            .get_data_files_added_between_snapshots(
-                self.table_id,
-                self.start_snapshot,
-                self.end_snapshot,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // Deletes applied in the window surface as `delete` rows (and pair into
-        // update preimages), so they participate in both the empty check and
-        // the path decision — a delete-only window is NOT empty. The insertions
-        // feed never reads the delete side.
-        let delete_files = if self.insertions_only {
-            Vec::new()
-        } else {
-            self.provider
-                .get_delete_files_added_between_snapshots(
+        // The data files and delete files added in the window, and the row
+        // versions stored in the catalog rather than in Parquet, read in one
+        // consistent read of the catalog
+        // (`MetadataProvider::begin_consistent_read`): a flush that commits
+        // meanwhile moves inlined rows or deletions into files, and separate
+        // reads could see them in both places or in neither.
+        let (data_files, delete_files, inlined) =
+            crate::metadata_provider::read_consistently(&self.provider, |provider| {
+                let external = |e| DataFusionError::External(Box::new(e));
+                // INSERT changes.
+                let data_files = provider
+                    .get_data_files_added_between_snapshots(
+                        self.table_id,
+                        self.start_snapshot,
+                        self.end_snapshot,
+                    )
+                    .map_err(external)?;
+                // Deletes applied in the window surface as `delete` rows (and
+                // pair into update preimages), so they participate in both the
+                // empty check and the path decision — a delete-only window is
+                // NOT empty. The insertions feed never reads the delete side.
+                let delete_files = if self.insertions_only {
+                    Vec::new()
+                } else {
+                    provider
+                        .get_delete_files_added_between_snapshots(
+                            self.table_id,
+                            self.start_snapshot,
+                            self.end_snapshot,
+                        )
+                        .map_err(external)?
+                };
+                // Inlined inserts, inlined rows deleted or superseded in the
+                // window, and inlined deletions of Parquet-resident rows. Each
+                // carries its own row id and snapshot, so none of them depends
+                // on scan order.
+                let inlined = InlinedChanges::read(
+                    provider.as_ref(),
                     self.table_id,
-                    self.start_snapshot,
-                    self.end_snapshot,
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-        };
-
-        // Row versions stored in the catalog rather than in Parquet: inlined
-        // inserts, inlined rows deleted or superseded in the window, and inlined
-        // deletions of Parquet-resident rows. Each carries its own row id and
-        // snapshot, so none of them depends on scan order.
-        let inlined = InlinedChanges::read(
-            self.provider.as_ref(),
-            self.table_id,
-            &columns,
-            (self.start_snapshot, self.end_snapshot),
-            !self.insertions_only,
-        )?;
+                    &columns,
+                    (self.start_snapshot, self.end_snapshot),
+                    !self.insertions_only,
+                )?;
+                Ok::<_, DataFusionError>((data_files, delete_files, inlined))
+            })?;
 
         // Handle empty case
         if data_files.is_empty() && delete_files.is_empty() && inlined.is_empty() {
