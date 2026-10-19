@@ -1143,7 +1143,7 @@ impl MetadataProvider for SqliteMetadataProvider {
     /// read holds a shared lock until it ends, so a writer's commit waits for
     /// it (for up to the writer's busy timeout).
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
-        if self.read.is_some() {
+        if self.read.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
         let read = Arc::new(block_on(ReadTransaction::begin(&self.pool, &["BEGIN"]))?);

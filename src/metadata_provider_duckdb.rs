@@ -1377,10 +1377,10 @@ impl MetadataProvider for DuckdbMetadataProvider {
     /// the snapshot it began with. The shared connection, and a writer on it,
     /// are not held.
     ///
-    /// DuckDB has no savepoints, and a statement that fails while it runs (not
-    /// one that names a missing table) ends the transaction. So inside a
-    /// consistent read, a statistics-narrowed listing that fails while it runs
-    /// fails the read; outside one, the page is listed again unnarrowed.
+    /// A statement that fails while it runs (not one that names a missing
+    /// table) ends DuckDB's transaction. So inside a consistent read, a
+    /// statistics-narrowed listing that fails while it runs fails the read;
+    /// outside one, the page is listed again unnarrowed.
     fn begin_consistent_read(&self) -> crate::Result<Option<ConsistentRead>> {
         if self
             .read_open

@@ -3335,17 +3335,36 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// its output both, and a flush between two reads moves rows or deletions
     /// out of both.
     ///
-    /// A provider already bound to a consistent read returns
+    /// A provider already bound to an open consistent read returns
     /// [`ConsistentRead::within`] itself, so a caller inside a read shares it.
+    /// A provider bound to a read that has ended begins a new one.
     ///
     /// The default returns `None`: each read sees the catalog as of its own
     /// statement. A scan then checks its listing against the next data file id
     /// read with its inlined rows ([`DuckLakeInlinedRows::next_file_id`]) and
     /// reads both again when a flush wrote a file since, as official DuckLake
     /// does where each statement commits on its own
-    /// (`DuckLakeMultiFileList::ReadCommittedFiles`). That check does not see a
-    /// merge between two listing pages, nor a flush that moves only inlined
-    /// deletions.
+    /// (`DuckLakeMultiFileList::ReadCommittedFiles` under
+    /// `CommitsEachStatement`, in official DuckLake newer than the extension
+    /// DuckDB 1.5.5 loads). That check does not see a merge between two
+    /// listing pages, nor a flush that moves only inlined deletions.
+    ///
+    /// # Wrapping providers
+    ///
+    /// A provider that wraps another (to cache reads, or to check access)
+    /// keeps the default unless it forwards this call. Not forwarding keeps
+    /// the default's per-statement reads. A wrapper that forwards must wrap the
+    /// provider of the read it gets back, and return that, so that the reads
+    /// inside the transaction still go through the wrapper; returning the
+    /// inner provider's read bypasses its caching and its checks.
+    /// [`MemoizedMetadataProvider`](crate::MemoizedMetadataProvider) is the
+    /// model: its read's provider serves the memo and passes the rest to the
+    /// wrapped provider's read.
+    ///
+    /// A clone of the read's provider keeps the read's transaction open (on
+    /// SQLite, with its shared lock) until the last clone drops, even after
+    /// [`ConsistentRead::end`]: through it, reads after `end` see the catalog
+    /// as of their own statement.
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
         Ok(None)
     }
@@ -3358,7 +3377,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 /// Keep one for the catalog reads of one scan or one plan, not for execution:
 /// on a backend that holds the state with a transaction, a writer can wait on
 /// it (a SQLite catalog in rollback-journal mode), and the database keeps the
-/// rows it shows until it ends.
+/// rows it shows until it ends. See
+/// [`MetadataProvider::begin_consistent_read`] for wrapping providers.
+#[must_use = "a consistent read holds a transaction until it ends or drops"]
 pub struct ConsistentRead {
     provider: Arc<dyn MetadataProvider>,
     end: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,

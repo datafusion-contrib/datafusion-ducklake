@@ -1285,8 +1285,9 @@ async fn test_query_with_filter() {
 
 /// Bring the minimal fixture schema up to a fully-migrated catalog: every
 /// optional capability the provider probes (`partial_max` columns, the
-/// `ducklake_schema_versions` ledger, and the inlined-data registry) plus the
-/// file columns the scan projection reads.
+/// `ducklake_schema_versions` ledger, the inlined-data registry, and the
+/// optional statistics, partition, sort and tag tables) plus the file columns
+/// the scan projection reads.
 async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
         "ALTER TABLE ducklake_data_file
@@ -1341,6 +1342,37 @@ async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> 
     )
     .execute(pool)
     .await?;
+    for statement in [
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+             partition_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT)",
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+             partition_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             partition_key_index BIGINT NOT NULL, column_id BIGINT NOT NULL,
+             transform VARCHAR NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+             sort_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT)",
+        "CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+             sort_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             sort_key_index BIGINT NOT NULL, expression VARCHAR NOT NULL,
+             dialect VARCHAR NOT NULL, sort_direction VARCHAR NOT NULL,
+             null_order VARCHAR NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS ducklake_table_stats (
+             table_id BIGINT PRIMARY KEY, record_count BIGINT NOT NULL DEFAULT 0,
+             next_row_id BIGINT NOT NULL DEFAULT 0, file_size_bytes BIGINT NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+             table_id BIGINT NOT NULL, column_id BIGINT NOT NULL, contains_null BOOLEAN,
+             contains_nan BOOLEAN, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR)",
+        "CREATE TABLE IF NOT EXISTS ducklake_tag (
+             object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT,
+             key VARCHAR, value VARCHAR)",
+        "CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT,
+             end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     Ok(())
 }
 

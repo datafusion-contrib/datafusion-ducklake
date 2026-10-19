@@ -115,7 +115,9 @@ use crate::table::{SCAN_READ_ATTEMPTS, inlined_rows_kept_moving, written_since};
 /// the rows (see [`DuckLakeInlinedRows::next_file_id`]), as a scan does.
 ///
 /// The memo keeps a fill only when the head after the fill is still the head
-/// that the bind read. So every kept fill shows the catalog at that one head. A
+/// that the bind read. The fill reads that head in its consistent read, which
+/// shows the state the fill read, or after its last read when the provider
+/// cannot begin one. So every kept fill shows the catalog at that one head. A
 /// query whose own fill read another state uses a fill that another query kept
 /// at its head, when there is one, else its own.
 ///
@@ -184,6 +186,15 @@ pub struct CatalogReadMemo {
 
 /// A table id and a snapshot id.
 type TableKey = (i64, i64);
+
+/// What [`MemoizedMetadataProvider::fill`] read.
+struct Fill {
+    reads: TableReads,
+    /// The estimated heap bytes of `reads`.
+    bytes: usize,
+    /// Whether the head after the reads is still the head the bind read.
+    unmoved: bool,
+}
 
 /// The inlined rows a fill reads before its listing.
 struct FillInlined {
@@ -333,9 +344,11 @@ struct LazyRead {
 enum LazyState {
     NotBegun,
     Open(ConsistentRead),
-    /// The wrapped provider cannot begin one, or the read has ended: reads go
-    /// to the wrapped provider itself.
+    /// The wrapped provider cannot begin one: reads go to the wrapped provider
+    /// itself.
     Direct,
+    /// The read has ended: reads go to the wrapped provider itself.
+    Ended,
 }
 
 impl LazyRead {
@@ -351,16 +364,21 @@ impl LazyRead {
         }
         Ok(match &*state {
             LazyState::Open(read) => Arc::clone(read.provider()),
-            LazyState::NotBegun | LazyState::Direct => Arc::clone(&self.inner),
+            LazyState::NotBegun | LazyState::Direct | LazyState::Ended => Arc::clone(&self.inner),
         })
     }
 
     /// End the read, if it began.
     fn end(&self) -> Result<()> {
-        match std::mem::replace(&mut *self.state(), LazyState::Direct) {
+        match std::mem::replace(&mut *self.state(), LazyState::Ended) {
             LazyState::Open(read) => read.end(),
-            LazyState::NotBegun | LazyState::Direct => Ok(()),
+            LazyState::NotBegun | LazyState::Direct | LazyState::Ended => Ok(()),
         }
+    }
+
+    /// Whether the read has not ended.
+    fn is_open(&self) -> bool {
+        !matches!(*self.state(), LazyState::Ended)
     }
 
     fn state(&self) -> MutexGuard<'_, LazyState> {
@@ -432,15 +450,16 @@ impl MemoizedMetadataProvider {
                 }
             }
         }
-        let Some((reads, bytes)) = self.fill(table_id, snapshot_id)? else {
+        let Some(Fill {
+            reads,
+            bytes,
+            unmoved,
+        }) = self.fill(table_id, snapshot_id)?
+        else {
             self.memo.lock().too_large.insert(table_id);
             return Ok(None);
         };
         let reads = Arc::new(reads);
-        // Every commit adds a snapshot, so a head that has not moved since the
-        // bind means that no commit landed before the fill ended. A head that
-        // cannot be read counts as moved.
-        let unmoved = self.inner.get_current_snapshot().ok() == Some(self.head);
         let mut state = self.memo.lock();
         if state.head == Some(self.head) {
             // Another query kept a fill at this head while this one read: it
@@ -469,12 +488,29 @@ impl MemoizedMetadataProvider {
     /// deletions, then the inlined rows, then the listing. A listing with a
     /// file written since the inlined rows reads both again, up to
     /// [`SCAN_READ_ATTEMPTS`] times.
-    fn fill(&self, table_id: i64, snapshot_id: i64) -> Result<Option<(TableReads, usize)>> {
+    ///
+    /// The fill then reads the head through the same read, so that it takes
+    /// no second connection while a scan's consistent read holds one.
+    fn fill(&self, table_id: i64, snapshot_id: i64) -> Result<Option<Fill>> {
         // Inside a scan's consistent read, the fill reads in it; otherwise in
         // one of its own.
         let reader = self.reader()?;
         crate::metadata_provider::read_consistently(&reader, |reader| {
-            self.fill_from(reader.as_ref(), table_id, snapshot_id)
+            let Some((reads, bytes)) = self.fill_from(reader.as_ref(), table_id, snapshot_id)?
+            else {
+                return Ok(None);
+            };
+            // Every commit adds a snapshot, so a head that has not moved since
+            // the bind means that the fill shows the catalog at that head:
+            // inside a consistent read the head is that of the state the fill
+            // read, and outside one no commit landed before the fill ended. A
+            // head that cannot be read counts as moved.
+            let unmoved = reader.get_current_snapshot().ok() == Some(self.head);
+            Ok(Some(Fill {
+                reads,
+                bytes,
+                unmoved,
+            }))
         })
     }
 
@@ -767,8 +803,9 @@ impl MetadataProvider for MemoizedMetadataProvider {
     /// A provider for the reads of one scan, sharing this one's picked reads.
     /// Its reads of the wrapped provider run in one consistent read of it,
     /// begun at the first of them: a scan the memo serves whole begins none.
+    /// A provider serving a read that has ended begins a new one.
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
-        if self.consistent.is_some() {
+        if self.consistent.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(
                 self.with_consistent(self.consistent.clone()),
             ))));

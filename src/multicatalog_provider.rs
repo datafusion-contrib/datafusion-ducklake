@@ -14,7 +14,7 @@
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
-use crate::catalog_read_transaction::{ReadTransaction, tolerating_failure};
+use crate::catalog_read_transaction::ReadTransaction;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
@@ -33,8 +33,8 @@ use crate::metadata_provider_postgres::{
     CONSISTENT_READ_BEGIN, InlinedDeletionTables, PostgresStatsDialect, StatsFilterSql,
     delete_file_begin_snapshot_on, fetch_data_file_page, first_inlined_snapshot_on,
     inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on, inlined_table_for_flush_on,
-    inlined_version_snapshot_on, read_inlined_rows_on, registered_inlined_tables_on,
-    scan_inlined_data_on, stats_filter_sql,
+    inlined_version_snapshot_on, missing_table_as_none, read_inlined_rows_on,
+    registered_inlined_tables_on, scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -140,6 +140,20 @@ struct SchemaCapabilities {
     /// The `ducklake_inlined_data_tables` registry exists, which a scan reads to
     /// find a table's inlined rows.
     inlined_data_tables: bool,
+    /// The `ducklake_partition_info` and `ducklake_partition_column` tables
+    /// exist. A table has a partition spec only when they do.
+    partition_specs: bool,
+    /// The `ducklake_sort_info` and `ducklake_sort_expression` tables exist.
+    /// A table has a sort spec only when they do.
+    sort_specs: bool,
+    /// The `ducklake_table_stats` table exists.
+    table_stats: bool,
+    /// The `ducklake_table_column_stats` table exists.
+    table_column_stats: bool,
+    /// The `ducklake_catalog_tag` table exists.
+    tags: bool,
+    /// The `ducklake_catalog_column_tag` table exists.
+    column_tags: bool,
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
@@ -168,6 +182,12 @@ impl SchemaCapabilities {
             && self.file_column_stats
             && self.file_partition_values
             && self.inlined_data_tables
+            && self.partition_specs
+            && self.sort_specs
+            && self.table_stats
+            && self.table_column_stats
+            && self.tags
+            && self.column_tags
     }
 
     /// What the store's `ducklake_schema_versions` ledger records, looked up
@@ -193,17 +213,24 @@ impl SchemaCapabilities {
 /// one from the pool for every statement. One session serves every catalog in
 /// its database.
 ///
-/// A provider bound to the session begins its consistent reads
-/// ([`MetadataProvider::begin_consistent_read`]) on this connection too. While
-/// any of them is open, the connection is inside one read-only transaction,
-/// begun by the first and committed by the last to end, so the scans of a query
-/// that read the catalog at once read one snapshot of it, as official DuckLake
-/// reads all of a transaction's metadata in one metadata transaction.
+/// The session's first catalog read begins a read-only `REPEATABLE READ`
+/// transaction on the connection, which lasts until [`Self::end`]. So every
+/// catalog read of the query sees one state of the catalog: its head, its table
+/// lookups and every scan, as official DuckLake reads all of a transaction's
+/// metadata in one metadata transaction. A commit that lands meanwhile is seen
+/// by the next session. A consistent read
+/// ([`MetadataProvider::begin_consistent_read`]) of a provider bound to the
+/// session reads in the session's transaction, and ending it ends nothing.
 ///
-/// [`Self::end`] gives the connection back to the pool. A provider still bound
-/// to an ended session reads through the pool again, so a read that comes late
-/// still works. Dropping the last handle to an open session gives the
-/// connection back as well.
+/// Keep a session for one query: the database keeps the rows the transaction
+/// shows until it ends.
+///
+/// [`Self::end`] commits the transaction and gives the connection back to the
+/// pool. A provider still bound to an ended session reads through the pool
+/// again, each statement on its own and each consistent read on a connection
+/// of its own, so a read that comes late still works.
+/// Dropping the last handle to an open session rolls its transaction back and
+/// gives the connection back as well.
 #[derive(Debug, Clone)]
 pub struct MetadataReadSession {
     inner: Arc<ReadSessionInner>,
@@ -220,50 +247,45 @@ struct ReadSessionInner {
     connection: tokio::sync::Mutex<SessionConnection>,
 }
 
-/// The connection of a [`MetadataReadSession`], and the consistent reads open
-/// on it.
+/// The connection of a [`MetadataReadSession`], and whether its transaction
+/// has begun.
 #[derive(Debug, Default)]
 struct SessionConnection {
     // `None` once the session ends.
     connection: Option<PoolConnection<Postgres>>,
-    // The consistent reads open on the connection. While there is one, the
-    // connection is inside the transaction the first of them began.
-    open_reads: usize,
-}
-
-impl SessionConnection {
-    /// End the transaction of the open reads, if any: the session ends.
-    async fn end_reads(&mut self) -> std::result::Result<(), sqlx::Error> {
-        if std::mem::take(&mut self.open_reads) == 0 {
-            return Ok(());
-        }
-        let Some(connection) = self.connection.as_mut() else {
-            return Ok(());
-        };
-        if let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut **connection).await {
-            // A connection that may still be inside the transaction is not
-            // pooled again.
-            if let Some(mut connection) = self.connection.take() {
-                connection.close_on_drop();
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
+    // Whether the connection is inside the session's transaction, which the
+    // session's first read begins.
+    in_transaction: bool,
 }
 
 impl MetadataReadSession {
-    /// End the session and give its connection back to the pool. Reads through
-    /// a provider bound to this session use the pool from now on. Ending an
+    /// End the session: commit its transaction, if a read began one, and give
+    /// its connection back to the pool. Reads through a provider bound to this
+    /// session use the pool from now on, each statement on its own. Ending an
     /// ended session does nothing.
     ///
-    /// A consistent read still open on the session ends with it: its
-    /// transaction commits here, and its later reads use the pool.
+    /// The commit ends a read-only transaction, so it writes nothing, but it
+    /// can fail, for example when the connection is lost. A connection whose
+    /// commit fails is closed instead of pooled.
     pub async fn end(&self) -> Result<()> {
         let mut session = self.inner.connection.lock().await;
-        let ended = session.end_reads().await;
-        drop(session.connection.take());
-        Ok(ended?)
+        let Some(mut connection) = session.connection.take() else {
+            return Ok(());
+        };
+        if std::mem::take(&mut session.in_transaction)
+            && let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut *connection).await
+        {
+            // A connection that may still be inside the transaction is not
+            // pooled again.
+            connection.close_on_drop();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Whether the session has not ended.
+    async fn is_open(inner: &ReadSessionInner) -> bool {
+        inner.connection.lock().await.connection.is_some()
     }
 }
 
@@ -309,7 +331,7 @@ impl Drop for ReadSessionInner {
         if session.connection.is_some() {
             crate::metadata_provider::catalog_runtime().spawn(async move {
                 let mut session = session;
-                if session.open_reads > 0
+                if session.in_transaction
                     && let Some(connection) = session.connection.as_mut()
                     && sqlx::raw_sql("ROLLBACK")
                         .execute(&mut **connection)
@@ -342,66 +364,9 @@ pub struct MulticatalogProvider {
     // to one (see `MetadataReadSession`).
     read_session: Option<Arc<ReadSessionInner>>,
     // The consistent read every catalog read runs in, when this provider is
-    // bound to one (see `MetadataProvider::begin_consistent_read`).
-    consistent: Option<Arc<MulticatalogRead>>,
-}
-
-/// A consistent read of a [`MulticatalogProvider`]: a transaction on a pooled
-/// connection of its own, or on the provider's read session.
-#[derive(Debug)]
-enum MulticatalogRead {
-    Pooled(ReadTransaction<Postgres>),
-    Session(SessionRead),
-}
-
-/// A consistent read open on a read session's connection, counted in its
-/// `open_reads`.
-#[derive(Debug)]
-struct SessionRead {
-    session: Arc<ReadSessionInner>,
-    ended: std::sync::atomic::AtomicBool,
-}
-
-impl SessionRead {
-    /// Count this read out of the session's open reads, and commit their
-    /// transaction when it was the last. Ending an ended read does nothing.
-    async fn end(&self) -> std::result::Result<(), sqlx::Error> {
-        if self.ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return Ok(());
-        }
-        let mut session = self.session.connection.lock().await;
-        if session.open_reads > 1 {
-            session.open_reads -= 1;
-            return Ok(());
-        }
-        session.end_reads().await
-    }
-}
-
-impl Drop for SessionRead {
-    fn drop(&mut self) {
-        if !*self.ended.get_mut() {
-            let read = Self {
-                session: Arc::clone(&self.session),
-                ended: std::sync::atomic::AtomicBool::new(false),
-            };
-            *self.ended.get_mut() = true;
-            crate::metadata_provider::catalog_runtime().spawn(async move {
-                // The transaction ends when its last read does; a failed commit
-                // has no caller left to report to.
-                let _ = read.end().await;
-            });
-        }
-    }
-}
-
-impl MulticatalogRead {
-    async fn end(&self) -> std::result::Result<(), sqlx::Error> {
-        match self {
-            Self::Pooled(read) => read.commit().await,
-            Self::Session(read) => read.end().await,
-        }
-    }
+    // bound to one on a pooled connection of its own (see
+    // `MetadataProvider::begin_consistent_read`).
+    consistent: Option<Arc<ReadTransaction<Postgres>>>,
 }
 
 impl MulticatalogProvider {
@@ -478,7 +443,9 @@ impl MulticatalogProvider {
     }
 
     /// Take one connection from this provider's pool for the catalog reads of
-    /// one query. See [`MetadataReadSession`].
+    /// one query, which all see one state of the catalog: the session's first
+    /// read begins a read-only transaction, and [`MetadataReadSession::end`]
+    /// commits it. See [`MetadataReadSession`].
     ///
     /// The connection is taken on the runtime this crate drives catalog I/O on,
     /// as [`Self::new`] opens its pool, so a connection the pool opens for it
@@ -495,7 +462,7 @@ impl MulticatalogProvider {
                 database: DatabaseIdentity::of(&self.pool),
                 connection: tokio::sync::Mutex::new(SessionConnection {
                     connection: Some(connection),
-                    open_reads: 0,
+                    in_transaction: false,
                 }),
             }),
         })
@@ -522,8 +489,9 @@ impl MulticatalogProvider {
     }
 
     /// Run `read` on the consistent read's connection while this provider is
-    /// bound to an open one, else on the read session's connection while the
-    /// session is open, else on one connection from the pool.
+    /// bound to an open one, else on the read session's connection, inside its
+    /// transaction, while the session is open, else on one connection from the
+    /// pool.
     async fn on_connection<T, E: From<sqlx::Error>>(
         &self,
         read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, E>,
@@ -533,26 +501,89 @@ impl MulticatalogProvider {
     }
 
     /// [`Self::on_connection`], telling `read` whether its connection is
-    /// inside a consistent read's transaction: a read session's connection is
-    /// while any read is open on it, whichever provider began it.
+    /// inside a transaction: a consistent read's, or a read session's, which
+    /// the session's first read begins.
     async fn on_connection_in_transaction<T, E: From<sqlx::Error>>(
         &self,
         read: impl AsyncFnOnce(&mut PgConnection, bool) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        if let Some(MulticatalogRead::Pooled(transaction)) = self.consistent.as_deref()
+        if let Some(transaction) = self.consistent.as_deref()
             && let Some(mut connection) = transaction.connection().await
         {
             return read(&mut connection, true).await;
         }
         if let Some(session) = &self.read_session {
             let mut session = session.connection.lock().await;
-            let in_transaction = session.open_reads > 0;
+            let session = &mut *session;
             if let Some(connection) = session.connection.as_mut() {
-                return read(connection, in_transaction).await;
+                if !session.in_transaction {
+                    sqlx::raw_sql(CONSISTENT_READ_BEGIN)
+                        .execute(&mut **connection)
+                        .await?;
+                    session.in_transaction = true;
+                }
+                return read(connection, true).await;
             }
         }
         let mut connection = self.pool.acquire().await?;
         read(&mut connection, false).await
+    }
+
+    /// Run `read`, a read of an optional catalog table, as
+    /// [`Self::on_connection`] runs it when the capability probe found the
+    /// table (`present`), else `None` without a statement. See
+    /// [`missing_table_as_none`] for a read that fails.
+    async fn read_if_present<T>(
+        &self,
+        present: bool,
+        read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, sqlx::Error>,
+    ) -> Result<Option<T>> {
+        if !present {
+            return Ok(None);
+        }
+        self.on_connection_in_transaction(async |connection, in_transaction| {
+            missing_table_as_none(read(connection).await, in_transaction)
+        })
+        .await
+    }
+
+    /// [`Self::read_all`] of an optional catalog table (see
+    /// [`Self::read_if_present`]).
+    async fn read_all_if_present(
+        &self,
+        present: bool,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<Option<Vec<PgRow>>> {
+        self.read_if_present(present, async |connection| {
+            query.fetch_all(connection).await
+        })
+        .await
+    }
+
+    /// [`Self::read_one`] of an optional catalog table (see
+    /// [`Self::read_if_present`]).
+    async fn read_one_if_present(
+        &self,
+        present: bool,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<Option<PgRow>> {
+        self.read_if_present(present, async |connection| {
+            query.fetch_one(connection).await
+        })
+        .await
+    }
+
+    /// [`Self::read_optional`] of an optional catalog table (see
+    /// [`Self::read_if_present`]).
+    async fn read_optional_if_present(
+        &self,
+        present: bool,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> Result<Option<Option<PgRow>>> {
+        self.read_if_present(present, async |connection| {
+            query.fetch_optional(connection).await
+        })
+        .await
     }
 
     /// Every row `query` returns, read as [`Self::on_connection`] reads.
@@ -580,34 +611,6 @@ impl MulticatalogProvider {
     ) -> std::result::Result<Option<PgRow>, sqlx::Error> {
         self.on_connection(async |connection| query.fetch_optional(connection).await)
             .await
-    }
-
-    /// One page of the file listing, read as [`Self::on_connection`] reads.
-    /// A `narrowed` page's failure is tolerated: inside a transaction, it runs
-    /// under a savepoint.
-    async fn read_page(
-        &self,
-        sql: &str,
-        narrowed: bool,
-        (table_id, snapshot_id): (i64, i64),
-        after_data_file_id: i64,
-        limit: i64,
-    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
-        self.on_connection_in_transaction(async |connection, in_transaction| {
-            tolerating_failure(connection, narrowed && in_transaction, async |connection| {
-                fetch_data_file_page(
-                    connection,
-                    sql,
-                    table_id,
-                    snapshot_id,
-                    after_data_file_id,
-                    limit,
-                )
-                .await
-            })
-            .await
-        })
-        .await
     }
 
     /// The inlined row versions of `table_id` that `selection` picks, in
@@ -666,8 +669,14 @@ impl MulticatalogProvider {
         if let Some(exists) = self.inlined_deletion_tables.known(table_id, snapshot_id) {
             return Ok(exists);
         }
-        // The head is read in the same statement as the check, so both describe
-        // one state of the catalog.
+        // `to_regclass` looks the name up in the catalog as it is now. Inside a
+        // consistent read's or a read session's `REPEATABLE READ` transaction,
+        // `MAX(snapshot_id)` reads the transaction's snapshot, which can be
+        // older. Recording `min(snapshot_id, head)` stays safe: a table the
+        // check misses is created, if ever, by a commit after the check, whose
+        // snapshot is above the head now and so above the transaction's head
+        // too. A table the check finds is read at the transaction's snapshot,
+        // which shows none of the deletions committed after it.
         let row = self
             .read_one(
                 sqlx::query(
@@ -700,16 +709,19 @@ impl MulticatalogProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        self.probe_schema_capabilities().await
+        self.on_connection(async |connection| self.probe_schema_capabilities_on(connection).await)
+            .await
     }
 
-    /// Probes the catalog's optional-schema capabilities, whatever the memo
-    /// holds, and memoizes an all-`true` answer as [`Self::schema_capabilities`]
-    /// does.
-    async fn probe_schema_capabilities(&self) -> Result<SchemaCapabilities> {
-        let row = self
-            .read_one(sqlx::query(
-                "SELECT
+    /// Probes the catalog's optional-schema capabilities on `connection`,
+    /// whatever the memo holds, and memoizes an all-`true` answer as
+    /// [`Self::schema_capabilities`] does.
+    async fn probe_schema_capabilities_on(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<SchemaCapabilities> {
+        let row = sqlx::query(
+            "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
                EXISTS (SELECT 1 FROM information_schema.columns
@@ -725,9 +737,18 @@ impl MulticatalogProvider {
                current_setting('server_version_num')::int >= 120000,
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_schema_versions'
-                         AND column_name = 'table_id')",
-            ))
-            .await?;
+                         AND column_name = 'table_id'),
+               to_regclass('ducklake_partition_info') IS NOT NULL
+                 AND to_regclass('ducklake_partition_column') IS NOT NULL,
+               to_regclass('ducklake_sort_info') IS NOT NULL
+                 AND to_regclass('ducklake_sort_expression') IS NOT NULL,
+               to_regclass('ducklake_table_stats') IS NOT NULL,
+               to_regclass('ducklake_table_column_stats') IS NOT NULL,
+               to_regclass('ducklake_catalog_tag') IS NOT NULL,
+               to_regclass('ducklake_catalog_column_tag') IS NOT NULL",
+        )
+        .fetch_one(connection)
+        .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.try_get(0)?,
             delete_file_partial_max: row.try_get(1)?,
@@ -738,6 +759,12 @@ impl MulticatalogProvider {
             file_column_stats: row.try_get(5)?,
             file_partition_values: row.try_get(6)?,
             inlined_data_tables: row.try_get(7)?,
+            partition_specs: row.try_get(11)?,
+            sort_specs: row.try_get(12)?,
+            table_stats: row.try_get(13)?,
+            table_column_stats: row.try_get(14)?,
+            tags: row.try_get(15)?,
+            column_tags: row.try_get(16)?,
             soft_input_validation: row.try_get(8)?,
             materialized_cte: row.try_get(9)?,
         };
@@ -795,8 +822,14 @@ impl MulticatalogProvider {
                 soft_input_validation: caps.soft_input_validation,
                 materialized_cte: caps.materialized_cte,
             };
-            let rendered = filter.and_then(|filter| filter.render(&dialect));
+            // The narrowed query reads `ducklake_file_column_stats`, and its
+            // partition pre-filters `ducklake_file_partition_value`. A catalog
+            // without one lists unnarrowed by it.
+            let rendered = filter
+                .filter(|_| caps.file_column_stats)
+                .and_then(|filter| filter.render(&dialect));
             let partitions = filter
+                .filter(|_| caps.file_partition_values)
                 .map(|filter| filter.render_partition_prefilters(&dialect, table_id))
                 .unwrap_or_default();
             let stats_sql = rendered
@@ -863,42 +896,70 @@ impl MulticatalogProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let narrowed = stats_sql.is_some();
-            let fetch = |sql: String, narrowed: bool| async move {
-                self.read_page(&sql, narrowed, (table_id, snapshot_id), after, limit)
-                    .await
-            };
-            let first = fetch(page_sql(caps, stats_sql.as_ref()), narrowed).await;
-            // A table the memoized probe saw can be gone by now. Probe again,
-            // past the memo, and read the page from the tables there are, so a
-            // missing table costs only what it held, as the separate reads did.
-            let (caps, first) = match first {
-                Err(error) if memoized && is_missing_statistics_table(&error) => {
-                    let current = self.probe_schema_capabilities().await?;
-                    (
-                        current,
-                        fetch(page_sql(current, stats_sql.as_ref()), narrowed).await,
+            let rows = self
+                .on_connection_in_transaction(async |connection, in_transaction| {
+                    let first = fetch_data_file_page(
+                        &mut *connection,
+                        &page_sql(caps, stats_sql.as_ref()),
+                        table_id,
+                        snapshot_id,
+                        after,
+                        limit,
                     )
-                },
-                first => (caps, first),
-            };
-            let rows = match first {
-                Ok(rows) => rows,
-                // The filter is advisory, so a catalog the narrowed query
-                // cannot run — one predating `ducklake_file_column_stats`,
-                // where joining it is a hard error, or one whose stats provoke
-                // an error the dialect did not anticipate — still lists its
-                // files. Any error retries, not just the missing table: the
-                // narrowed query is the only thing this arm adds, and listing
-                // every live file is always correct. The retry uses the same
-                // parameters, and a failure that is not the filter's fault
-                // surfaces from it.
-                Err(error) if stats_sql.is_some() => {
-                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
-                    fetch(page_sql(caps, None), false).await?
-                },
-                Err(error) => return Err(error.into()),
-            };
+                    .await;
+                    // Inside a transaction an error ended it, where a retry
+                    // would only fail again and hide the error: it fails the
+                    // read.
+                    if in_transaction {
+                        return Ok::<_, crate::DuckLakeError>(first?);
+                    }
+                    // A table the memoized probe saw can be gone by now. Probe
+                    // again, past the memo, and read the page from the tables
+                    // there are, so a missing table costs only what it held, as
+                    // the separate reads did.
+                    let (caps, first) = match first {
+                        Err(error) if memoized && is_missing_statistics_table(&error) => {
+                            let current = self.probe_schema_capabilities_on(connection).await?;
+                            let page = fetch_data_file_page(
+                                &mut *connection,
+                                &page_sql(current, stats_sql.as_ref()),
+                                table_id,
+                                snapshot_id,
+                                after,
+                                limit,
+                            )
+                            .await;
+                            (current, page)
+                        },
+                        first => (caps, first),
+                    };
+                    match first {
+                        Ok(rows) => Ok(rows),
+                        // The filter is advisory, so a narrowed query the
+                        // catalog cannot run (its stats provoke an error the
+                        // dialect did not anticipate, or a table was dropped
+                        // since the probe) lists the page again unnarrowed. Any
+                        // error retries: the narrowed query is the only thing
+                        // this arm adds, and listing every live file is always
+                        // correct. The retry uses the same parameters, and a
+                        // failure that is not the filter's fault surfaces from
+                        // it.
+                        Err(error) if stats_sql.is_some() => {
+                            crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
+                            Ok(fetch_data_file_page(
+                                connection,
+                                &page_sql(caps, None),
+                                table_id,
+                                snapshot_id,
+                                after,
+                                limit,
+                            )
+                            .await?)
+                        },
+                        Err(error) => Err(error.into()),
+                    }
+                })
+                .await?;
             // The same on every row: whether the table has any partition values.
             let has_partition_values = match rows.first() {
                 Some(row) => row.try_get::<bool, _>("has_partition_values")?,
@@ -940,8 +1001,11 @@ impl MulticatalogProvider {
         let Some(last_data_file_id) = files.last().map(|file| file.file.data_file_id) else {
             return Ok(());
         };
-        let rows = match self
-            .read_all(
+        // The page saw the table. Dropped since, outside a transaction, it
+        // reads no values, as on a catalog without the table.
+        let Some(rows) = self
+            .read_all_if_present(
+                true,
                 sqlx::query(
                     "SELECT data_file_id, partition_key_index, partition_value
                      FROM ducklake_file_partition_value
@@ -952,13 +1016,9 @@ impl MulticatalogProvider {
                 .bind(after_data_file_id)
                 .bind(last_data_file_id),
             )
-            .await
-        {
-            Ok(rows) => rows,
-            // Dropped since the page saw it: no values, as on a catalog
-            // without the table.
-            Err(error) if is_missing_statistics_table(&error) => return Ok(()),
-            Err(error) => return Err(error.into()),
+            .await?
+        else {
+            return Ok(());
         };
         let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
         for row in rows {
@@ -1109,41 +1169,28 @@ fn decode_page_statistics(
 
 impl MetadataProvider for MulticatalogProvider {
     /// A read-only `REPEATABLE READ` transaction, whose snapshot the first read
-    /// fixes: on the read session's connection while this provider is bound to
-    /// an open session (see [`MetadataReadSession`]), else on a pooled
-    /// connection of its own.
+    /// fixes: the read session's while this provider is bound to an open
+    /// session (see [`MetadataReadSession`]), which the session ends, else one
+    /// on a pooled connection of its own.
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
-        if self.consistent.is_some() {
+        let within = match (&self.consistent, &self.read_session) {
+            (Some(read), _) if read.is_open() => true,
+            (_, Some(session)) => block_on(MetadataReadSession::is_open(session)),
+            _ => false,
+        };
+        if within {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
-        let read = block_on(async {
-            if let Some(session) = &self.read_session {
-                let mut connection = session.connection.lock().await;
-                let open_reads = connection.open_reads;
-                if let Some(pooled) = connection.connection.as_mut() {
-                    if open_reads == 0 {
-                        sqlx::raw_sql(CONSISTENT_READ_BEGIN)
-                            .execute(&mut **pooled)
-                            .await?;
-                    }
-                    connection.open_reads += 1;
-                    return Ok::<_, sqlx::Error>(MulticatalogRead::Session(SessionRead {
-                        session: Arc::clone(session),
-                        ended: std::sync::atomic::AtomicBool::new(false),
-                    }));
-                }
-            }
-            Ok(MulticatalogRead::Pooled(
-                ReadTransaction::begin(&self.pool, &[CONSISTENT_READ_BEGIN]).await?,
-            ))
-        })?;
-        let read = Arc::new(read);
+        let read = Arc::new(block_on(ReadTransaction::begin(
+            &self.pool,
+            &[CONSISTENT_READ_BEGIN],
+        ))?);
         let provider = Self {
             consistent: Some(Arc::clone(&read)),
             ..self.clone()
         };
         Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
-            Ok(block_on(read.end())?)
+            Ok(block_on(read.commit())?)
         })))
     }
 
@@ -1737,8 +1784,9 @@ impl MetadataProvider for MulticatalogProvider {
                 files.iter().map(|f| f.data_file_id).max(),
             ) {
                 let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-                match self
-                    .read_all(
+                let rows = self
+                    .read_all_if_present(
+                        caps.file_partition_values,
                         sqlx::query(
                             "SELECT data_file_id, partition_key_index, partition_value
                      FROM ducklake_file_partition_value
@@ -1748,22 +1796,15 @@ impl MetadataProvider for MulticatalogProvider {
                         .bind(min)
                         .bind(max),
                     )
-                    .await
-                {
-                    Ok(rows) => {
-                        for row in rows {
-                            let data_file_id: i64 = row.try_get(0)?;
-                            let key_index: i32 =
-                                i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                            let value: Option<String> = row.try_get(2)?;
-                            values_by_file
-                                .entry(data_file_id)
-                                .or_default()
-                                .push((key_index, value));
-                        }
-                    },
-                    Err(error) if is_missing_statistics_table(&error) => {},
-                    Err(error) => return Err(error.into()),
+                    .await?;
+                for row in rows.unwrap_or_default() {
+                    let data_file_id: i64 = row.try_get(0)?;
+                    let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                    let value: Option<String> = row.try_get(2)?;
+                    values_by_file
+                        .entry(data_file_id)
+                        .or_default()
+                        .push((key_index, value));
                 }
                 for file in &mut files {
                     if let Some(values) = values_by_file.remove(&file.data_file_id) {
@@ -1778,20 +1819,22 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         // Keyed by the globally-unique table_id, so no catalog scoping is needed.
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let generation_count: i64 = match self
-                .read_one(
+                .read_one_if_present(
+                    caps.partition_specs,
                     sqlx::query("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1")
                         .bind(table_id),
                 )
-                .await
+                .await?
             {
-                Ok(row) => row.try_get(0)?,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(row) => row.try_get(0)?,
+                None => return Ok(None),
             };
             let prune_safe = generation_count == 1;
             let rows = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.partition_specs,
                     sqlx::query(
                         "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
@@ -1806,11 +1849,10 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(None),
             };
             let parsed = rows
                 .iter()
@@ -1830,8 +1872,10 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
         // Keyed by the globally unique table_id, so no catalog scoping is needed.
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let rows = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.sort_specs,
                     sqlx::query(
                         "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
                         se.sort_direction, se.null_order
@@ -1847,11 +1891,10 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(None),
             };
             let parsed = rows
                 .iter()
@@ -1897,17 +1940,19 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let table = match self
-                .read_optional(
+                .read_optional_if_present(
+                    caps.table_stats,
                     sqlx::query(
                         "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
                     )
                     .bind(table_id),
                 )
-                .await
+                .await?
             {
-                Ok(row) => row
+                Some(row) => row
                     .map(|row| {
                         Ok::<_, sqlx::Error>(DuckLakeTableStatistics {
                             record_count: row.try_get(0)?,
@@ -1915,11 +1960,11 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
-                Err(error) => return Err(error.into()),
+                None => None,
             };
             let column_sizes = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.file_column_stats,
                     sqlx::query(
                         "SELECT stats.column_id,
                         CASE
@@ -1948,9 +1993,9 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .filter_map(|row| match row.try_get::<Option<i64>, _>(1) {
                         Ok(Some(size)) => Some(row.try_get(0).map(|column_id| (column_id, size))),
@@ -1958,8 +2003,7 @@ impl MetadataProvider for MulticatalogProvider {
                         Err(error) => Some(Err(error)),
                     })
                     .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
-                Err(error) => return Err(error.into()),
+                None => HashMap::new(),
             };
             let bounds_are_exact: bool = self
                 .read_one(
@@ -1978,16 +2022,17 @@ impl MetadataProvider for MulticatalogProvider {
                 .await?
                 .try_get(0)?;
             let columns = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.table_column_stats,
                     sqlx::query(
                         "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
                     )
                     .bind(table_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         let column_id = row.try_get(0)?;
@@ -2002,8 +2047,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
             Ok(DuckLakeStatistics {
                 table,
@@ -2015,17 +2059,19 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let table = match self
-                .read_optional(
+                .read_optional_if_present(
+                    caps.table_stats,
                     sqlx::query(
                         "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
                     )
                     .bind(table_id),
                 )
-                .await
+                .await?
             {
-                Ok(row) => row
+                Some(row) => row
                     .map(|row| {
                         Ok::<_, sqlx::Error>(DuckLakeTableStatistics {
                             record_count: row.try_get(0)?,
@@ -2033,21 +2079,21 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
-                Err(error) => return Err(error.into()),
+                None => None,
             };
 
             let columns = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.table_column_stats,
                     sqlx::query(
                         "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
                     )
                     .bind(table_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeTableColumnStatistics {
@@ -2061,12 +2107,12 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
 
             let files = match self
-                .read_all(
+                .read_all_if_present(
+                    caps.file_column_stats,
                     sqlx::query(
                         "SELECT
                     stats.data_file_id,
@@ -2089,9 +2135,9 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeFileColumnStatistics {
@@ -2106,8 +2152,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
 
             Ok(DuckLakeStatistics {
@@ -2220,9 +2265,15 @@ impl MetadataProvider for MulticatalogProvider {
             {
                 return Ok(Vec::new());
             }
-            self.on_connection(async |connection| {
-                inlined_file_deletes_between_on(connection, table_id, start_snapshot, end_snapshot)
-                    .await
+            self.on_connection_in_transaction(async |connection, in_transaction| {
+                inlined_file_deletes_between_on(
+                    connection,
+                    in_transaction,
+                    table_id,
+                    start_snapshot,
+                    end_snapshot,
+                )
+                .await
             })
             .await
         })
@@ -2320,8 +2371,9 @@ impl MetadataProvider for MulticatalogProvider {
             {
                 return Ok(Vec::new());
             }
-            self.on_connection(async |connection| {
-                inlined_file_deletes_for_flush_on(connection, table_id, snapshot_id).await
+            self.on_connection_in_transaction(async |connection, in_transaction| {
+                inlined_file_deletes_for_flush_on(connection, in_transaction, table_id, snapshot_id)
+                    .await
             })
             .await
         })
@@ -2352,29 +2404,30 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE begin_snapshot <= $1
                  ORDER BY file_id, row_id"
             );
-            match self
-                .read_all(sqlx::query(AssertSqlSafe(sql)).bind(snapshot_id))
+            let rows = match self
+                .read_all_if_present(true, sqlx::query(AssertSqlSafe(sql)).bind(snapshot_id))
                 .await
             {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| {
-                        Ok(DuckLakeInlinedDelete {
-                            data_file_id: row.try_get(0)?,
-                            row_id: row.try_get(1)?,
-                        })
-                    })
-                    .collect(),
+                Ok(Some(rows)) => rows,
                 // The table was seen, and is gone: expire dropped it with a
                 // table no surviving snapshot sees, or its catalog was dropped
                 // (see `InlinedDeletionTable`). A missing table holds no
-                // deletions to apply.
-                Err(error) if is_missing_statistics_table(&error) => {
+                // deletions to apply, or, inside a transaction, fails the read
+                // (see `missing_table_as_none`). Either way the memo forgets
+                // it, so the next read asks again.
+                result => {
                     self.inlined_deletion_tables.forget(table_id);
-                    Ok(Vec::new())
+                    return result.map(|_| Vec::new());
                 },
-                Err(error) => Err(error.into()),
-            }
+            };
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeInlinedDelete {
+                        data_file_id: row.try_get(0)?,
+                        row_id: row.try_get(1)?,
+                    })
+                })
+                .collect()
         })
     }
 
@@ -2500,11 +2553,12 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_tags(&self, target: TagTarget, snapshot_id: i64) -> Result<Vec<DuckLakeTag>> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let result = match target {
                 TagTarget::Object {
                     object_type,
                     object_id,
-                } => self.read_all(sqlx::query(
+                } => self.read_all_if_present(caps.tags, sqlx::query(
                     "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_catalog_tag
                      WHERE catalog_id = $1 AND object_type = $2 AND object_id = $3
                        AND $4 >= begin_snapshot
@@ -2516,11 +2570,11 @@ impl MetadataProvider for MulticatalogProvider {
                 .bind(object_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id))
-                .await,
+                .await?,
                 TagTarget::Column {
                     table_id,
                     column_id,
-                } => self.read_all(sqlx::query(
+                } => self.read_all_if_present(caps.column_tags, sqlx::query(
                     "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_catalog_column_tag
                      WHERE catalog_id = $1 AND table_id = $2 AND column_id = $3
                        AND $4 >= begin_snapshot
@@ -2532,12 +2586,11 @@ impl MetadataProvider for MulticatalogProvider {
                 .bind(column_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id))
-                .await,
+                .await?,
             };
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {
@@ -2559,8 +2612,10 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let result = self
-                .read_optional(
+                .read_optional_if_present(
+                    caps.views,
                     sqlx::query(
                         "SELECT v.view_id FROM ducklake_view v
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = v.schema_id
@@ -2574,12 +2629,10 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await;
-            match result {
-                Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
-                Ok(None) => Ok(None),
-                Err(error) if is_missing_statistics_table(&error) => Ok(None),
-                Err(error) => Err(error.into()),
+                .await?;
+            match result.flatten() {
+                Some(row) => Ok(Some(row.try_get(0)?)),
+                None => Ok(None),
             }
         })
     }
@@ -2735,8 +2788,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_object_tags(&self, snapshot_id: i64) -> Result<Vec<ObjectTag>> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let result = self
-                .read_all(
+                .read_all_if_present(
+                    caps.tags,
                     sqlx::query(
                         "SELECT object_type, object_id, begin_snapshot, end_snapshot, key, value
                  FROM ducklake_catalog_tag
@@ -2748,11 +2803,10 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await;
+                .await?;
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {
@@ -2783,8 +2837,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_column_tags(&self, snapshot_id: i64) -> Result<Vec<ColumnTag>> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             let result = self
-                .read_all(
+                .read_all_if_present(
+                    caps.column_tags,
                     sqlx::query(
                         "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
                  FROM ducklake_catalog_column_tag
@@ -2796,11 +2852,10 @@ impl MetadataProvider for MulticatalogProvider {
                     .bind(snapshot_id)
                     .bind(snapshot_id),
                 )
-                .await;
+                .await?;
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {

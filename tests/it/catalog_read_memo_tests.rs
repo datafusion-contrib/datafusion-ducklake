@@ -1952,6 +1952,104 @@ async fn a_flush_between_a_deletes_reads_leaves_no_row_undeleted() -> anyhow::Re
     Ok(())
 }
 
+/// A table with a writer over `lake`, its catalog reads counted by `counting`.
+#[cfg(feature = "write-sqlite")]
+async fn writable(lake: &Lake, counting: &CountingProvider) -> anyhow::Result<DuckLakeTable> {
+    let url = format!("sqlite:{}", lake.catalog_path().display());
+    let writer = datafusion_ducklake::SqliteMetadataWriter::new(&url).await?;
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(counting.clone()), Arc::new(writer))?;
+    let table = catalog
+        .schema("main")
+        .expect("schema main")
+        .table("t")
+        .await?
+        .expect("table t");
+    Ok(table
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLake table")
+        .clone())
+}
+
+/// A flush that moves only inlined deletions commits between the reads of a
+/// positional delete: of the files, then of the inlined deletions. Read in two
+/// states of the catalog, rows 3 and 7 are in neither the file's delete file
+/// nor the inlined deletions, so the delete counts them as live rows and
+/// commits their deletion again. Read in one, they are deleted already, and
+/// the delete deletes nothing.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_positional_deletes_reads_deletes_no_row_twice() -> anyhow::Result<()> {
+    let lake = Lake::new(10, INLINED_DELETIONS)?;
+    let counting = lake.provider().await?;
+    let table = writable(&lake, &counting).await?;
+    let (table_id, head) = table_at_head(&counting)?;
+    let files = counting.get_table_files_for_select(table_id, head)?;
+    let [file] = files.as_slice() else {
+        panic!("one data file: {files:?}");
+    };
+    let state = SessionContext::new().state();
+
+    counting.before("get_inlined_deletes", lake.runner(FLUSH));
+    let deleted = table
+        .delete_positions(&state, vec![(file.data_file_id, vec![3, 7])])
+        .await?;
+    assert!(counting.hook_ran());
+    assert_eq!(deleted.rows_deleted, 0, "{deleted:?}");
+    // The flush committed: the deletions moved to a delete file.
+    let provider = lake.provider().await?;
+    let (_, head) = table_at_head(&provider)?;
+    assert!(provider.get_inlined_deletes(table_id, head)?.is_empty());
+    assert!(
+        provider
+            .get_table_files_for_select(table_id, head)?
+            .iter()
+            .any(|file| file.delete_file.is_some())
+    );
+    Ok(())
+}
+
+/// A flush that moves only inlined deletions commits between a merge's read
+/// of the files and its read of the inlined deletions. Read in two states of
+/// the catalog, the file with the deletions shows neither a delete file nor
+/// inlined deletions, so the merge takes it, and either writes rows 3 and 7
+/// back or fails on the flush's delete file. Read in one, the file's inlined
+/// deletions keep it out of the merge, which has one file left and merges
+/// nothing.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_between_a_merges_reads_merges_no_deleted_row_back() -> anyhow::Result<()> {
+    let lake = Lake::new(
+        10,
+        &[
+            "CREATE TABLE lake.t (id INT)",
+            "INSERT INTO lake.t SELECT i FROM range(20) r(i)",
+            "DELETE FROM lake.t WHERE id IN (3, 7)",
+            "INSERT INTO lake.t SELECT i FROM range(20, 40) r(i)",
+        ],
+    )?;
+    let counting = lake.provider().await?;
+    let table = writable(&lake, &counting).await?;
+    let state = SessionContext::new().state();
+
+    counting.before("get_inlined_deletes", lake.runner(FLUSH));
+    let merged = table
+        .merge_adjacent_files(&state, datafusion_ducklake::MergeOptions::default())
+        .await?;
+    assert!(counting.hook_ran());
+    assert!(!merged.did_work(), "{merged:?}");
+    let ids = Caller::plain(&lake)
+        .await?
+        .query("SELECT count(*) AS n, sum(id) AS total FROM t")
+        .await?;
+    // 38 rows: 0..40 without 3 and 7.
+    assert!(ids.contains("| 38 | 770   |"), "{ids}");
+    // The flush committed: the deletions moved to a delete file.
+    let provider = lake.provider().await?;
+    let (table_id, head) = table_at_head(&provider)?;
+    assert!(provider.get_inlined_deletes(table_id, head)?.is_empty());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // A commit between two pages of a scan's listing
 // ---------------------------------------------------------------------------
@@ -2112,6 +2210,22 @@ async fn flush_between_a_change_feeds_reads(backend: &Backend) -> anyhow::Result
         counting.before("get_inlined_file_deletes_between", lake.runner(FLUSH));
         let rows = query(&ctx, feed).await?;
         assert!(counting.hook_ran(), "{feed}");
+        // The flush committed: the deletions moved to a delete file.
+        let provider = lake.provider().await?;
+        let (table_id, head) = table_at_head(&provider)?;
+        assert!(
+            provider.get_inlined_deletes(table_id, head)?.is_empty(),
+            "{feed}"
+        );
+        assert_eq!(
+            provider
+                .get_table_files_for_select(table_id, head)?
+                .iter()
+                .filter(|file| file.delete_file.is_some())
+                .count(),
+            1,
+            "{feed}"
+        );
         if rows != expected {
             wrong.push(format!("{feed}\n{rows}\nexpected\n{expected}"));
         }

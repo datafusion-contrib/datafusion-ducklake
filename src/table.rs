@@ -1939,7 +1939,9 @@ impl DuckLakeTable {
     /// files: a listed file at or above that id was committed since, and may
     /// hold rows also read inlined, so both are read again. Official DuckLake
     /// reads a scan's inlined rows and files in this order where each of its
-    /// statements commits on its own (`DuckLakeMultiFileList::ReadCommittedFiles`).
+    /// statements commits on its own (`DuckLakeMultiFileList::ReadCommittedFiles`
+    /// under `CommitsEachStatement`, in official DuckLake newer than the
+    /// extension DuckDB 1.5.5 loads).
     fn scan_catalog_reads(
         &self,
         with_row_ids: bool,

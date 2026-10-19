@@ -1,9 +1,7 @@
 //! PostgreSQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
-use crate::catalog_read_transaction::{
-    CatalogConnection, ReadTransaction, catalog_connection, tolerating_failure,
-};
+use crate::catalog_read_transaction::{CatalogConnection, ReadTransaction, catalog_connection};
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
     render_inlined_filter,
@@ -213,6 +211,26 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("does not exist") || message.contains("undefined table")
 }
 
+/// `result`, a read of an optional catalog table the capability probe found,
+/// with a missing-table error read as `None` outside a transaction: the table
+/// was dropped since the probe, and holds nothing to read.
+///
+/// Inside a transaction (`in_transaction`) every error is returned as it is.
+/// PostgreSQL ends a transaction at its first failed statement, so no later
+/// read could run, and a read the probe found possible fails only for a reason
+/// the caller must see. A caller skips a table the probe found missing instead
+/// of reading it, so no statement is sent that is expected to fail.
+pub(crate) fn missing_table_as_none<T>(
+    result: std::result::Result<T, sqlx::Error>,
+    in_transaction: bool,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if !in_transaction && is_missing_statistics_table(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -403,6 +421,20 @@ struct SchemaCapabilities {
     /// The `ducklake_file_partition_value` table exists. A listing carries
     /// each file's partition values only when it does.
     file_partition_values: bool,
+    /// The `ducklake_partition_info` and `ducklake_partition_column` tables
+    /// exist. A table has a partition spec only when they do.
+    partition_specs: bool,
+    /// The `ducklake_sort_info` and `ducklake_sort_expression` tables exist
+    /// (DuckLake 0.4 on). A table has a sort spec only when they do.
+    sort_specs: bool,
+    /// The `ducklake_table_stats` table exists.
+    table_stats: bool,
+    /// The `ducklake_table_column_stats` table exists.
+    table_column_stats: bool,
+    /// The `ducklake_tag` table exists.
+    tags: bool,
+    /// The `ducklake_column_tag` table exists.
+    column_tags: bool,
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
@@ -431,6 +463,12 @@ impl SchemaCapabilities {
             && self.views
             && self.file_column_stats
             && self.file_partition_values
+            && self.partition_specs
+            && self.sort_specs
+            && self.table_stats
+            && self.table_column_stats
+            && self.tags
+            && self.column_tags
     }
 
     /// What the catalog's `ducklake_schema_versions` ledger records.
@@ -723,9 +761,12 @@ pub(crate) async fn inlined_table_for_flush_on(
 
 /// The inlined deletions of Parquet rows of `table_id` a flush at `snapshot_id`
 /// writes out, with their data files and live delete files, read on
-/// `connection`. A table without an inlined-deletion table has none.
+/// `connection`. A table without an inlined-deletion table has none: check
+/// that it exists first. `in_transaction` says whether `connection` is inside
+/// a transaction (see [`missing_table_as_none`]).
 pub(crate) async fn inlined_file_deletes_for_flush_on(
     connection: &mut PgConnection,
+    in_transaction: bool,
     table_id: i64,
     snapshot_id: i64,
 ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
@@ -738,10 +779,9 @@ pub(crate) async fn inlined_file_deletes_for_flush_on(
     for _ in 0..crate::metadata_provider::INLINED_FILE_DELETES_FOR_FLUSH_PARAMS {
         query = query.bind(snapshot_id);
     }
-    let rows = match query.fetch_all(&mut *connection).await {
-        Ok(rows) => rows,
-        Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+    let Some(rows) = missing_table_as_none(query.fetch_all(connection).await, in_transaction)?
+    else {
+        return Ok(Vec::new());
     };
     rows.iter()
         .map(|row| {
@@ -774,26 +814,29 @@ pub(crate) async fn inlined_file_deletes_for_flush_on(
 
 /// The inlined deletions of Parquet rows of `table_id` committed after
 /// `start_snapshot` and at or below `end_snapshot`, read on `connection`. A
-/// table without an inlined-deletion table has none.
+/// table without an inlined-deletion table has none: check that it exists
+/// first. `in_transaction` says whether `connection` is inside a transaction
+/// (see [`missing_table_as_none`]).
 pub(crate) async fn inlined_file_deletes_between_on(
     connection: &mut PgConnection,
+    in_transaction: bool,
     table_id: i64,
     start_snapshot: i64,
     end_snapshot: i64,
 ) -> Result<Vec<InlinedFileDeleteChange>> {
     let table = quote_ident(&inlined_delete_table_name(table_id)?);
     let sql = inlined_file_deletes_between_sql(&table, ["$1", "$2", "$3"]);
-    match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+    let rows = sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
         .bind(table_id)
         .bind(start_snapshot)
         .bind(end_snapshot)
-        .fetch_all(&mut *connection)
-        .await
-    {
-        Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
-        Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
-        Err(error) => Err(error.into()),
-    }
+        .fetch_all(connection)
+        .await;
+    Ok(missing_table_as_none(rows, in_transaction)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(inlined_file_delete_change)
+        .collect())
 }
 
 /// The begin snapshot of delete file `delete_file_id`, read on `connection`.
@@ -1316,6 +1359,23 @@ impl PostgresMetadataProvider {
         catalog_connection(self.read.as_deref(), &self.pool).await
     }
 
+    /// Run `read`, a read of an optional catalog table, on the connection of
+    /// [`Self::connection`] when the capability probe found the table
+    /// (`present`), else `None` without a statement. See
+    /// [`missing_table_as_none`] for a read that fails.
+    async fn read_if_present<T>(
+        &self,
+        present: bool,
+        read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, sqlx::Error>,
+    ) -> Result<Option<T>> {
+        if !present {
+            return Ok(None);
+        }
+        let mut connection = self.connection().await?;
+        let in_read = connection.in_read();
+        missing_table_as_none(read(&mut connection).await, in_read)
+    }
+
     /// Whether `table_id`'s inlined-deletion table, named `table`, exists for a
     /// read at `snapshot_id`.
     ///
@@ -1332,8 +1392,14 @@ impl PostgresMetadataProvider {
         if let Some(exists) = self.inlined_deletion_tables.known(table_id, snapshot_id) {
             return Ok(exists);
         }
-        // The head is read in the same statement as the check, so both describe
-        // one state of the catalog.
+        // `to_regclass` looks the name up in the catalog as it is now. Inside a
+        // consistent read's `REPEATABLE READ` transaction, `MAX(snapshot_id)`
+        // reads the transaction's snapshot, which can be older. Recording
+        // `min(snapshot_id, head)` stays safe: a table the check misses is
+        // created, if ever, by a commit after the check, whose snapshot is
+        // above the head now and so above the transaction's head too. A table
+        // the check finds is read at the transaction's snapshot, which shows
+        // none of the deletions committed after it.
         let (exists, head): (bool, i64) = sqlx::query_as(
             "SELECT to_regclass($1) IS NOT NULL,
                     (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot)",
@@ -1411,19 +1477,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-            bool,
-        ) = sqlx::query_as(
+        let row = sqlx::query(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -1440,22 +1494,36 @@ impl PostgresMetadataProvider {
                        WHERE table_name = 'ducklake_schema_versions'
                          AND column_name = 'table_id'),
                to_regclass('ducklake_file_column_stats') IS NOT NULL,
-               to_regclass('ducklake_file_partition_value') IS NOT NULL",
+               to_regclass('ducklake_file_partition_value') IS NOT NULL,
+               to_regclass('ducklake_partition_info') IS NOT NULL
+                 AND to_regclass('ducklake_partition_column') IS NOT NULL,
+               to_regclass('ducklake_sort_info') IS NOT NULL
+                 AND to_regclass('ducklake_sort_expression') IS NOT NULL,
+               to_regclass('ducklake_table_stats') IS NOT NULL,
+               to_regclass('ducklake_table_column_stats') IS NOT NULL,
+               to_regclass('ducklake_tag') IS NOT NULL,
+               to_regclass('ducklake_column_tag') IS NOT NULL",
         )
         .fetch_one(&mut *self.connection().await?)
         .await?;
         let caps = SchemaCapabilities {
-            data_file_partial_max: row.0,
-            delete_file_partial_max: row.1,
-            schema_versions: row.2,
-            schema_versions_table_id: row.8,
-            data_file_partition_id: row.3,
-            inlined_data_tables: row.4,
-            views: row.5,
-            file_column_stats: row.9,
-            file_partition_values: row.10,
-            soft_input_validation: row.6,
-            materialized_cte: row.7,
+            data_file_partial_max: row.try_get(0)?,
+            delete_file_partial_max: row.try_get(1)?,
+            schema_versions: row.try_get(2)?,
+            schema_versions_table_id: row.try_get(8)?,
+            data_file_partition_id: row.try_get(3)?,
+            inlined_data_tables: row.try_get(4)?,
+            views: row.try_get(5)?,
+            file_column_stats: row.try_get(9)?,
+            file_partition_values: row.try_get(10)?,
+            partition_specs: row.try_get(11)?,
+            sort_specs: row.try_get(12)?,
+            table_stats: row.try_get(13)?,
+            table_column_stats: row.try_get(14)?,
+            tags: row.try_get(15)?,
+            column_tags: row.try_get(16)?,
+            soft_input_validation: row.try_get(6)?,
+            materialized_cte: row.try_get(7)?,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -1508,8 +1576,14 @@ impl PostgresMetadataProvider {
                 soft_input_validation: caps.soft_input_validation,
                 materialized_cte: caps.materialized_cte,
             };
-            let rendered = filter.and_then(|filter| filter.render(&dialect));
+            // The narrowed query reads `ducklake_file_column_stats`, and its
+            // partition pre-filters `ducklake_file_partition_value`. A catalog
+            // without one lists unnarrowed by it.
+            let rendered = filter
+                .filter(|_| caps.file_column_stats)
+                .and_then(|filter| filter.render(&dialect));
             let partitions = filter
+                .filter(|_| caps.file_partition_values)
                 .map(|filter| filter.render_partition_prefilters(&dialect, table_id))
                 .unwrap_or_default();
             let stats_sql = rendered
@@ -1558,41 +1632,45 @@ impl PostgresMetadataProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let first = {
-                let sql = listing_sql(stats_sql.as_ref());
+            let rows = {
                 let mut connection = self.connection().await?;
-                // Only the narrowed query's failure is tolerated below.
-                let savepoint = stats_sql.is_some() && connection.in_read();
-                tolerating_failure(&mut connection, savepoint, async |connection| {
-                    fetch_data_file_page(connection, &sql, table_id, snapshot_id, after, limit)
-                        .await
-                })
+                let in_read = connection.in_read();
+                match fetch_data_file_page(
+                    &mut *connection,
+                    &listing_sql(stats_sql.as_ref()),
+                    table_id,
+                    snapshot_id,
+                    after,
+                    limit,
+                )
                 .await
-            };
-            let rows = match first {
-                Ok(rows) => rows,
-                // The filter is advisory, so a catalog the narrowed query
-                // cannot run — one predating `ducklake_file_column_stats`,
-                // where joining it is a hard error, or one whose stats provoke
-                // an error the dialect did not anticipate — still lists its
-                // files. Any error retries, not just the missing table: the
-                // narrowed query is the only thing this arm adds, and listing
-                // every live file is always correct. The retry uses the same
-                // parameters, and a failure that is not the filter's fault
-                // surfaces from it.
-                Err(error) if stats_sql.is_some() => {
-                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
-                    fetch_data_file_page(
-                        &mut *self.connection().await?,
-                        &listing_sql(None),
-                        table_id,
-                        snapshot_id,
-                        after,
-                        limit,
-                    )
-                    .await?
-                },
-                Err(error) => return Err(error.into()),
+                {
+                    Ok(rows) => rows,
+                    // The filter is advisory, so outside a consistent read a
+                    // narrowed query the catalog cannot run (its stats provoke
+                    // an error the dialect did not anticipate, or a table was
+                    // dropped since the probe) lists the page again
+                    // unnarrowed. Any error retries: the narrowed query is the
+                    // only thing this arm adds, and listing every live file is
+                    // always correct. The retry uses the same parameters, and a
+                    // failure that is not the filter's fault surfaces from it.
+                    // Inside a consistent read the error ended the read's
+                    // transaction, where a retry would only fail again and hide
+                    // it, so the error fails the read.
+                    Err(error) if stats_sql.is_some() && !in_read => {
+                        crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
+                        fetch_data_file_page(
+                            &mut *connection,
+                            &listing_sql(None),
+                            table_id,
+                            snapshot_id,
+                            after,
+                            limit,
+                        )
+                        .await?
+                    },
+                    Err(error) => return Err(error.into()),
+                }
             };
             let files = rows
                 .iter()
@@ -1648,33 +1726,27 @@ impl PostgresMetadataProvider {
             if let Some(ids) = page_ids.as_deref() {
                 statistics_query = statistics_query.bind(ids);
             }
-            // A catalog without the table has no statistics. Asking for them
-            // would fail, which inside a consistent read ends its transaction.
-            let statistics = match if caps.file_column_stats {
-                statistics_query
-                    .fetch_all(&mut *self.connection().await?)
-                    .await
-            } else {
-                Ok(Vec::new())
-            } {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| {
-                        Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.try_get(0)?,
-                            column_id: row.try_get(1)?,
-                            column_size_bytes: row.try_get(2)?,
-                            value_count: row.try_get(3)?,
-                            null_count: row.try_get(4)?,
-                            min_value: row.try_get(5)?,
-                            max_value: row.try_get(6)?,
-                            contains_nan: row.try_get(7)?,
-                        })
+            // A catalog without the table has no statistics.
+            let statistics = self
+                .read_if_present(caps.file_column_stats, async |connection| {
+                    statistics_query.fetch_all(connection).await
+                })
+                .await?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| {
+                    Ok(DuckLakeFileColumnStatistics {
+                        data_file_id: row.try_get(0)?,
+                        column_id: row.try_get(1)?,
+                        column_size_bytes: row.try_get(2)?,
+                        value_count: row.try_get(3)?,
+                        null_count: row.try_get(4)?,
+                        min_value: row.try_get(5)?,
+                        max_value: row.try_get(6)?,
+                        contains_nan: row.try_get(7)?,
                     })
-                    .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
+                })
+                .collect::<Result<Vec<_>>>()?;
             let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
             for statistic in statistics {
                 statistics_by_file
@@ -1699,26 +1771,19 @@ impl PostgresMetadataProvider {
             if let Some(ids) = page_ids.as_deref() {
                 partition_values_query = partition_values_query.bind(ids);
             }
-            match if caps.file_partition_values {
-                partition_values_query
-                    .fetch_all(&mut *self.connection().await?)
-                    .await
-            } else {
-                Ok(Vec::new())
-            } {
-                Ok(rows) => {
-                    for row in rows {
-                        let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                        let value: Option<String> = row.try_get(2)?;
-                        values_by_file
-                            .entry(data_file_id)
-                            .or_default()
-                            .push((key_index, value));
-                    }
-                },
-                Err(error) if is_missing_statistics_table(&error) => {},
-                Err(error) => return Err(error.into()),
+            let partition_values = self
+                .read_if_present(caps.file_partition_values, async |connection| {
+                    partition_values_query.fetch_all(connection).await
+                })
+                .await?;
+            for row in partition_values.unwrap_or_default() {
+                let data_file_id: i64 = row.try_get(0)?;
+                let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                let value: Option<String> = row.try_get(2)?;
+                values_by_file
+                    .entry(data_file_id)
+                    .or_default()
+                    .push((key_index, value));
             }
 
             Ok(files
@@ -1743,7 +1808,7 @@ impl MetadataProvider for PostgresMetadataProvider {
     /// One pooled connection inside `BEGIN ISOLATION LEVEL REPEATABLE READ,
     /// READ ONLY`, whose snapshot the first read fixes.
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
-        if self.read.is_some() {
+        if self.read.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
         let read = Arc::new(block_on(ReadTransaction::begin(
@@ -2211,37 +2276,33 @@ impl MetadataProvider for PostgresMetadataProvider {
             // partition — without the values it would merge across partitions and
             // strip the assignment. Scoped by the fetched id range; a catalog
             // predating partition support has no values to read.
-            if let (true, Some(min), Some(max)) = (
-                caps.file_partition_values,
+            if let (Some(min), Some(max)) = (
                 files.iter().map(|f| f.data_file_id).min(),
                 files.iter().map(|f| f.data_file_id).max(),
             ) {
                 let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-                match sqlx::query(
-                    "SELECT data_file_id, partition_key_index, partition_value
+                let rows = self
+                    .read_if_present(caps.file_partition_values, async |connection| {
+                        sqlx::query(
+                            "SELECT data_file_id, partition_key_index, partition_value
                      FROM ducklake_file_partition_value
                      WHERE table_id = $1 AND data_file_id >= $2 AND data_file_id <= $3",
-                )
-                .bind(table_id)
-                .bind(min)
-                .bind(max)
-                .fetch_all(&mut *self.connection().await?)
-                .await
-                {
-                    Ok(rows) => {
-                        for row in rows {
-                            let data_file_id: i64 = row.try_get(0)?;
-                            let key_index: i32 =
-                                i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                            let value: Option<String> = row.try_get(2)?;
-                            values_by_file
-                                .entry(data_file_id)
-                                .or_default()
-                                .push((key_index, value));
-                        }
-                    },
-                    Err(error) if is_missing_statistics_table(&error) => {},
-                    Err(error) => return Err(error.into()),
+                        )
+                        .bind(table_id)
+                        .bind(min)
+                        .bind(max)
+                        .fetch_all(connection)
+                        .await
+                    })
+                    .await?;
+                for row in rows.unwrap_or_default() {
+                    let data_file_id: i64 = row.try_get(0)?;
+                    let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                    let value: Option<String> = row.try_get(2)?;
+                    values_by_file
+                        .entry(data_file_id)
+                        .or_default()
+                        .push((key_index, value));
                 }
                 for file in &mut files {
                     if let Some(values) = values_by_file.remove(&file.data_file_id) {
@@ -2255,23 +2316,29 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         block_on(async {
+            let caps = self.schema_capabilities().await?;
             // Pruning is only safe with exactly one spec generation ever (see
             // PartitionSpec::prune_safe); the live spec is returned regardless so
             // the write path always targets the current generation.
-            let generation_count: i64 = match sqlx::query_scalar(
-                "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_one(&mut *self.connection().await?)
-            .await
+            let generation_count: i64 = match self
+                .read_if_present(caps.partition_specs, async |connection| {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1",
+                    )
+                    .bind(table_id)
+                    .fetch_one(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(count) => count,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(count) => count,
+                None => return Ok(None),
             };
             let prune_safe = generation_count == 1;
-            let rows = match sqlx::query(
-                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+            let rows = match self
+                .read_if_present(caps.partition_specs, async |connection| {
+                    sqlx::query(
+                        "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
                  JOIN ducklake_partition_column AS pc
                    ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
@@ -2279,16 +2346,17 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND $2 >= pi.begin_snapshot
                    AND ($3 < pi.end_snapshot OR pi.end_snapshot IS NULL)
                  ORDER BY pc.partition_key_index",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(None),
             };
             let parsed = rows
                 .iter()
@@ -2307,8 +2375,11 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
         block_on(async {
-            let rows = match sqlx::query(
-                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+            let caps = self.schema_capabilities().await?;
+            let rows = match self
+                .read_if_present(caps.sort_specs, async |connection| {
+                    sqlx::query(
+                        "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
                         se.sort_direction, se.null_order
                  FROM ducklake_sort_info AS si
                  JOIN ducklake_sort_expression AS se
@@ -2317,16 +2388,17 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND $2 >= si.begin_snapshot
                    AND ($3 < si.end_snapshot OR si.end_snapshot IS NULL)
                  ORDER BY se.sort_key_index",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(None),
             };
             let parsed = rows
                 .iter()
@@ -2372,15 +2444,20 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
         block_on(async {
-            let table = match sqlx::query(
-                "SELECT record_count, file_size_bytes
+            let caps = self.schema_capabilities().await?;
+            let table = match self
+                .read_if_present(caps.table_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .fetch_optional(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(row) => row
+                Some(row) => row
                     .map(|row| {
                         Ok::<_, sqlx::Error>(DuckLakeTableStatistics {
                             record_count: row.try_get(0)?,
@@ -2388,11 +2465,12 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
-                Err(error) => return Err(error.into()),
+                None => None,
             };
-            let column_sizes = match sqlx::query(
-                "SELECT stats.column_id,
+            let column_sizes = match self
+                .read_if_present(caps.file_column_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT stats.column_id,
                         CASE
                           WHEN COUNT(*) = COUNT(stats.column_size_bytes)
                            AND COUNT(*) = (
@@ -2411,17 +2489,19 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND $5 >= data.begin_snapshot
                    AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
                  GROUP BY stats.column_id",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .filter_map(|row| match row.try_get::<Option<i64>, _>(1) {
                         Ok(Some(size)) => Some(row.try_get(0).map(|column_id| (column_id, size))),
@@ -2429,8 +2509,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         Err(error) => Some(Err(error)),
                     })
                     .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
-                Err(error) => return Err(error.into()),
+                None => HashMap::new(),
             };
             let bounds_are_exact: bool = sqlx::query_scalar(
                 "SELECT NOT EXISTS (
@@ -2445,15 +2524,19 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(snapshot_id)
             .fetch_one(&mut *self.connection().await?)
             .await?;
-            let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+            let columns = match self
+                .read_if_present(caps.table_column_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         let column_id = row.try_get(0)?;
@@ -2468,8 +2551,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
             Ok(DuckLakeStatistics {
                 table,
@@ -2481,15 +2563,20 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         block_on(async {
-            let table = match sqlx::query(
-                "SELECT record_count, file_size_bytes
+            let caps = self.schema_capabilities().await?;
+            let table = match self
+                .read_if_present(caps.table_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .fetch_optional(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(row) => row
+                Some(row) => row
                     .map(|row| {
                         Ok::<_, sqlx::Error>(DuckLakeTableStatistics {
                             record_count: row.try_get(0)?,
@@ -2497,19 +2584,22 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
-                Err(error) => return Err(error.into()),
+                None => None,
             };
 
-            let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+            let columns = match self
+                .read_if_present(caps.table_column_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeTableColumnStatistics {
@@ -2523,12 +2613,13 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
 
-            let files = match sqlx::query(
-                "SELECT
+            let files = match self
+                .read_if_present(caps.file_column_stats, async |connection| {
+                    sqlx::query(
+                        "SELECT
                     stats.data_file_id,
                     stats.column_id,
                     stats.column_size_bytes,
@@ -2544,14 +2635,16 @@ impl MetadataProvider for PostgresMetadataProvider {
                  WHERE stats.table_id = $1
                    AND $2 >= data.begin_snapshot
                    AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?
             {
-                Ok(rows) => rows
+                Some(rows) => rows
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeFileColumnStatistics {
@@ -2566,8 +2659,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
+                None => Vec::new(),
             };
 
             Ok(DuckLakeStatistics {
@@ -2743,7 +2835,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                 return Ok(Vec::new());
             }
             let mut connection = self.connection().await?;
-            inlined_file_deletes_for_flush_on(&mut connection, table_id, snapshot_id).await
+            let in_read = connection.in_read();
+            inlined_file_deletes_for_flush_on(&mut connection, in_read, table_id, snapshot_id).await
         })
     }
 
@@ -2762,8 +2855,15 @@ impl MetadataProvider for PostgresMetadataProvider {
                 return Ok(Vec::new());
             }
             let mut connection = self.connection().await?;
-            inlined_file_deletes_between_on(&mut connection, table_id, start_snapshot, end_snapshot)
-                .await
+            let in_read = connection.in_read();
+            inlined_file_deletes_between_on(
+                &mut connection,
+                in_read,
+                table_id,
+                start_snapshot,
+                end_snapshot,
+            )
+            .await
         })
     }
 
@@ -2791,29 +2891,34 @@ impl MetadataProvider for PostgresMetadataProvider {
                 "SELECT file_id, row_id FROM {} WHERE begin_snapshot <= $1 ORDER BY file_id, row_id",
                 quote_ident(&table)
             );
-            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(snapshot_id)
-                .fetch_all(&mut *self.connection().await?)
-                .await;
-            match rows {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| {
-                        Ok(DuckLakeInlinedDelete {
-                            data_file_id: row.try_get(0)?,
-                            row_id: row.try_get(1)?,
-                        })
-                    })
-                    .collect(),
+            let rows = match self
+                .read_if_present(true, async |connection| {
+                    sqlx::query(AssertSqlSafe(sql.as_str()))
+                        .bind(snapshot_id)
+                        .fetch_all(connection)
+                        .await
+                })
+                .await
+            {
+                Ok(Some(rows)) => rows,
                 // The table was seen, and is gone: expire dropped it with a
                 // table no surviving snapshot sees (see `InlinedDeletionTable`).
-                // A missing table holds no deletions to apply.
-                Err(error) if is_missing_statistics_table(&error) => {
+                // A missing table holds no deletions to apply, or, inside a
+                // consistent read, fails the read (see `missing_table_as_none`).
+                // Either way the memo forgets it, so the next read asks again.
+                result => {
                     self.inlined_deletion_tables.forget(table_id);
-                    Ok(Vec::new())
+                    return result.map(|_| Vec::new());
                 },
-                Err(error) => Err(error.into()),
-            }
+            };
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeInlinedDelete {
+                        data_file_id: row.try_get(0)?,
+                        row_id: row.try_get(1)?,
+                    })
+                })
+                .collect()
         })
     }
 
@@ -2929,12 +3034,13 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_tags(&self, target: TagTarget, snapshot_id: i64) -> Result<Vec<DuckLakeTag>> {
         block_on(async {
-            let result =
-                match target {
-                    TagTarget::Object {
-                        object_id,
-                        ..
-                    } => {
+            let caps = self.schema_capabilities().await?;
+            let result = match target {
+                TagTarget::Object {
+                    object_id,
+                    ..
+                } => {
+                    self.read_if_present(caps.tags, async |connection| {
                         sqlx::query(
                             "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_tag
                      WHERE object_id = $1 AND $2 >= begin_snapshot
@@ -2944,13 +3050,17 @@ impl MetadataProvider for PostgresMetadataProvider {
                         .bind(object_id)
                         .bind(snapshot_id)
                         .bind(snapshot_id)
-                        .fetch_all(&mut *self.connection().await?)
+                        .fetch_all(connection)
                         .await
-                    },
-                    TagTarget::Column {
-                        table_id,
-                        column_id,
-                    } => sqlx::query(
+                    })
+                    .await?
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    self.read_if_present(caps.column_tags, async |connection| {
+                        sqlx::query(
                         "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_column_tag
                      WHERE table_id = $1 AND column_id = $2 AND $3 >= begin_snapshot
                        AND ($4 < end_snapshot OR end_snapshot IS NULL)
@@ -2960,13 +3070,14 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .bind(column_id)
                     .bind(snapshot_id)
                     .bind(snapshot_id)
-                    .fetch_all(&mut *self.connection().await?)
-                    .await,
-                };
+                    .fetch_all(connection).await
+                    })
+                    .await?
+                },
+            };
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {
@@ -2988,22 +3099,25 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
         block_on(async {
-            let result = sqlx::query(
-                "SELECT view_id FROM ducklake_view
+            let caps = self.schema_capabilities().await?;
+            let result = self
+                .read_if_present(caps.views, async |connection| {
+                    sqlx::query(
+                        "SELECT view_id FROM ducklake_view
                  WHERE schema_id = $1 AND view_name = $2 AND $3 >= begin_snapshot
                    AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-            )
-            .bind(schema_id)
-            .bind(name)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_optional(&mut *self.connection().await?)
-            .await;
-            match result {
-                Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
-                Ok(None) => Ok(None),
-                Err(error) if is_missing_statistics_table(&error) => Ok(None),
-                Err(error) => Err(error.into()),
+                    )
+                    .bind(schema_id)
+                    .bind(name)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_optional(connection)
+                    .await
+                })
+                .await?;
+            match result.flatten() {
+                Some(row) => Ok(Some(row.try_get(0)?)),
+                None => Ok(None),
             }
         })
     }
@@ -3146,7 +3260,10 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn list_all_object_tags(&self, snapshot_id: i64) -> Result<Vec<ObjectTag>> {
         block_on(async {
-            let result = sqlx::query(
+            let caps = self.schema_capabilities().await?;
+            let result = self
+                .read_if_present(caps.tags, async |connection| {
+                    sqlx::query(
                 "SELECT object_id, begin_snapshot, end_snapshot, key, value FROM ducklake_tag
                  WHERE $1 >= begin_snapshot
                    AND ($2 < end_snapshot OR end_snapshot IS NULL)
@@ -3154,12 +3271,12 @@ impl MetadataProvider for PostgresMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await;
+            .fetch_all(connection).await
+                })
+                .await?;
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {
@@ -3180,21 +3297,25 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn list_all_column_tags(&self, snapshot_id: i64) -> Result<Vec<ColumnTag>> {
         block_on(async {
-            let result = sqlx::query(
-                "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
+            let caps = self.schema_capabilities().await?;
+            let result = self
+                .read_if_present(caps.column_tags, async |connection| {
+                    sqlx::query(
+                        "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
                  FROM ducklake_column_tag
                  WHERE $1 >= begin_snapshot
                    AND ($2 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY table_id, column_id, key",
-            )
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await;
+                    )
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(connection)
+                    .await
+                })
+                .await?;
             let rows = match result {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
             };
             rows.into_iter()
                 .map(|row| {

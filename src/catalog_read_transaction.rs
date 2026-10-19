@@ -3,6 +3,7 @@
 //! connection every read of such a provider runs on.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlx::pool::PoolConnection;
 use sqlx::{Database, Executor, Pool};
@@ -25,6 +26,9 @@ where
     // scans at once, and a provider bound to the read can be shared by them:
     // their statements take turns on the connection.
     connection: Mutex<Option<PoolConnection<DB>>>,
+    // Cleared when the read commits, so that a provider bound to it can tell
+    // without waiting on the connection's lock.
+    open: AtomicBool,
 }
 
 impl<DB> ReadTransaction<DB>
@@ -48,7 +52,13 @@ where
         }
         Ok(Self {
             connection: Mutex::new(Some(connection)),
+            open: AtomicBool::new(true),
         })
+    }
+
+    /// Whether the read has not been committed.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
     }
 
     /// The read's connection while the read is open.
@@ -65,6 +75,7 @@ where
         let Some(mut connection) = self.connection.lock().await.take() else {
             return Ok(());
         };
+        self.open.store(false, Ordering::Release);
         if let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut *connection).await {
             connection.close_on_drop();
             return Err(error);
@@ -161,44 +172,4 @@ where
         return Ok(CatalogConnection::InRead(connection));
     }
     Ok(CatalogConnection::Pooled(pool.acquire().await?))
-}
-
-/// Run `read`, a statement whose failure its caller tolerates, on
-/// `connection`; under a savepoint when `savepoint` is set, which a statement
-/// inside a consistent read's transaction needs.
-///
-/// PostgreSQL ends a transaction at its first failed statement, and every
-/// later statement of the transaction fails until it ends. A savepoint undoes
-/// the failure, so the read goes on as it does outside a transaction. It costs
-/// two round trips, so a provider sets it only around a statement that can fail
-/// on a current catalog.
-#[cfg(feature = "metadata-postgres")]
-pub(crate) async fn tolerating_failure<T>(
-    connection: &mut sqlx::PgConnection,
-    savepoint: bool,
-    read: impl AsyncFnOnce(&mut sqlx::PgConnection) -> std::result::Result<T, sqlx::Error>,
-) -> std::result::Result<T, sqlx::Error> {
-    if !savepoint {
-        return read(connection).await;
-    }
-    sqlx::raw_sql("SAVEPOINT ducklake_tolerated_read")
-        .execute(&mut *connection)
-        .await?;
-    match read(&mut *connection).await {
-        Ok(value) => {
-            sqlx::raw_sql("RELEASE SAVEPOINT ducklake_tolerated_read")
-                .execute(&mut *connection)
-                .await?;
-            Ok(value)
-        },
-        Err(error) => {
-            sqlx::raw_sql(
-                "ROLLBACK TO SAVEPOINT ducklake_tolerated_read; \
-                 RELEASE SAVEPOINT ducklake_tolerated_read",
-            )
-            .execute(&mut *connection)
-            .await?;
-            Err(error)
-        },
-    }
 }

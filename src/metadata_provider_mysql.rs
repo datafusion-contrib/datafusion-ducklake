@@ -183,9 +183,20 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("doesn't exist")
         || message.contains("does not exist")
         || message.contains("unknown table")
-        // `ER_TABLE_DEF_CHANGED`: a consistent read reached a table created
-        // after its snapshot, which holds nothing at that snapshot.
-        || message.contains("table definition has changed")
+}
+
+/// Whether a read of a table's inlined-deletion table found none at its
+/// snapshot: the table is missing, or a consistent read reached a table created
+/// after its snapshot (`ER_TABLE_DEF_CHANGED`), which holds nothing at that
+/// snapshot. DuckLake creates and drops an inlined-deletion table, and never
+/// alters it, so for it that error means a table created since.
+fn is_absent_inlined_deletion_table(error: &sqlx::Error) -> bool {
+    const ER_TABLE_DEF_CHANGED: u16 = 1412;
+    is_missing_statistics_table(error)
+        || error
+            .as_database_error()
+            .and_then(|error| error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+            .is_some_and(|error| error.number() == ER_TABLE_DEF_CHANGED)
 }
 
 /// The system column names DuckLake gives a new inlined data table in this
@@ -952,18 +963,24 @@ impl MySqlMetadataProvider {
 }
 
 impl MetadataProvider for MySqlMetadataProvider {
-    /// One pooled connection inside `START TRANSACTION READ ONLY, WITH
-    /// CONSISTENT SNAPSHOT` at `REPEATABLE READ`, whatever the server's default
-    /// isolation level: InnoDB takes the snapshot when the transaction starts.
+    /// One pooled connection inside `START TRANSACTION READ ONLY` at
+    /// `REPEATABLE READ`, whatever the server's default isolation level: InnoDB
+    /// takes the snapshot at the transaction's first read.
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
-        if self.read.is_some() {
+        if self.read.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
         let read = Arc::new(block_on(ReadTransaction::begin(
             &self.pool,
             &[
+                // Official DuckLake begins its metadata transaction at the
+                // server's default isolation level. At `READ COMMITTED` each
+                // statement would see the commits since the last, and a merge
+                // between two pages of a listing would list rows twice; official
+                // lists a table's files in one statement, so it does not need
+                // this.
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-                "START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT",
+                "START TRANSACTION READ ONLY",
             ],
         ))?);
         let provider = Self {
@@ -2159,7 +2176,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             }
             let rows = match query.fetch_all(&mut *self.connection().await?).await {
                 Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => return Ok(Vec::new()),
                 Err(error) => return Err(error.into()),
             };
             rows.iter()
@@ -2212,7 +2229,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 .await
             {
                 Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
         })
@@ -2254,7 +2271,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         })
                     })
                     .collect(),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
         })
