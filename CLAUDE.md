@@ -257,8 +257,8 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 
 ### Current Limitations
 
-- Non-empty `CREATE TABLE AS SELECT` is rejected before publishing metadata.
-  Create an empty table, reopen the catalog, then use `INSERT INTO ... SELECT`.
+- Non-empty `CREATE TABLE AS SELECT` through `SessionContext::sql` is rejected before publishing
+  metadata; run it through `execute_ducklake_sql`.
 - Writes, including SQL `UPDATE` and `DELETE`, are supported on SQLite, DuckDB, MySQL and
   PostgreSQL; the single-catalog PostgreSQL writer supports neither `UPDATE` nor `DELETE`
   (see `COMPATIBILITY.md`)

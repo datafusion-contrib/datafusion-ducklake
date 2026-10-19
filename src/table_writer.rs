@@ -2567,6 +2567,7 @@ impl DuckLakeTableWriter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_rows_inner(
         &self,
         schema_name: &str,
@@ -2575,10 +2576,14 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         batches: &[RecordBatch],
         resolve_layout: bool,
+        columns: Option<&[ColumnDef]>,
     ) -> Result<PreparedTableWrite> {
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
-        let columns = arrow_schema_to_column_defs(&validation_schema)?;
+        let columns = match columns {
+            Some(columns) => columns.to_vec(),
+            None => arrow_schema_to_column_defs(&validation_schema)?,
+        };
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // Refused before the setup, which on some backends creates the table.
         let decision = self.inline_decision(
@@ -3218,7 +3223,42 @@ impl DuckLakeWriteTransaction<'_> {
 
         let prepared = self
             .writer
-            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .prepare_rows_inner(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                true,
+                None,
+            )
+            .await?;
+        self.writes.push(prepared);
+        Ok(())
+    }
+
+    /// Stages one table write whose catalog columns are `columns` rather than
+    /// those `arrow_schema` derives, as a CTAS records nested children nullable.
+    pub(crate) async fn stage_write_with_columns(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let prepared = self
+            .writer
+            .prepare_rows_inner(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                true,
+                Some(columns),
+            )
             .await?;
         self.writes.push(prepared);
         Ok(())
@@ -3240,7 +3280,15 @@ impl DuckLakeWriteTransaction<'_> {
 
         let writer = self.writer.clone().with_options(options);
         let prepared = writer
-            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .prepare_rows_inner(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                true,
+                None,
+            )
             .await?;
         self.writes.push(prepared);
         Ok(())
@@ -3286,7 +3334,15 @@ impl DuckLakeWriteTransaction<'_> {
             }
         }
         let mut prepared = writer
-            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .prepare_rows_inner(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                true,
+                None,
+            )
             .await?;
         prepared.write.snapshot_id_columns = snapshot_id_columns
             .iter()
