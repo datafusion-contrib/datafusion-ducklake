@@ -70,9 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DuckLakeCatalog::checkpoint` runs official's `CHECKPOINT`, and `MetadataWriter::maintenance`
   exposes expire and cleanup, on every writable backend but single-catalog PostgreSQL.
 - `cleanup_old_files_mysql` and `delete_orphaned_files_mysql` clean up MySQL catalogs.
+- `CREATE TABLE [IF NOT EXISTS] t [(columns)] AS SELECT` through `execute_ducklake_sql`: rows and
+  table metadata commit in one snapshot, with columns named and nullable as in DuckDB (#308).
 
 ### Changed
 
+- **BREAKING**: write a catalog these writers create, or `migrate_to_official_layout` migrates,
+  only with 0.10 or later; upgrade every writer of a catalog, then migrate it.
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
@@ -314,6 +318,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and row id, as official's join does, instead of an update preimage without its postimage.
 - A scan, `rowid` lookup, `DELETE`, `UPDATE`, keyed mutation or fork no longer misses or
   doubles inlined rows that a concurrent flush moves to a file between its catalog reads.
+- SQLite, DuckDB, and MySQL insert a new table's row at its commit, so a failed write leaves
+  none, and a create of a name another transaction created first conflicts.
+- Official DuckDB can attach and write, renames included, catalogs the DuckDB, SQLite, MySQL,
+  and single-catalog PostgreSQL writers create, or `migrate_to_official_layout` migrates.
+- A commit that inlines rows advances `next_file_id` as official's does, so an official session
+  sees that its table statistics changed.
 
 ## [0.9.0] - 2026-10-07
 

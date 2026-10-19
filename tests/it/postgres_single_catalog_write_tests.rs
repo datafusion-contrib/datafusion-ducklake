@@ -593,13 +593,13 @@ async fn initialize_schema_is_idempotent() {
 
     let counters: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ducklake_metadata
-         WHERE key IN ('next_column_id','next_snapshot_id','next_partition_id','next_sort_id')
+         WHERE key IN ('next_column_id','next_snapshot_id','next_catalog_id')
            AND scope IS NULL",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(counters, 4, "each id counter must be seeded exactly once");
+    assert_eq!(counters, 3, "each id counter must be seeded exactly once");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1653,5 +1653,59 @@ async fn an_empty_inlined_registry_answers_up_to_the_head() {
         absent_through(head + 100),
         Some(head),
         "never above the head"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn sql_create_table_as_select_commits_rows_in_one_snapshot() {
+    let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
+
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let head = catalog.provider().get_current_snapshot().unwrap();
+    let catalog = Arc::new(catalog);
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "lake",
+        Arc::clone(&catalog) as Arc<dyn datafusion::catalog::CatalogProvider>,
+    );
+    ctx.register_batch(
+        "source",
+        batch(vec![1, 2, 3], vec![Some("one"), None, Some("three")]),
+    )
+    .unwrap();
+
+    execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "CREATE TABLE lake.main.picked AS SELECT id, name FROM source WHERE id <> 2 ORDER BY id",
+    )
+    .await
+    .unwrap();
+
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    assert_eq!(provider.get_current_snapshot().unwrap(), head + 1);
+    let ctx = read_context(&conn_str).await;
+    let batches = ctx
+        .sql("SELECT id, name FROM lake.main.picked ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names = arrow::compute::cast(batches[0].column(1), &DataType::Utf8).unwrap();
+    let names = names.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(ids.values(), &[1, 3]);
+    assert_eq!(
+        names.iter().collect::<Vec<_>>(),
+        vec![Some("one"), Some("three")]
     );
 }

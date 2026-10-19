@@ -697,9 +697,8 @@ async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
     // A comment after a DuckDB commit keeps its watermark, however many comments follow.
     assert_eq!(watermark(comment("c1")).await, base);
     assert_eq!(watermark(comment("c2")).await, base);
-
-    // The crate allocates a partition id from its own counter and leaves the watermarks NULL.
-    // A later comment must copy that NULL, not the stale value from before the allocation.
+    // The crate takes the partition id from official's `next_catalog_id` and
+    // advances it past the id; later comments carry the advanced watermark.
     let partition = writer
         .set_partition_spec(
             env.table_id,
@@ -709,7 +708,16 @@ async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
             )],
         )
         .unwrap();
-    assert_eq!(watermark(partition).await, (None, None));
-    assert_eq!(watermark(comment("c3")).await, (None, None));
-    assert_eq!(watermark(comment("c4")).await, (None, None));
+    let partition_id: i64 = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info WHERE begin_snapshot = ?",
+    )
+    .bind(partition)
+    .fetch_one(&sqlite)
+    .await
+    .unwrap();
+    let advanced = (Some(partition_id + 1), base.1);
+    assert_eq!(Some(partition_id), base.0);
+    assert_eq!(watermark(partition).await, advanced);
+    assert_eq!(watermark(comment("c3")).await, advanced);
+    assert_eq!(watermark(comment("c4")).await, advanced);
 }

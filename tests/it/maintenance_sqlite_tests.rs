@@ -617,8 +617,9 @@ async fn delete_orphaned_files_handles_empty_schema_path() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-         VALUES (1, 't', 't', 1, 1)",
+        "INSERT INTO ducklake_table
+             (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 1, 't', 't', 1, 1)",
     )
     .execute(&p)
     .await
@@ -663,6 +664,20 @@ async fn delete_orphaned_files_handles_absolute_file_paths() {
         .writer
         .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
         .unwrap();
+    // The table row exists once a commit publishes it.
+    let committed = h
+        .writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "t",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols(),
+            &s.field_ids,
+        )
+        .unwrap();
 
     // Materialise the file at an absolute path that happens to fall under
     // data_path — that's the configuration where the SQL CASE's absolute
@@ -676,9 +691,9 @@ async fn delete_orphaned_files_handles_absolute_file_paths() {
         "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, record_count, begin_snapshot)
          VALUES (?, ?, 0, 100, 5, ?)",
     )
-    .bind(s.table_id)
+    .bind(committed.table_id)
     .bind(&abs_str)
-    .bind(s.snapshot_id)
+    .bind(committed.snapshot_id)
     .execute(&p)
     .await
     .unwrap();

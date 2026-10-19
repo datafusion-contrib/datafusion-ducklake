@@ -226,7 +226,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
 | `SELECT` against DuckLake tables                                                                                                                                                                                                                                                                                                 | ✅        |
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
-| Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
+| `CREATE TABLE [IF NOT EXISTS] … AS SELECT` via `execute_ducklake_sql` — rows and table metadata in one snapshot, nullable columns as in DuckDB, an empty result publishes no data file; SQLite, DuckDB, MySQL, and single-catalog PostgreSQL                                                                                     | ✅        |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional deletes, inlined deletions of Parquet rows under the scoped `data_inlining_row_limit`, and inlined-row deletes, mixed in one snapshot; metadata-only truncate; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                      | ✅        |
@@ -398,17 +398,31 @@ settings, including `execution.time_zone`, are not inherited.
 
 ---
 
-Non-empty `CREATE TABLE AS SELECT` is rejected before any table metadata is
-published. Create an empty table, reopen the catalog to see its committed
-snapshot, and use `INSERT INTO ... SELECT` to write rows. CTAS support requires
-session and object-store handling that the registration path does not provide.
+`CREATE TABLE … AS SELECT` runs through `execute_ducklake_sql` when its name,
+resolved with the session's default catalog and schema, names the DuckLake
+catalog the call runs against; any other CTAS goes to DataFusion. It plans the
+query on the session, derives nullable columns from its schema, and commits the
+rows and the table metadata in one snapshot through the session's object store
+with the same write options as `INSERT`. Columns are named as DuckDB names
+them: a column list such as `CREATE TABLE t (a, b) AS …` renames the leading
+columns, and without one a repeated name, compared ignoring case, takes a `_1`,
+`_2`, … suffix. `IF NOT EXISTS` is a no-op on an existing table or view. A
+table another transaction creates under the name while the query runs makes the
+CTAS conflict, as official refuses the create. `OR REPLACE` and a column list
+with types fail closed. Every column and nested child is nullable, as in
+official. `SessionContext::sql` still rejects a non-empty CTAS before
+publishing metadata, because DataFusion hands the materialized rows to a
+synchronous registration hook that has no object store; an empty CTAS through
+it keeps creating the empty table.
 
 ## Write concurrency
 
 Write commits allocate a snapshot and publish their data and final metadata in
-one database transaction. Write setup retains each backend's existing schema
-and table reservation behavior; PostgreSQL layouts reserve identifiers without
-publishing schema or table rows.
+one database transaction. Write setup reserves the schema and table identifiers
+of a new table and the commit inserts their rows, as official DuckLake does, so
+a write that fails after setup leaves no row. A commit that finds the name
+taken by a table another transaction created conflicts instead of writing into
+it.
 
 `DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
 MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field
@@ -904,6 +918,24 @@ Known edges:
   it forward, matching upstream's `if (SchemaChangesMade()) schema_version++`. These branches
   deliberately retain their existing counter or sequence allocation instead of adding the
   separate Group 9 snapshot-allocator change.
+- **Official DuckDB can write a catalog this crate created.** On DuckDB, SQLite, MySQL, and
+  single-catalog PostgreSQL metadata, the writers lay out `ducklake_schema`, `ducklake_table`,
+  `ducklake_data_file`, and `ducklake_delete_file` with official's columns, order and keys, since
+  official inserts into them by position and keeps one `ducklake_table` row per version of a
+  table, and create every table official reads. Schema, table, partition, and sort ids come from
+  official's `next_catalog_id` namespace and file ids from its `next_file_id` one, which every
+  snapshot carries as the watermarks official allocates from; either side then allocates past
+  the other's ids, and a commit that inlines rows advances `next_file_id` once per table, as
+  official's does. Initialization only adds what an older catalog lacks, so a release before 0.10
+  keeps writing it; `migrate_to_official_layout` then rebuilds it into official's layout
+  (idempotent, lossless, blocking the tables' writers while it runs), after which only 0.10 or
+  later should write it: an older release fails to create a table (and, on DuckDB, to add a
+  file), and its snapshots lack the watermarks official reads. Until then the writers also take
+  ids past the counters and sequences older releases allocate from. The multi-catalog PostgreSQL layout is library-specific and stays
+  unattachable by official. Official DuckDB 1.5.5's MySQL connector cannot append to an existing
+  table on any MySQL catalog, its own included. This crate writes a table's files under its
+  schema and table names, not its stored path, so a file it writes to a table official renamed
+  lands outside the table's directory, and neither side reads it.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

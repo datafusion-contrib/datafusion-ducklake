@@ -2038,10 +2038,6 @@ impl Lake {
                 .await
                 .unwrap();
                 pool.close().await;
-                crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(
-                    &copy,
-                )
-                .await;
                 Some(Metadata::Sqlite(copy))
             },
             Kind::Duckdb => {

@@ -1102,21 +1102,21 @@ async fn mysql_positional_delete_snapshot_records_changes_made() {
     );
 }
 
-/// Staging a table (begin_write_transaction) and abandoning the write leaves a
-/// table row with zero live columns; the next write must create the columns at
-/// its commit instead of failing with a retryable-looking Conflict.
+/// Staging a table (begin_write_transaction) and abandoning the write leaves no
+/// table row; the next write creates the table and its columns at its commit
+/// instead of failing with a retryable-looking Conflict.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn mysql_first_write_commits_after_abandoned_staging() {
     let (_container, writer, pool) = start_writer().await;
     let columns = int_column();
-    // Stage the table but never write: it persists with zero live columns.
+    // Stage the table but never write: only its id was reserved.
     let staged = writer
         .begin_write_transaction("main", "t", &columns, WriteMode::Append)
         .unwrap();
     // The next write's commit creates the columns rather than conflicting.
     let (setup, commit) = append(&writer, "a.parquet", 2);
-    assert_eq!(setup.table_id, staged.table_id);
+    assert_ne!(setup.table_id, staged.table_id);
     assert_eq!(commit.snapshot_id, 1, "abandoned staging left no snapshot");
     let live_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ducklake_column
@@ -1129,7 +1129,7 @@ async fn mysql_first_write_commits_after_abandoned_staging() {
     assert_eq!(live_columns, 1);
 }
 
-/// Every data/delete-file insert path draws from the explicit counters, so a
+/// Every data/delete-file insert path draws from the one `next_file_id` counter, so a
 /// sequence mixing appends (formerly AUTO_INCREMENT) with UPDATE-style and
 /// compaction registrations (always explicit) allocates distinct ids. Under the
 /// old split allocators the UPDATE's explicit id would have collided with the
@@ -1143,7 +1143,8 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
     append(&writer, "b.parquet", 2);
     let a_id = file_id(&pool, "a.parquet").await;
     let b_id = file_id(&pool, "b.parquet").await;
-    assert_eq!((a_id, b_id), (1, 2), "appends allocate from the counter");
+    // File ids start at 0, as official numbers them.
+    assert_eq!((a_id, b_id), (0, 1), "appends allocate from the counter");
 
     // UPDATE-style commit: register the rewritten file and swap a's delete file
     // in one snapshot. Its explicit ids must not collide with the appends.
@@ -1177,9 +1178,9 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
             .unwrap();
     assert_eq!(
         (c_id, delete_id),
-        (3, 1),
-        "the UPDATE's data file continues the shared space; delete files have \
-         their own counter"
+        (2, 3),
+        "the UPDATE's data file and delete file continue the space data and delete \
+         files share, as official's `next_file_id`"
     );
     assert_eq!(
         changes_made(&pool, update_commit.snapshot_id).await,
@@ -1671,4 +1672,77 @@ async fn mysql_orphan_inlined_table_is_ignored_and_replaced() {
         "{text}"
     );
     assert_eq!(mysql_table_count(pool, "t").await, 3);
+}
+
+/// A create inserts its table row at the commit: a write that fails after
+/// setup leaves no row, so later commits expose no column-less table and a
+/// retry creates it, and of two writes creating one table the second to commit
+/// conflicts, as official DuckLake refuses it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_create_inserts_the_table_row_at_its_commit() {
+    let (_container, writer, pool) = start_writer().await;
+    let columns = int_column();
+    let publish = |name: &str, setup: &WriteSetupResult| {
+        writer.publish_snapshot(
+            setup.table_id,
+            "main",
+            name,
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+    };
+    let table_rows = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ducklake_table WHERE table_name = ?")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // A setup its write never commits, as after a failed upload.
+    writer
+        .begin_write_transaction("main", "failed", &columns, WriteMode::Replace)
+        .unwrap();
+    let after_failure = table_rows("failed").await;
+    append(&writer, "later.parquet", 3);
+    let after_later_commit = table_rows("failed").await;
+    let retried = writer
+        .begin_write_transaction("main", "failed", &columns, WriteMode::Replace)
+        .unwrap();
+    let created = publish("failed", &retried).unwrap();
+
+    let first = writer
+        .begin_write_transaction("main", "twice", &columns, WriteMode::Replace)
+        .unwrap();
+    let second = writer
+        .begin_write_transaction("main", "twice", &columns, WriteMode::Replace)
+        .unwrap();
+    publish("twice", &first).unwrap();
+    let error = publish("twice", &second).unwrap_err();
+
+    assert_eq!(after_failure, 0);
+    assert_eq!(after_later_commit, 0);
+    assert_eq!(created.table_id, retried.table_id);
+    assert_eq!(table_rows("failed").await, 1);
+    assert_eq!(
+        changes_made(&pool, created.snapshot_id).await,
+        Some(format!(
+            "created_table:\"main\".\"failed\",inserted_into_table:{}",
+            retried.table_id
+        ))
+    );
+    assert_ne!(first.table_id, second.table_id);
+    assert!(
+        matches!(&error, datafusion_ducklake::DuckLakeError::Conflict(message)
+            if message == "table \"main\".\"twice\" was created by another transaction; retry the write"),
+        "{error}"
+    );
+    assert_eq!(table_rows("twice").await, 1);
 }
