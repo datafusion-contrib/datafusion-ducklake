@@ -622,8 +622,11 @@ async fn reads_without_optional_tables(provider: Arc<dyn MetadataProvider>, sche
 
 /// A consistent read of a PostgreSQL catalog without its optional tables
 /// reads each as empty, as a read outside one does, and sends no statement
-/// that fails: it uses no savepoint either (`pg_stat_statements` sees every
-/// statement the server ran).
+/// that fails. Every read after the first succeeding in the same transaction
+/// shows that no statement failed, as a failed one ends the transaction. That
+/// the server ran no `SAVEPOINT` is the guard against a read that hides a
+/// failure under one (`pg_stat_statements` records completed statements, so it
+/// counts the savepoints but not a failed statement).
 #[cfg(feature = "write-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
@@ -681,7 +684,7 @@ async fn a_postgres_read_skips_missing_optional_tables() {
     reads_without_optional_tables(Arc::new(PostgresMetadataProvider::from_pool(pool)), "main")
         .await;
 
-    // The reads are counted, so a savepoint would be too.
+    // The reads completed and are counted, so a savepoint would be too.
     let (savepoints, snapshot_reads): (i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE query ILIKE '%savepoint%'),
                 count(*) FILTER (WHERE query ILIKE '%ducklake_snapshot%')
@@ -784,11 +787,99 @@ mod multicatalog {
         .await;
     }
 
-    /// A provider bound to a read session reads on the session's connection,
-    /// in one transaction that the session's first read begins and its end
-    /// commits. A consistent read of the provider reads in it, and ending the
-    /// read ends nothing. After the session ends, the provider reads through
-    /// the pool and sees the commits since.
+    /// A flush that commits between a consistent read's read of the inlined
+    /// rows and its file listing moves no row out of the read: inside it the
+    /// rows are still inlined and the flush's file is not listed. A read after
+    /// it sees the file and no inlined row.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    async fn a_flush_between_a_multicatalog_reads_moves_no_row_out_of_it() {
+        use datafusion::prelude::SessionContext;
+        use datafusion_ducklake::DuckLakeCatalog;
+
+        let (container, writer, provider) = store(1).await;
+        let temp = TempDir::new().unwrap();
+        writer
+            .set_data_path(temp.path().join("data").to_str().unwrap())
+            .unwrap();
+        let tables =
+            DuckLakeTableWriter::new(Arc::clone(&writer), Arc::new(LocalFileSystem::new()))
+                .unwrap()
+                .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
+        tables
+            .write_table("public", "t", &[batch(0..100)])
+            .await
+            .unwrap();
+        tables
+            .append_table("public", "t", &[batch(100..102)])
+            .await
+            .unwrap();
+        // The flush reads through a pool of its own: the provider's one
+        // connection is the read's.
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let pool = PgPool::connect(&format!(
+            "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+        let flusher = DuckLakeCatalog::with_writer(
+            Arc::new(
+                MulticatalogProvider::with_pool_and_id(pool, provider.catalog_id())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::clone(&writer),
+        )
+        .unwrap();
+
+        let read = provider
+            .begin_consistent_read()
+            .unwrap()
+            .expect("the provider begins a consistent read");
+        let bound = Arc::clone(read.provider());
+        let head = bound.get_current_snapshot().unwrap();
+        let schema_id = bound
+            .get_schema_by_name("public", head)
+            .unwrap()
+            .expect("the schema")
+            .schema_id;
+        let table_id = bound
+            .get_table_by_name(schema_id, "t", head)
+            .unwrap()
+            .expect("table t")
+            .table_id;
+        let columns = bound.get_table_structure(table_id, head).unwrap();
+        let inlined: usize = bound
+            .read_inlined_rows(
+                table_id,
+                &columns,
+                InlinedRowSelection::VisibleAt(head),
+                None,
+            )
+            .unwrap()
+            .iter()
+            .map(|rows| rows.batch.num_rows())
+            .sum();
+        assert_eq!(inlined, 2);
+
+        let flushed = flusher
+            .flush_inlined_data(&SessionContext::new().state(), Some("public"), Some("t"))
+            .await
+            .unwrap();
+        assert_eq!(flushed.len(), 1);
+        assert!(writer.head_snapshot().unwrap() > Some(head));
+
+        assert_eq!(seen(bound.as_ref(), table_id), (1, 2));
+        drop(bound);
+        read.end().unwrap();
+        assert_eq!(seen(&provider, table_id), (2, 0));
+    }
+
+    /// A provider bound to a read session reads on the session's connection.
+    /// The reads open on it at once share one transaction: the first begins it
+    /// and the last to end commits it. So a read begun while another is open
+    /// sees that one's state, and a read begun after both ended sees the
+    /// commits since.
     #[tokio::test(flavor = "multi_thread")]
     #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn reads_on_a_read_session_share_one_transaction() {
@@ -808,95 +899,40 @@ mod multicatalog {
         let session = provider.begin_read_session().await.unwrap();
         let bound = provider.with_read_session(&session).unwrap();
         let head = bound.get_current_snapshot().unwrap();
+
+        let first = bound.begin_consistent_read().unwrap().expect("a read");
+        assert_eq!(first.provider().get_current_snapshot().unwrap(), head);
         tables
             .append_table("public", "t", &[batch(100..200)])
             .await
             .unwrap();
-        assert!(writer.head_snapshot().unwrap() > Some(head));
-        assert_eq!(bound.get_current_snapshot().unwrap(), head);
-
-        let first = bound.begin_consistent_read().unwrap().expect("a read");
-        assert_eq!(first.provider().get_current_snapshot().unwrap(), head);
-        first.end().unwrap();
-        assert_eq!(bound.get_current_snapshot().unwrap(), head);
         let second = bound.begin_consistent_read().unwrap().expect("a read");
         assert_eq!(second.provider().get_current_snapshot().unwrap(), head);
+        first.end().unwrap();
+        // The second read is still open, and so is the transaction.
+        assert_eq!(second.provider().get_current_snapshot().unwrap(), head);
+        assert_eq!(bound.get_current_snapshot().unwrap(), head);
         second.end().unwrap();
-
-        session.end().await.unwrap();
         let moved = bound.get_current_snapshot().unwrap();
         assert!(moved > head);
-        // A read begun after the session ended takes a connection of its own.
+
         let third = bound.begin_consistent_read().unwrap().expect("a read");
         assert_eq!(third.provider().get_current_snapshot().unwrap(), moved);
-        third.end().unwrap();
-    }
-
-    /// `SELECT count(id)` of table `t` of a catalog over `provider`, through
-    /// a scan of its files.
-    async fn scanned_count(provider: Arc<dyn MetadataProvider>) -> i64 {
-        use datafusion::prelude::SessionContext;
-        use datafusion_ducklake::DuckLakeCatalog;
-
-        let head = provider.get_current_snapshot().unwrap();
-        let ctx = SessionContext::new();
-        ctx.register_catalog(
-            "lake",
-            Arc::new(DuckLakeCatalog::with_snapshot(provider, head).unwrap()),
-        );
-        let batches = ctx
-            .sql("SELECT count(id) FROM lake.public.t WHERE id >= 0")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count is Int64")
-            .value(0)
-    }
-
-    /// Two queries on one read session, with a commit between them, read one
-    /// state of the catalog: the head, the table lookups and the scans. A
-    /// query on the next session sees the commit.
-    #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-    async fn the_queries_of_a_read_session_read_one_state() {
-        let (_container, writer, provider) = store(2).await;
-        let temp = TempDir::new().unwrap();
-        let data_path = temp.path().join("data");
-        writer.set_data_path(data_path.to_str().unwrap()).unwrap();
-        let tables =
-            DuckLakeTableWriter::new(Arc::clone(&writer), Arc::new(LocalFileSystem::new()))
-                .unwrap();
-        tables
-            .write_table("public", "t", &[batch(0..100)])
-            .await
-            .unwrap();
-
-        let session = provider.begin_read_session().await.unwrap();
-        let bound: Arc<dyn MetadataProvider> =
-            Arc::new(provider.with_read_session(&session).unwrap());
-        assert_eq!(scanned_count(Arc::clone(&bound)).await, 100);
-        tables
-            .append_table("public", "t", &[batch(100..150)])
-            .await
-            .unwrap();
-        assert_eq!(scanned_count(Arc::clone(&bound)).await, 100);
+        let ended = Arc::clone(third.provider());
+        // Ending the session commits the read open on it.
         session.end().await.unwrap();
-
-        let next = provider.begin_read_session().await.unwrap();
-        let bound: Arc<dyn MetadataProvider> = Arc::new(provider.with_read_session(&next).unwrap());
-        assert_eq!(scanned_count(bound).await, 150);
-        next.end().await.unwrap();
+        third.end().unwrap();
+        assert_eq!(provider.get_current_snapshot().unwrap(), moved);
+        // A read through the ended read's provider begins a new one, on a
+        // pooled connection of its own.
+        let fourth = ended.begin_consistent_read().unwrap().expect("a read");
+        assert_eq!(fourth.provider().get_current_snapshot().unwrap(), moved);
+        fourth.end().unwrap();
     }
 
-    /// The reads of a read session of a store without its optional tables
-    /// read each as empty, in the session's one transaction, which stays usable
-    /// to its end.
+    /// A consistent read on a read session of a store without its optional
+    /// tables reads each as empty, and its transaction on the session's
+    /// connection stays usable to its end.
     #[tokio::test(flavor = "multi_thread")]
     #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn a_read_session_skips_missing_optional_tables() {
@@ -934,4 +970,134 @@ mod multicatalog {
         .await;
         session.end().await.unwrap();
     }
+}
+
+/// A consistent read of a MySQL catalog whose snapshot predates the table's
+/// inlined-deletion table reads no inlined deletions: MySQL refuses a read of a
+/// table created after the snapshot (`ER_TABLE_DEF_CHANGED`, 1412), and the
+/// table holds nothing at the snapshot. The same error on another read still
+/// fails it.
+#[cfg(feature = "write-mysql")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_mysql_read_before_the_inlined_deletion_table_reads_none() {
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, MySqlMetadataProvider, MySqlMetadataWriter};
+    use sqlx::mysql::MySqlPoolOptions;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::mysql::Mysql;
+
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    let writer = Arc::new(
+        MySqlMetadataWriter::new_with_init(&url)
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(10),
+    );
+    let temp = TempDir::new().unwrap();
+    writer
+        .set_data_path(temp.path().join("data").to_str().unwrap())
+        .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
+        .write_table("main", "t", &[batch(0..100)])
+        .await
+        .unwrap();
+    let admin = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let deletion_tables = async || -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables
+             WHERE table_schema = 'test' AND table_name LIKE 'ducklake_inlined_delete%'",
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+    };
+    assert_eq!(deletion_tables().await, 0);
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(POOL_WAIT)
+        .connect(&url)
+        .await
+        .unwrap();
+    let provider = MySqlMetadataProvider::from_pool(pool);
+    let read = provider
+        .begin_consistent_read()
+        .unwrap()
+        .expect("the provider begins a consistent read");
+    let bound = Arc::clone(read.provider());
+    // The first read fixes the read's snapshot.
+    let head = bound.get_current_snapshot().unwrap();
+    let schema_id = bound
+        .get_schema_by_name("main", head)
+        .unwrap()
+        .expect("the schema")
+        .schema_id;
+    let table_id = bound
+        .get_table_by_name(schema_id, "t", head)
+        .unwrap()
+        .expect("table t")
+        .table_id;
+
+    // The table's first inlined deletion creates its inlined-deletion table.
+    let ctx = SessionContext::new();
+    DuckLakeCatalog::register(
+        &ctx,
+        "lake",
+        DuckLakeCatalog::with_writer(
+            Arc::new(MySqlMetadataProvider::new(&url).await.unwrap()),
+            writer.clone(),
+        )
+        .unwrap(),
+    );
+    ctx.sql("DELETE FROM lake.main.t WHERE id < 5")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(deletion_tables().await, 1);
+    let moved = writer.head_snapshot().unwrap().expect("a head");
+    assert!(moved > head);
+
+    // Inside the read, the table did not exist yet.
+    assert!(
+        bound
+            .get_inlined_deletes(table_id, head)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bound
+            .get_inlined_file_deletes_for_flush(table_id, head)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bound
+            .get_inlined_file_deletes_between(table_id, 0, head)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(bound.get_current_snapshot().unwrap(), head);
+
+    // A table rebuilt since the snapshot raises the same error, which fails
+    // any other read.
+    sqlx::query("ALTER TABLE ducklake_view ENGINE = InnoDB")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let error = bound.list_views(schema_id, head).unwrap_err().to_string();
+    assert!(error.contains("1412"), "{error}");
+    drop(bound);
+    let _ = read.end();
+
+    assert_eq!(
+        provider.get_inlined_deletes(table_id, moved).unwrap().len(),
+        5
+    );
 }

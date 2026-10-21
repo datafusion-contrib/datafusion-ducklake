@@ -3339,6 +3339,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// [`ConsistentRead::within`] itself, so a caller inside a read shares it.
     /// A provider bound to a read that has ended begins a new one.
     ///
+    /// This API may change as the crate moves to one catalog transaction per
+    /// query (#394).
+    ///
     /// The default returns `None`: each read sees the catalog as of its own
     /// statement. A scan then checks its listing against the next data file id
     /// read with its inlined rows ([`DuckLakeInlinedRows::next_file_id`]) and
@@ -3379,6 +3382,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 /// it (a SQLite catalog in rollback-journal mode), and the database keeps the
 /// rows it shows until it ends. See
 /// [`MetadataProvider::begin_consistent_read`] for wrapping providers.
+///
+/// This API may change as the crate moves to one catalog transaction per query
+/// (#394).
 #[must_use = "a consistent read holds a transaction until it ends or drops"]
 pub struct ConsistentRead {
     provider: Arc<dyn MetadataProvider>,

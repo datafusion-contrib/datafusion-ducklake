@@ -1387,23 +1387,53 @@ async fn test_schema_capability_probe_memoized_positive_only() {
     migrate_fixture_to_current_schema(&provider.pool)
         .await
         .expect("Failed to migrate fixture schema");
+    sqlx::query("DROP TABLE ducklake_column_tag")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
 
-    // Fully-migrated catalog: the first scan probes once (all capabilities
-    // true) and memoizes; the second scan reuses the memo and must return
-    // identical results.
+    // One optional table missing: the probe memoizes the capabilities it finds
+    // present, but not the missing one, so the memo is incomplete and every
+    // call probes again. The results do not change.
     assert!(!provider.schema_capabilities_cached());
     let first = provider
         .get_table_files_for_select(1, 1)
         .expect("Should get table files");
+    assert_eq!(first.len(), 2);
     assert!(
-        provider.schema_capabilities_cached(),
-        "an all-true probe result must be cached after the first call"
+        !provider.schema_capabilities_cached(),
+        "a capability found missing must not be cached"
     );
     let second = provider
         .get_table_files_for_select(1, 1)
         .expect("Should get table files");
-    assert_eq!(first.len(), 2);
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    assert!(!provider.schema_capabilities_cached());
+
+    // The catalog gains the missing table. The next call probes only the
+    // capabilities not yet found present, so it completes the memo even though
+    // a table found present before is gone now: DuckLake never drops one, and
+    // a capability found present is not probed again.
+    sqlx::query("DROP TABLE ducklake_tag")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_column_tag (
+             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT,
+             end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+    )
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+    let third = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        provider.schema_capabilities_cached(),
+        "every catalog capability is known present after the upgrade"
+    );
+    assert_eq!(format!("{first:?}"), format!("{third:?}"));
 
     // Clones share the memo (the cell is Arc-shared).
     assert!(provider.clone().schema_capabilities_cached());

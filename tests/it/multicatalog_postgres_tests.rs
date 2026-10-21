@@ -9657,6 +9657,250 @@ async fn a_query_reads_the_catalog_on_its_read_session_alone() {
     let _second = small.acquire().await.unwrap();
 }
 
+/// A catalog `name` holding table `main.t`: ids 0 to 29 in three Parquet
+/// files, ids 30 to 32 inlined, and inlined deletions of ids 0 to 7, all in
+/// the first file. Returns the catalog id, its writer and the directory the
+/// files are in.
+async fn bound_compaction_fixture(
+    pool: &PgPool,
+    name: &str,
+) -> (i64, Arc<PostgresMetadataWriter>, tempfile::TempDir) {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, DuckLakeWriteOptions};
+    use object_store::local::LocalFileSystem;
+
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog(name)
+        .await
+        .unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(10),
+    );
+    let temp = tempfile::TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let rows = |ids: std::ops::Range<i64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(ids))],
+        )
+        .unwrap()
+    };
+    let to_files = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    to_files
+        .write_table("main", "t", &[rows(0..10)])
+        .await
+        .unwrap();
+    for ids in [10..20, 20..30] {
+        to_files
+            .append_table("main", "t", &[rows(ids)])
+            .await
+            .unwrap();
+    }
+    DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
+        .append_table("main", "t", &[rows(30..33)])
+        .await
+        .unwrap();
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    DuckLakeCatalog::register(
+        &ctx,
+        "lake",
+        DuckLakeCatalog::with_writer(Arc::new(provider.clone()), writer.clone()).unwrap(),
+    );
+    ctx.sql("DELETE FROM lake.main.t WHERE id < 8")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let table = provider
+        .get_table_by_name(
+            provider
+                .get_schema_by_name("main", head)
+                .unwrap()
+                .unwrap()
+                .schema_id,
+            "t",
+            head,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !provider
+            .get_inlined_deletes(table.table_id, head)
+            .unwrap()
+            .is_empty(),
+        "the fixture's deletions are inlined"
+    );
+    (catalog_id, writer, temp)
+}
+
+/// A merge or rewrite of `main.t` of the catalog `catalog_id`, under
+/// [`InlinedFlushPolicy::always`], through a table whose catalog reads run on
+/// a read session (`bound`) that has already read the head, else through the
+/// pool. Returns the result, then the live data files, the rows and their sum
+/// as a provider of its own reads them afterwards.
+async fn compact_bound_or_not(
+    pool: &PgPool,
+    catalog_id: i64,
+    writer: Arc<PostgresMetadataWriter>,
+    bound: bool,
+    merge: bool,
+) -> (datafusion_ducklake::CompactionResult, usize, i64, i64) {
+    use arrow::array::Int64Array;
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{
+        DuckLakeCatalog, DuckLakeTable, DuckLakeWriteOptions, InlinedFlushPolicy, MergeOptions,
+        RewriteOptions,
+    };
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let session = provider.begin_read_session().await.unwrap();
+    let reads: Arc<dyn MetadataProvider> = if bound {
+        let bound = provider.with_read_session(&session).unwrap();
+        bound.get_current_snapshot().unwrap();
+        Arc::new(bound)
+    } else {
+        Arc::new(provider.clone())
+    };
+    let catalog = DuckLakeCatalog::with_writer(reads, writer)
+        .unwrap()
+        .with_write_options(
+            DuckLakeWriteOptions::default().with_inlined_flush_policy(InlinedFlushPolicy::always()),
+        );
+    let table = catalog
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = table
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLake table");
+    let state = SessionContext::new().state();
+    let result = if merge {
+        table
+            .merge_adjacent_files(&state, MergeOptions::default())
+            .await
+    } else {
+        table
+            .rewrite_data_files(
+                &state,
+                RewriteOptions {
+                    delete_threshold: 0.5,
+                    data_file_ids: None,
+                },
+            )
+            .await
+    }
+    .unwrap();
+    session.end().await.unwrap();
+
+    let fresh = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let head = fresh.get_current_snapshot().unwrap();
+    let schema_id = fresh
+        .get_schema_by_name("main", head)
+        .unwrap()
+        .unwrap()
+        .schema_id;
+    let table_id = fresh
+        .get_table_by_name(schema_id, "t", head)
+        .unwrap()
+        .unwrap()
+        .table_id;
+    let files = fresh
+        .get_table_files_for_select(table_id, head)
+        .unwrap()
+        .len();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(DuckLakeCatalog::new(fresh).unwrap()));
+    let batches = ctx
+        .sql("SELECT count(*), sum(id) FROM lake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let value = |column: usize| {
+        batches[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an Int64 aggregate")
+            .value(0)
+    };
+    (result, files, value(0), value(1))
+}
+
+/// A writable table whose catalog reads run on a read session sees the
+/// commits of its own writer: a merge or rewrite that flushes the table's
+/// inlined data first then plans over the flushed files, as one through the
+/// pool does. The writer commits on connections of its own, so a session that
+/// read the head before the flush and kept reading that state would merge less
+/// and see the rewrite's own flush as a conflict.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_session_bound_compaction_sees_its_own_flush() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    for merge in [true, false] {
+        let mut outcomes = Vec::new();
+        for bound in [false, true] {
+            let name = format!("compaction_{merge}_{bound}");
+            let (catalog_id, writer, _data) = bound_compaction_fixture(&pool, &name).await;
+            outcomes.push(compact_bound_or_not(&pool, catalog_id, writer, bound, merge).await);
+        }
+        let (control, bound) = (&outcomes[0], &outcomes[1]);
+        assert!(control.0.inlined_flush_snapshot.is_some(), "{control:?}");
+        assert!(control.0.files_processed > 0, "{control:?}");
+        assert_eq!(
+            (control.2, control.3),
+            (25, (8..33).sum::<i64>()),
+            "{control:?}"
+        );
+        assert_eq!(
+            (
+                bound.0.files_processed,
+                bound.0.files_created,
+                bound.0.rows_written,
+                bound.0.inlined_flush_snapshot.is_some(),
+            ),
+            (
+                control.0.files_processed,
+                control.0.files_created,
+                control.0.rows_written,
+                true,
+            ),
+            "merge: {merge}"
+        );
+        assert_eq!(
+            (bound.1, bound.2, bound.3),
+            (control.1, control.2, control.3),
+            "merge: {merge}"
+        );
+    }
+}
+
 /// Every catalog read of a bound provider runs on the session's connection: on
 /// a one-connection pool whose only connection the session holds, every one of
 /// them still answers. A read that went to the pool would wait out the pool's

@@ -39,7 +39,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
@@ -403,8 +403,6 @@ macro_rules! bind_repeat {
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
-    /// `ducklake_delete_file.partial_max` exists.
-    delete_file_partial_max: bool,
     /// The `ducklake_schema_versions` table exists.
     schema_versions: bool,
     /// `ducklake_schema_versions.table_id` exists (DuckLake 0.4 on).
@@ -438,37 +436,68 @@ struct SchemaCapabilities {
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
-    /// A server capability rather than a catalog one, so it is deliberately not
-    /// part of [`Self::all`]: gating the memo on it would make an otherwise
-    /// fully-migrated catalog on an older server re-probe on every call, and a
-    /// stale `false` only costs pruning.
+    /// A server capability rather than a catalog one, so no probe runs for it
+    /// alone (see [`CapabilityMemo`]): a catalog whose capabilities are
+    /// all known on an older server probes no more, and a stale `false` only
+    /// costs pruning.
     soft_input_validation: bool,
     /// The server accepts `WITH ... AS MATERIALIZED` (PostgreSQL 12+), which
     /// [`PostgresStatsDialect`] declares the statistics CTE with.
     ///
-    /// A server capability like `soft_input_validation`, and excluded from
-    /// [`Self::all`] for the same reason. A stale `false` costs only the time
-    /// the narrowed listing takes.
+    /// A server capability like `soft_input_validation`, and probed no more
+    /// once the catalog's are known, for the same reason. A stale `false` costs
+    /// only the time the narrowed listing takes.
     materialized_cte: bool,
 }
 
 impl SchemaCapabilities {
-    fn all(&self) -> bool {
-        self.data_file_partial_max
-            && self.delete_file_partial_max
-            && self.schema_versions
-            && self.schema_versions_table_id
-            && self.data_file_partition_id
-            && self.inlined_data_tables
-            && self.views
-            && self.file_column_stats
-            && self.file_partition_values
-            && self.partition_specs
-            && self.sort_specs
-            && self.table_stats
-            && self.table_column_stats
-            && self.tags
-            && self.column_tags
+    /// The SQL that probes each capability, by bit (see [`Self::from_bits`]).
+    const PROBES: [&'static str; CAPABILITY_BITS] = [
+        "EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max')",
+        "to_regclass('ducklake_schema_versions') IS NOT NULL",
+        "EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'ducklake_schema_versions' AND column_name = 'table_id')",
+        "EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id')",
+        "to_regclass('ducklake_inlined_data_tables') IS NOT NULL",
+        "to_regclass('ducklake_view') IS NOT NULL",
+        "to_regclass('ducklake_file_column_stats') IS NOT NULL",
+        "to_regclass('ducklake_file_partition_value') IS NOT NULL",
+        "to_regclass('ducklake_partition_info') IS NOT NULL
+           AND to_regclass('ducklake_partition_column') IS NOT NULL",
+        "to_regclass('ducklake_sort_info') IS NOT NULL
+           AND to_regclass('ducklake_sort_expression') IS NOT NULL",
+        "to_regclass('ducklake_table_stats') IS NOT NULL",
+        "to_regclass('ducklake_table_column_stats') IS NOT NULL",
+        "to_regclass('ducklake_tag') IS NOT NULL",
+        "to_regclass('ducklake_column_tag') IS NOT NULL",
+        "to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL",
+        "current_setting('server_version_num')::int >= 120000",
+    ];
+
+    /// The capabilities whose bits `bits` sets, in the order of
+    /// [`Self::PROBES`].
+    fn from_bits(bits: u32) -> Self {
+        let has = |bit: u32| bits & (1 << bit) != 0;
+        Self {
+            data_file_partial_max: has(0),
+            schema_versions: has(1),
+            schema_versions_table_id: has(2),
+            data_file_partition_id: has(3),
+            inlined_data_tables: has(4),
+            views: has(5),
+            file_column_stats: has(6),
+            file_partition_values: has(7),
+            partition_specs: has(8),
+            sort_specs: has(9),
+            table_stats: has(10),
+            table_column_stats: has(11),
+            tags: has(12),
+            column_tags: has(13),
+            soft_input_validation: has(14),
+            materialized_cte: has(15),
+        }
     }
 
     /// What the catalog's `ducklake_schema_versions` ledger records.
@@ -484,6 +513,76 @@ pub(crate) fn schema_version_ledger(exists: bool, per_table: bool) -> SchemaVers
         (true, true) => SchemaVersionLedger::PerTable,
         (true, false) => SchemaVersionLedger::Global,
         (false, _) => SchemaVersionLedger::Absent,
+    }
+}
+
+/// How many capabilities a PostgreSQL provider probes: the bits of a
+/// [`CapabilityMemo`].
+pub(crate) const CAPABILITY_BITS: usize = 16;
+
+/// The bits of the server's capabilities, `pg_input_is_valid` and
+/// `MATERIALIZED`, which come after the catalog's.
+pub(crate) const CAPABILITY_SERVER_BITS: u32 = (1 << 14) | (1 << 15);
+
+/// The capabilities a provider has found present, one bit each, shared across
+/// the provider's clones.
+///
+/// DuckLake adds catalog tables and columns and never drops them, so each bit
+/// found true is kept on its own, and a later probe checks only the bits not
+/// yet found. A bit found false is probed again by the next call, so a catalog
+/// upgraded meanwhile is picked up. Once every catalog bit is known, no probe
+/// runs: a server capability found false then stays false (see
+/// [`CAPABILITY_SERVER_BITS`]). Concurrent calls may each probe, which is
+/// harmless: bits are only ever added.
+#[derive(Debug, Default)]
+pub(crate) struct CapabilityMemo(std::sync::atomic::AtomicU32);
+
+impl CapabilityMemo {
+    /// The bits found present so far.
+    pub(crate) fn known(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether every catalog capability is known present, so no probe runs.
+    pub(crate) fn complete(&self) -> bool {
+        let catalog = ((1u32 << CAPABILITY_BITS) - 1) & !CAPABILITY_SERVER_BITS;
+        self.known() & catalog == catalog
+    }
+
+    /// Probe, in one statement on `connection`, the capabilities `probes` lists
+    /// by bit, skipping the bits in `skip`; keep the bits found present, and
+    /// return them with `skip`'s.
+    pub(crate) async fn probe(
+        &self,
+        connection: &mut PgConnection,
+        probes: &[&str; CAPABILITY_BITS],
+        skip: u32,
+    ) -> std::result::Result<u32, sqlx::Error> {
+        let unknown: Vec<usize> = (0..CAPABILITY_BITS)
+            .filter(|bit| skip & (1 << bit) == 0)
+            .collect();
+        if unknown.is_empty() {
+            return Ok(skip);
+        }
+        let sql = format!(
+            "SELECT {}",
+            unknown
+                .iter()
+                .map(|&bit| probes[bit])
+                .collect::<Vec<_>>()
+                .join(",\n       ")
+        );
+        let row = sqlx::query(AssertSqlSafe(sql))
+            .fetch_one(connection)
+            .await?;
+        let mut found = 0;
+        for (column, &bit) in unknown.iter().enumerate() {
+            if row.try_get::<bool, _>(column)? {
+                found |= 1 << bit;
+            }
+        }
+        self.0.fetch_or(found, std::sync::atomic::Ordering::AcqRel);
+        Ok(skip | found)
     }
 }
 
@@ -763,13 +862,14 @@ pub(crate) async fn inlined_table_for_flush_on(
 /// writes out, with their data files and live delete files, read on
 /// `connection`. A table without an inlined-deletion table has none: check
 /// that it exists first. `in_transaction` says whether `connection` is inside
-/// a transaction (see [`missing_table_as_none`]).
+/// a transaction; outside one, a table gone since the check reads as `None`
+/// (see [`missing_table_as_none`]).
 pub(crate) async fn inlined_file_deletes_for_flush_on(
     connection: &mut PgConnection,
     in_transaction: bool,
     table_id: i64,
     snapshot_id: i64,
-) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+) -> Result<Option<Vec<DuckLakeInlinedFileDeleteForFlush>>> {
     let table = inlined_delete_table_name(table_id)?;
     let sql = format!(
         "{} ORDER BY del.file_id, del.row_id",
@@ -781,7 +881,7 @@ pub(crate) async fn inlined_file_deletes_for_flush_on(
     }
     let Some(rows) = missing_table_as_none(query.fetch_all(connection).await, in_transaction)?
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     rows.iter()
         .map(|row| {
@@ -809,21 +909,23 @@ pub(crate) async fn inlined_file_deletes_for_flush_on(
                 earlier_delete_end: row.try_get(16)?,
             })
         })
-        .collect()
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 /// The inlined deletions of Parquet rows of `table_id` committed after
 /// `start_snapshot` and at or below `end_snapshot`, read on `connection`. A
 /// table without an inlined-deletion table has none: check that it exists
-/// first. `in_transaction` says whether `connection` is inside a transaction
-/// (see [`missing_table_as_none`]).
+/// first. `in_transaction` says whether `connection` is inside a transaction;
+/// outside one, a table gone since the check reads as `None` (see
+/// [`missing_table_as_none`]).
 pub(crate) async fn inlined_file_deletes_between_on(
     connection: &mut PgConnection,
     in_transaction: bool,
     table_id: i64,
     start_snapshot: i64,
     end_snapshot: i64,
-) -> Result<Vec<InlinedFileDeleteChange>> {
+) -> Result<Option<Vec<InlinedFileDeleteChange>>> {
     let table = quote_ident(&inlined_delete_table_name(table_id)?);
     let sql = inlined_file_deletes_between_sql(&table, ["$1", "$2", "$3"]);
     let rows = sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
@@ -833,10 +935,7 @@ pub(crate) async fn inlined_file_deletes_between_on(
         .fetch_all(connection)
         .await;
     Ok(missing_table_as_none(rows, in_transaction)?
-        .unwrap_or_default()
-        .into_iter()
-        .map(inlined_file_delete_change)
-        .collect())
+        .map(|rows| rows.into_iter().map(inlined_file_delete_change).collect()))
 }
 
 /// The begin snapshot of delete file `delete_file_id`, read on `connection`.
@@ -1228,7 +1327,7 @@ pub(crate) fn stats_filter_sql(
 /// can see, and dropping its catalog from a multicatalog store. Table ids are
 /// never reused, so a dropped one is never created again, and "exists" can go
 /// stale only for a table no surviving snapshot reads. A read that finds it
-/// gone reads no deletions, and `get_inlined_deletes` then forgets the entry.
+/// gone reads no deletions, and the memo then forgets the entry.
 /// "Absent" holds for reads at or below the catalog's head at the time of the
 /// check: a deletion committed later takes a snapshot above that head, which
 /// such a read does not see.
@@ -1294,15 +1393,32 @@ impl InlinedDeletionTables {
     pub(crate) fn forget(&self, table_id: i64) {
         self.tables().remove(&table_id);
     }
+
+    /// The rows of `read`, a read of `table_id`'s inlined-deletion table the
+    /// memo found, or none when the table is gone. When it is gone, or the
+    /// read failed, the memo forgets the table, so the next read asks again.
+    pub(crate) fn rows_or_forget<T: Default>(
+        &self,
+        table_id: i64,
+        read: Result<Option<T>>,
+    ) -> Result<T> {
+        match read {
+            Ok(Some(rows)) => Ok(rows),
+            read => {
+                self.forget(table_id);
+                read.map(|_| T::default())
+            },
+        }
+    }
 }
 
 /// PostgreSQL-based metadata provider for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct PostgresMetadataProvider {
     pub pool: PgPool,
-    // Positive-only memo of the optional-schema capability probes. `Arc` so
-    // derived `Clone` shares the cache across provider clones.
-    schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    // The optional-schema capabilities found present (see `CapabilityMemo`).
+    // `Arc` so derived `Clone` shares the memo across provider clones.
+    schema_capabilities: Arc<CapabilityMemo>,
     // Each table's inlined-deletion table, by table id, as far as this provider
     // has looked (see `InlinedDeletionTable`). Shared across clones.
     inlined_deletion_tables: Arc<InlinedDeletionTables>,
@@ -1322,7 +1438,7 @@ impl PostgresMetadataProvider {
 
         Ok(Self {
             pool,
-            schema_capabilities: Arc::new(OnceLock::new()),
+            schema_capabilities: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
         })
@@ -1344,7 +1460,7 @@ impl PostgresMetadataProvider {
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
-            schema_capabilities: Arc::new(OnceLock::new()),
+            schema_capabilities: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
         }
@@ -1457,78 +1573,30 @@ impl PostgresMetadataProvider {
         Ok(self.schema_capabilities().await?.inlined_data_tables)
     }
 
-    /// Whether the schema-capability memo is populated. Exposed for tests.
+    /// Whether the schema-capability memo knows every catalog capability
+    /// present, so no probe runs. Exposed for tests.
     #[doc(hidden)]
     pub fn schema_capabilities_cached(&self) -> bool {
-        self.schema_capabilities.get().is_some()
+        self.schema_capabilities.complete()
     }
 
-    /// Returns the catalog's optional-schema capabilities, probing at most
-    /// once per provider lifetime on a fully-migrated catalog.
-    ///
-    /// Cache-positive-only: capability existence is monotonic (migrations only
-    /// add columns/tables, never drop them), so an all-`true` answer is an
-    /// immutable fact and safe to memoize. A `false` answer is never cached —
-    /// the next call re-probes, so a mid-flight catalog upgrade is picked up
-    /// on the next call exactly like the previous per-call probing. Concurrent
-    /// first calls may each probe once (one statement each) — harmless; a
-    /// raced `set` is ignored.
+    /// Returns the catalog's optional-schema capabilities: from the memo when
+    /// it knows every catalog capability present, else from one probe of the
+    /// capabilities it does not know (see [`CapabilityMemo`]).
     async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
-        if let Some(caps) = self.schema_capabilities.get() {
-            return Ok(*caps);
+        let known = self.schema_capabilities.known();
+        if self.schema_capabilities.complete() {
+            return Ok(SchemaCapabilities::from_bits(known));
         }
-        let row = sqlx::query(
-            "SELECT
-               EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
-               EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
-               to_regclass('ducklake_schema_versions') IS NOT NULL,
-               EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
-               to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
-               to_regclass('ducklake_view') IS NOT NULL,
-               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
-               current_setting('server_version_num')::int >= 120000,
-               EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_schema_versions'
-                         AND column_name = 'table_id'),
-               to_regclass('ducklake_file_column_stats') IS NOT NULL,
-               to_regclass('ducklake_file_partition_value') IS NOT NULL,
-               to_regclass('ducklake_partition_info') IS NOT NULL
-                 AND to_regclass('ducklake_partition_column') IS NOT NULL,
-               to_regclass('ducklake_sort_info') IS NOT NULL
-                 AND to_regclass('ducklake_sort_expression') IS NOT NULL,
-               to_regclass('ducklake_table_stats') IS NOT NULL,
-               to_regclass('ducklake_table_column_stats') IS NOT NULL,
-               to_regclass('ducklake_tag') IS NOT NULL,
-               to_regclass('ducklake_column_tag') IS NOT NULL",
-        )
-        .fetch_one(&mut *self.connection().await?)
-        .await?;
-        let caps = SchemaCapabilities {
-            data_file_partial_max: row.try_get(0)?,
-            delete_file_partial_max: row.try_get(1)?,
-            schema_versions: row.try_get(2)?,
-            schema_versions_table_id: row.try_get(8)?,
-            data_file_partition_id: row.try_get(3)?,
-            inlined_data_tables: row.try_get(4)?,
-            views: row.try_get(5)?,
-            file_column_stats: row.try_get(9)?,
-            file_partition_values: row.try_get(10)?,
-            partition_specs: row.try_get(11)?,
-            sort_specs: row.try_get(12)?,
-            table_stats: row.try_get(13)?,
-            table_column_stats: row.try_get(14)?,
-            tags: row.try_get(15)?,
-            column_tags: row.try_get(16)?,
-            soft_input_validation: row.try_get(6)?,
-            materialized_cte: row.try_get(7)?,
-        };
-        if caps.all() {
-            let _ = self.schema_capabilities.set(caps);
-        }
-        Ok(caps)
+        let bits = self
+            .schema_capabilities
+            .probe(
+                &mut *self.connection().await?,
+                &SchemaCapabilities::PROBES,
+                known,
+            )
+            .await?;
+        Ok(SchemaCapabilities::from_bits(bits))
     }
 
     /// One page of the visible file listing, optionally narrowed inside SQL by
@@ -2836,7 +2904,10 @@ impl MetadataProvider for PostgresMetadataProvider {
             }
             let mut connection = self.connection().await?;
             let in_read = connection.in_read();
-            inlined_file_deletes_for_flush_on(&mut connection, in_read, table_id, snapshot_id).await
+            let read =
+                inlined_file_deletes_for_flush_on(&mut connection, in_read, table_id, snapshot_id)
+                    .await;
+            self.inlined_deletion_tables.rows_or_forget(table_id, read)
         })
     }
 
@@ -2856,14 +2927,15 @@ impl MetadataProvider for PostgresMetadataProvider {
             }
             let mut connection = self.connection().await?;
             let in_read = connection.in_read();
-            inlined_file_deletes_between_on(
+            let read = inlined_file_deletes_between_on(
                 &mut connection,
                 in_read,
                 table_id,
                 start_snapshot,
                 end_snapshot,
             )
-            .await
+            .await;
+            self.inlined_deletion_tables.rows_or_forget(table_id, read)
         })
     }
 

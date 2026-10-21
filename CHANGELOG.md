@@ -79,8 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
 - A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only
   transaction, so PgBouncer statement pooling is unsupported (#383).
-- `MetadataReadSession` holds one transaction from its first read until `end`, which commits
-  it and can fail (#383).
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
