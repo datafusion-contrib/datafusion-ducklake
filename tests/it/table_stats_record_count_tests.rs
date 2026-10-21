@@ -480,15 +480,8 @@ struct Check<'a> {
 }
 
 /// Run `scenario` with official on SQLite metadata in `dir` and with the
-/// crate on `side`, then compare, returning each difference. `before_duckdb`
-/// runs between the crate's writes and DuckDB's reads of the crate's catalog.
-async fn run(
-    scenario: &Scenario,
-    dir: &Path,
-    side: Side,
-    check: Check<'_>,
-    before_duckdb: impl std::future::Future<Output = ()>,
-) -> Vec<String> {
+/// crate on `side`, then compare, returning each difference.
+async fn run(scenario: &Scenario, dir: &Path, side: Side, check: Check<'_>) -> Vec<String> {
     let official_metadata = Metadata::Sqlite(dir.join("official.db"));
     let official_data = dir.join("official_data");
     std::fs::create_dir_all(&official_data).unwrap();
@@ -516,7 +509,6 @@ async fn run(
         ));
     }
     drop(side);
-    before_duckdb.await;
 
     if let Some(metadata) = check.duckdb_reads {
         let got = duckdb_answers(metadata, check.crate_data);
@@ -590,9 +582,6 @@ async fn sqlite_matches_official() {
                     raw: &metadata,
                     crate_data: &data,
                 },
-                crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(
-                    &path,
-                ),
             )
             .await,
         );
@@ -630,7 +619,6 @@ async fn duckdb_matches_official() {
                     raw: &metadata,
                     crate_data: &data,
                 },
-                async {},
             )
             .await,
         );
@@ -687,15 +675,11 @@ async fn mysql_matches_official() {
                 &scenario,
                 dir,
                 side,
-                // DuckDB 1.5.5 cannot attach this crate's MySQL catalogs (their
-                // `ducklake_snapshot` lacks `next_catalog_id`); its MIN/MAX shortcut
-                // depends on `record_count` alone, which is compared.
                 Check {
-                    duckdb_reads: None,
+                    duckdb_reads: Some(&metadata),
                     raw: &metadata,
                     crate_data: &data,
                 },
-                async {},
             )
             .await,
         );
@@ -768,14 +752,11 @@ async fn postgres_single_catalog_matches_official() {
                 &scenario,
                 dir,
                 side,
-                // As for MySQL, DuckDB cannot attach this crate's PostgreSQL
-                // catalogs; `record_count` is compared.
                 Check {
-                    duckdb_reads: None,
+                    duckdb_reads: Some(&metadata),
                     raw: &metadata,
                     crate_data: &data,
                 },
-                async {},
             )
             .await,
         );
@@ -848,7 +829,6 @@ async fn multicatalog_matches_official() {
                     raw: &metadata,
                     crate_data: &data,
                 },
-                async {},
             )
             .await,
         );

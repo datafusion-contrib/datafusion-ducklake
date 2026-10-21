@@ -3450,21 +3450,6 @@ async fn delete_rowids_on_an_official_update_file() {
     // Row ids 3 and 7 are the updated rows; 0 is an original one.
     let deleted = table.delete_rowids(&ctx.state(), &[0, 3, 7]).await.unwrap();
     assert_eq!(deleted.rows_deleted, 3);
-    // The snapshots this crate's writer adds leave official's id counters
-    // NULL: carry them forward so official attaches.
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
-        .await
-        .unwrap();
-    for column in ["next_catalog_id", "next_file_id"] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE ducklake_snapshot SET {column} = \
-             (SELECT MAX({column}) FROM ducklake_snapshot) + 100 WHERE {column} IS NULL"
-        )))
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    pool.close().await;
     let theirs = duckdb_query(
         &metadata,
         &data,

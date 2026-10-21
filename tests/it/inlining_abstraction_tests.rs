@@ -2304,7 +2304,9 @@ async fn age_trigger_on_non_utc_postgres_sessions() {
             .unwrap();
             let (dir, data) = scratch();
             let writer =
-                datafusion_ducklake::PostgresSingleCatalogMetadataWriter::from_pool(pool.clone());
+                datafusion_ducklake::PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+                    .await
+                    .unwrap();
             writer.set_data_path(data.to_str().unwrap()).unwrap();
             let lake = Lake {
                 writer: Arc::new(writer),
@@ -2979,7 +2981,6 @@ async fn official_reads_what_the_new_paths_wrote() {
         .unwrap();
     let ours = lake.rows("t").await;
     let db = lake._dir.path().join("lake.db");
-    crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&db).await;
     let official = crate::inlined_mutation_differential_tests::duckdb_query(
         &crate::inlined_mutation_differential_tests::Metadata::Sqlite(db.clone()),
         &lake.data,

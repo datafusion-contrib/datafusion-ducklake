@@ -4,7 +4,7 @@
 //! atomic `register_data_files` with per-file partition values), then reads it
 //! back through the DuckDB provider. The DataFusion INSERT splitting itself is
 //! backend-agnostic and covered by the SQLite tests; this pins the
-//! DuckDB-specific catalog SQL (sequence-allocated `partition_id`, `RETURNING`).
+//! DuckDB-specific catalog SQL (counter-allocated `partition_id`).
 
 #![cfg(all(feature = "write-duckdb", feature = "metadata-duckdb"))]
 
@@ -50,21 +50,26 @@ fn duckdb_set_spec_and_register_partition_files() {
             .unwrap();
         table_id = setup.table_id;
 
-        // Partition by region (identity). Fresh catalog → the sequence assigns
-        // partition_id = 1.
-        writer
+        // Partition by region (identity).
+        let snapshot = writer
             .set_partition_spec(
                 table_id,
                 &[("region".to_string(), PartitionTransform::Identity)],
             )
             .unwrap();
+        let partition_id = writer
+            .metadata_provider()
+            .get_partition_spec(table_id, snapshot)
+            .unwrap()
+            .unwrap()
+            .partition_id;
 
         // Register two partition files atomically in one snapshot.
         let files = vec![
             DataFileInfo::new("region=us/a.parquet", 100, 2)
-                .with_partition(1, vec![(0, Some("us".to_string()))]),
+                .with_partition(partition_id, vec![(0, Some("us".to_string()))]),
             DataFileInfo::new("region=eu/b.parquet", 100, 3)
-                .with_partition(1, vec![(0, Some("eu".to_string()))]),
+                .with_partition(partition_id, vec![(0, Some("eu".to_string()))]),
         ];
         let setup2 = writer
             .begin_write_transaction("main", "events", &cols, WriteMode::Append)
@@ -149,19 +154,25 @@ fn duckdb_register_files_with_retired_partition_id_conflicts() {
         .unwrap();
     let table_id = setup.table_id;
 
-    // Set spec (region) → partition_id 1, then RESET → retire generation 1.
-    writer
+    // Set spec (region), then RESET → retire that generation.
+    let snapshot = writer
         .set_partition_spec(
             table_id,
             &[("region".to_string(), PartitionTransform::Identity)],
         )
         .unwrap();
+    let retired = writer
+        .metadata_provider()
+        .get_partition_spec(table_id, snapshot)
+        .unwrap()
+        .unwrap()
+        .partition_id;
     writer.reset_partition_spec(table_id).unwrap();
 
-    // Register a file stamped with the now-retired partition_id 1.
+    // Register a file stamped with the now-retired partition_id.
     let files = vec![
         DataFileInfo::new("region=us/a.parquet", 100, 2)
-            .with_partition(1, vec![(0, Some("us".to_string()))]),
+            .with_partition(retired, vec![(0, Some("us".to_string()))]),
     ];
     let setup2 = writer
         .begin_write_transaction("main", "events", &cols, WriteMode::Append)

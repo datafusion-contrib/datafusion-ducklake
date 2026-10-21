@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DuckLakeTableWriter::flush_table_inlined_data` flush inlined data on every writable backend.
 - `stats_encode::StatKind`, `ColumnStats` and the `merge_*_column_stats` functions merge
   table-wide statistics as official DuckLake does.
+- `migrate_to_official_layout` on the DuckDB, SQLite, MySQL and single-catalog PostgreSQL
+  writers brings a catalog to official's table layout, so official DuckDB can write it.
+- `MetadataWriter::get_table_directory` resolves a live table's directory from its stored paths.
 - `MetadataProvider::get_inlined_data_for_flush`, `get_inlined_file_deletes_for_flush`,
   `get_inlined_file_deletes_between`, `read_inlined_rows` and `get_delete_file_begin_snapshot`.
 - `table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT`.
@@ -79,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
 - A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only
   transaction, so a pooler in statement mode, such as PgBouncer's, is unsupported (#383).
+- **BREAKING**: write a catalog these writers create, or `migrate_to_official_layout` migrates,
+  only with 0.10 or later; upgrade every writer of a catalog, then migrate it.
+- **BREAKING**: `PostgresSingleCatalogMetadataWriter::from_pool` is async and returns `Result`,
+  bringing an earlier catalog up to date as `new` does; add `.await?` at the call.
+- Schema, table, partition and sort ids come from one `next_catalog_id` counter starting at
+  `0`, as official's do; a column added to a table takes an id past the table's.
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
@@ -322,6 +331,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doubles inlined rows that a concurrent flush moves to a file between its catalog reads.
 - A scan, mutation, fork or change feed reads the catalog in one transaction: a merge between
   two listing pages or a flush of only inlined deletions no longer splits its reads (#383).
+- SQLite, DuckDB, and MySQL insert a new table's row at its commit, so a failed write leaves
+  none, and a create of a name another transaction created first conflicts.
+- Official DuckDB can attach and write, renames included, catalogs the DuckDB, SQLite, MySQL,
+  and single-catalog PostgreSQL writers create, or `migrate_to_official_layout` migrates.
+- A commit that inlines rows advances `next_file_id` as official's does, so an official session
+  sees that its table statistics changed.
 
 ## [0.9.0] - 2026-10-07
 

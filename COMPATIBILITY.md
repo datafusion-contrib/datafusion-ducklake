@@ -406,9 +406,11 @@ session and object-store handling that the registration path does not provide.
 ## Write concurrency
 
 Write commits allocate a snapshot and publish their data and final metadata in
-one database transaction. Write setup retains each backend's existing schema
-and table reservation behavior; PostgreSQL layouts reserve identifiers without
-publishing schema or table rows.
+one database transaction. Write setup reserves the schema and table identifiers
+of a new table and the commit inserts their rows, as official DuckLake does, so
+a write that fails after setup leaves no row. A commit that finds the name
+taken by a table another transaction created conflicts instead of writing into
+it.
 
 `DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
 MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field
@@ -904,6 +906,45 @@ Known edges:
   it forward, matching upstream's `if (SchemaChangesMade()) schema_version++`. These branches
   deliberately retain their existing counter or sequence allocation instead of adding the
   separate Group 9 snapshot-allocator change.
+- **Official DuckDB can write a catalog this crate created.** It applies to DuckDB, SQLite,
+  MySQL, and single-catalog PostgreSQL metadata. The multi-catalog PostgreSQL layout is
+  library-specific and stays unattachable by official.
+  - *Layout:* `ducklake_schema`, `ducklake_table`, `ducklake_data_file`, and
+    `ducklake_delete_file` have official's columns, order and keys, since official inserts into
+    them by position and keeps one `ducklake_table` row per version of a table. The writers
+    create every table official reads, write `parquet` as a file's format, and give schemas and
+    tables v7 UUIDs, rows the migration fills in included.
+  - *Ids:* schema, table, partition, and sort ids come from official's `next_catalog_id`
+    namespace and file ids from its `next_file_id` one. Each commit raises the watermarks of the
+    snapshot it writes past every id in use, and a commit that inlines rows advances
+    `next_file_id` once per table, as official's does. Only initialization raises those of a
+    committed snapshot: a head an earlier writer left without them, so official can attach. A column the
+    crate adds to a table takes an id past the table's, as official numbers a table's columns.
+  - *Conflicts:* a table id reserved when a write begins is checked at its commit, which
+    conflicts when official took it meanwhile, for another table or one of the same name. A write
+    whose base snapshot was expired meanwhile commits when it creates the table, which the writer
+    that reserved the id knows; an `Append` to a table that existed at its setup and has no row
+    left conflicts, as the table may have been dropped meanwhile.
+  - *Paths:* a file the crate writes goes to the directory the table's stored path names, which
+    a rename by official keeps; a table's first file goes under its schema's stored path, which
+    official may have stored under another name.
+  - *Migration:* initialization only adds what an older catalog lacks, so a release before 0.10
+    keeps writing it, and the writers take ids past the counters and sequences older releases
+    allocate from. `migrate_to_official_layout` then rebuilds it into official's layout
+    (idempotent, lossless, blocking the tables' writers while it runs). On PostgreSQL the rebuilt
+    tables keep their owner, grants and indexes, and a table a view depends on is refused; on
+    MySQL 8.0 reordering columns copies the table (`ALGORITHM=COPY`); a write it interrupts
+    fails with a retryable `Conflict`, and the migration retries a pass a write deadlocked. Afterwards only 0.10 or
+    later should write it: an older release fails to create a table (and, on DuckDB, to add a
+    file), and its snapshots lack the watermarks official reads until the next 0.10 commit.
+  - *Privileges:* opening a writer on a current catalog runs no DDL, so a role that only reads
+    and writes the catalog tables can open one. On PostgreSQL, file ids default from the
+    `next_file_id` counter (`ducklake_next_file_id()`), which takes no privilege beyond the
+    tables'. A catalog not yet migrated keeps the identity sequences a release before 0.10
+    takes file ids from; writing it once official wrote it takes `UPDATE` on them, and without
+    it the commit names the grant.
+  - Official DuckDB 1.5.5's MySQL connector cannot append to an existing table on any MySQL
+    catalog, its own included.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

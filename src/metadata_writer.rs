@@ -4,6 +4,7 @@
 //! along with helper types for column definitions and data file registration.
 
 use crate::metadata_provider::{TagObjectType, TagTarget, snapshot_change_tokens};
+use crate::path_resolver::resolve_path;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -24,6 +25,117 @@ pub(crate) fn directory_path(path: &str) -> String {
     } else {
         format!("{path}/")
     }
+}
+
+/// A live schema's stored `path` and `path_is_relative`, and those of its
+/// table of a name when one is live, as `get_table_directory` reads them.
+pub(crate) type StoredTablePaths = (String, Option<bool>, Option<String>, Option<bool>);
+
+/// The directory of a table's files, as readers resolve it: the table's stored
+/// `path` under its schema's under `data_path`, each relative to the directory
+/// above unless stored absolute.
+pub(crate) fn table_directory(
+    data_path: &str,
+    (schema_path, schema_path_is_relative): (&str, bool),
+    (table_path, table_path_is_relative): (&str, bool),
+) -> Result<String> {
+    let schema_directory = resolve_path(data_path, schema_path, schema_path_is_relative)?;
+    resolve_path(&schema_directory, table_path, table_path_is_relative)
+}
+
+/// What a commit finds of the id `begin_write_transaction` reserved for a
+/// table, when no live table has the table's name.
+pub(crate) struct ReservedTableId {
+    /// A row of the id has the table's name: the table existed at the setup,
+    /// and another transaction dropped or renamed it since.
+    pub(crate) renamed: bool,
+    /// Another schema, table, view, partition, sort or macro has the id:
+    /// official DuckDB, or a release before 0.10, allocated it since the setup.
+    pub(crate) taken: bool,
+    /// The snapshot the setup saw was expired since, so a table that existed
+    /// then may have been dropped and expired, leaving no row of the id.
+    pub(crate) base_expired: bool,
+    /// The committing writer's setup reserved the id for a table that did not
+    /// exist then ([`ReservedTables`]), so no table of the id was dropped
+    /// since, expired base or not.
+    pub(crate) reserved_at_setup: bool,
+}
+
+/// The table ids a writer's `begin_write_transaction` reserved for tables that
+/// did not exist yet, until their commit takes them. Only the writer that made
+/// a setup knows whether its table existed then, which an expired base hides
+/// from the catalog.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReservedTables(Arc<std::sync::Mutex<HashSet<i64>>>);
+
+impl ReservedTables {
+    /// Remember `table_id`, reserved for a table that does not exist yet.
+    pub(crate) fn insert(&self, table_id: i64) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(table_id);
+    }
+
+    /// Whether this writer reserved `table_id` for a new table, forgetting it:
+    /// a commit takes a setup's id once, and a later write to the table finds
+    /// it live.
+    pub(crate) fn take(&self, table_id: i64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&table_id)
+    }
+}
+
+/// The [`ReservedTableId`] of an id another transaction took for a table of
+/// the same name, which a commit finds live under the name.
+pub(crate) fn reserved_id_taken() -> ReservedTableId {
+    ReservedTableId {
+        renamed: false,
+        taken: true,
+        base_expired: false,
+        reserved_at_setup: false,
+    }
+}
+
+/// Refuse a commit that would insert the row of `schema_name.table_name` under
+/// an id that changed hands since the setup, as official DuckLake refuses to
+/// commit a create of a name or id another transaction took. An expired base
+/// matters only to an `Append` of a table that existed at its setup, which
+/// could bring back a table dropped meanwhile: a `Replace` that recreates a
+/// dropped table is a create, and so is a write whose setup reserved the id.
+pub(crate) fn refuse_changed_table_id(
+    reserved: &ReservedTableId,
+    mode: WriteMode,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<()> {
+    let table = quote_snapshot_table(schema_name, table_name);
+    let conflict = if reserved.renamed {
+        format!("table {table} was dropped or renamed by another transaction")
+    } else if reserved.taken {
+        format!("the id reserved for table {table} was taken by another transaction")
+    } else if reserved.base_expired && mode == WriteMode::Append && !reserved.reserved_at_setup {
+        format!(
+            "table {table} may have been dropped by another transaction: the snapshot this \
+             write began on was expired"
+        )
+    } else {
+        return Ok(());
+    };
+    Err(DuckLakeError::Conflict(format!(
+        "{conflict}; retry the write"
+    )))
+}
+
+/// The table or index a `CREATE ... IF NOT EXISTS <name>` statement creates.
+#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+pub(crate) fn created_name(ddl: &str) -> &str {
+    ddl.split("IF NOT EXISTS")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map_or("", |name| name.trim_end_matches('('))
 }
 
 /// Validate a catalog entity name (schema, table, or column).
@@ -182,6 +294,42 @@ pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> 
             )));
         },
     })
+}
+
+/// The `ducklake_metadata` counters releases before 0.10 took partition and
+/// sort ids from, where official DuckDB takes them from `next_catalog_id`, as a
+/// SQL list. A writer that takes a catalog id takes it past them and raises
+/// them to it, so a 0.9 writer on a catalog not yet migrated to official's
+/// layout never takes the same id.
+#[cfg_attr(
+    not(any(feature = "write-sqlite", feature = "write-mysql", feature = "write-postgres")),
+    allow(dead_code)
+)]
+pub(crate) const LEGACY_CATALOG_ID_COUNTERS: &str = "('next_partition_id', 'next_sort_id')";
+
+/// The columns of a writer's `POSITIONAL_TABLES` entry, one definition per
+/// line, each with its name, definition and whether it is the table's key.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn positional_columns(columns: &str) -> Vec<(&str, &str, bool)> {
+    columns
+        .split(",\n")
+        .map(|definition| {
+            let definition = definition.trim();
+            let name = definition.split_whitespace().next().unwrap_or_default();
+            (name, definition, definition.contains("PRIMARY KEY"))
+        })
+        .collect()
+}
+
+/// The `inlined_insert` tokens of `changes_made`, one per table whose rows a
+/// commit inlined. Official DuckDB advances `next_file_id` once for each, and
+/// a running session reads that to tell its cached table statistics are stale.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn inlined_inserts(changes_made: &str) -> usize {
+    changes_made
+        .split(',')
+        .filter(|token| token.starts_with("inlined_insert:"))
+        .count()
 }
 
 /// Rewrites a `sort_on_insert` or `hive_file_pattern` stored as a case
@@ -2497,6 +2645,17 @@ pub(crate) fn rewritten_deletes_snapshot(write: &StagedTableWrite) -> Option<i64
 /// What [`rewritten_delete_conflict`] says, after the table id.
 const REWRITTEN_DELETE_CONFLICT: &str = ": the catalog committed a snapshot at or after snapshot";
 
+/// The conflict a write that expects the catalog at `base_snapshot` raises
+/// when its table was created after that snapshot: the writer found the name
+/// free, so another transaction created the table since, and official DuckLake
+/// refuses the create.
+pub(crate) fn created_table_conflict(table_id: i64, base_snapshot: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "table {table_id} was created by another transaction after snapshot {base_snapshot}; \
+         retry the write"
+    ))
+}
+
 /// The conflict a staged write that dates deletions in a rewritten delete file
 /// raises when the catalog committed a snapshot at or after that date. The
 /// staged transaction re-dates the deletions to the next snapshot and retries
@@ -4694,6 +4853,19 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
+
+    /// The directory the files of `schema_name.table_name` go to, as readers
+    /// resolve it from the stored paths: a live table's own, or, for a table
+    /// not created yet, the directory under its live schema's path that the
+    /// table's row will name. `None` when the schema does not exist either.
+    /// A table official DuckDB renamed keeps its directory, and a schema it
+    /// created may store a path other than its name, so files must not go
+    /// where the names point. The default, `None`, leaves the directory to the
+    /// names, as the multi-catalog layout lays files out.
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let _ = (schema_name, table_name);
+        Ok(None)
+    }
 
     /// Return the live top-level column nullability for an existing table.
     ///
