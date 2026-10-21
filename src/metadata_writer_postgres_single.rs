@@ -31,8 +31,8 @@ use crate::metadata_writer::{
     tag_change, top_level_column_ids, validate_name,
 };
 use crate::metadata_writer::{
-    InlinedFlushTable, LEGACY_CATALOG_ID_COUNTERS, inlined_flush_changes, inlined_inserts,
-    positional_columns, validate_inlined_flush,
+    InlinedFlushTable, LEGACY_CATALOG_ID_COUNTERS, ReservedTableId, inlined_flush_changes,
+    inlined_inserts, positional_columns, refuse_changed_table_id, validate_inlined_flush,
 };
 use crate::metadata_writer::{directory_path, table_directory};
 use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
@@ -322,7 +322,7 @@ const POSITIONAL_TABLES: [(&str, &str, &str); 4] = [
         file_order BIGINT,
         path VARCHAR NOT NULL,
         path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
-        file_format VARCHAR,
+        file_format VARCHAR DEFAULT 'parquet',
         record_count BIGINT,
         file_size_bytes BIGINT NOT NULL,
         footer_size BIGINT,
@@ -342,7 +342,7 @@ const POSITIONAL_TABLES: [(&str, &str, &str); 4] = [
         data_file_id BIGINT NOT NULL,
         path VARCHAR NOT NULL,
         path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
-        format VARCHAR,
+        format VARCHAR DEFAULT 'parquet',
         delete_count BIGINT,
         file_size_bytes BIGINT NOT NULL,
         footer_size BIGINT,
@@ -400,13 +400,17 @@ impl PostgresSingleCatalogMetadataWriter {
                 .await
         })
         .await?;
-        // A catalog an earlier release created lacks columns and counters this
-        // writer uses, even when the caller skips `initialize_schema`.
+        // A catalog an earlier release created lacks tables, columns and
+        // counters this writer uses, even when the caller skips
+        // `initialize_schema`.
         let initialized: bool =
             sqlx::query_scalar("SELECT to_regclass('ducklake_snapshot') IS NOT NULL")
                 .fetch_one(&pool)
                 .await?;
         if initialized {
+            for ddl in SQL_CREATE_TABLES {
+                sqlx::query(*ddl).execute(&pool).await?;
+            }
             add_official_columns(&pool).await?;
             seed_counter(&pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
         }
@@ -611,16 +615,42 @@ async fn raise_head_watermarks(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
     Ok(())
 }
 
-/// Add the snapshot id watermarks and each of [`POSITIONAL_TABLES`]' columns a
-/// catalog that predates them lacks, last, as a release before 0.10, which
-/// names the columns it writes, still writes the table. Only a missing column
+/// Add the columns a catalog an earlier release created lacks: the snapshot id
+/// watermarks, each of [`POSITIONAL_TABLES`]' columns, and those of earlier
+/// spec versions, last, as a release before 0.10, which names the columns it
+/// writes, still writes the table. Only a missing column
 /// is altered in, since `ADD COLUMN IF NOT EXISTS` takes the table's
 /// `ACCESS EXCLUSIVE` lock even when it adds nothing.
 async fn add_official_columns(pool: &PgPool) -> Result<()> {
     let watermarks =
         [("next_catalog_id", "next_catalog_id BIGINT"), ("next_file_id", "next_file_id BIGINT")];
-    let tables = std::iter::once(("ducklake_snapshot", watermarks.to_vec())).chain(
-        POSITIONAL_TABLES.iter().map(|(table, id, columns)| {
+    let earlier = [
+        (
+            "ducklake_metadata",
+            vec![("scope", "scope VARCHAR"), ("scope_id", "scope_id BIGINT")],
+        ),
+        (
+            "ducklake_column",
+            vec![
+                ("initial_default", "initial_default VARCHAR"),
+                ("default_value", "default_value VARCHAR"),
+                ("default_value_type", "default_value_type VARCHAR"),
+                ("default_value_dialect", "default_value_dialect VARCHAR"),
+            ],
+        ),
+        (
+            "ducklake_data_file",
+            vec![("partition_id", "partition_id BIGINT"), ("partial_max", "partial_max BIGINT")],
+        ),
+        (
+            "ducklake_delete_file",
+            vec![("partial_max", "partial_max BIGINT")],
+        ),
+        ("ducklake_snapshot", watermarks.to_vec()),
+    ];
+    let tables = earlier
+        .into_iter()
+        .chain(POSITIONAL_TABLES.iter().map(|(table, id, columns)| {
             // Every catalog has its id column, and adding an identity column
             // creates its sequence even when the column exists.
             let missing = positional_columns(columns)
@@ -629,8 +659,7 @@ async fn add_official_columns(pool: &PgPool) -> Result<()> {
                 .map(|(name, definition, _)| (name, definition))
                 .collect::<Vec<_>>();
             (*table, missing)
-        }),
-    );
+        }));
     for (table, columns) in tables {
         let current: Vec<String> = sqlx::query_scalar(
             "SELECT attname::text FROM pg_attribute
@@ -663,7 +692,10 @@ async fn add_official_columns(pool: &PgPool) -> Result<()> {
 /// `table_uuid` get one, and the new identity sequence continues past the
 /// copied ids. One transaction per table, which locks the table first, so a
 /// row another writer commits meanwhile is copied or waits for the rebuilt
-/// table, and a rebuild cut short leaves the original in place.
+/// table, and a rebuild cut short leaves the original in place. The rebuilt
+/// table keeps the original's owner, grants and indexes, and its identity
+/// sequence the original's grants; a table views depend on is refused, as
+/// dropping it would drop them.
 async fn order_positional_tables(pool: &PgPool) -> Result<()> {
     for (table, id, columns) in POSITIONAL_TABLES {
         let expected = positional_columns(columns)
@@ -697,8 +729,31 @@ async fn order_positional_tables(pool: &PgPool) -> Result<()> {
             .join(", ");
         let ordered = format!("{table}__ordered");
         let mut tx = pool.begin().await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *tx)
+        .await?;
+        let views: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT view.oid::regclass::text
+             FROM pg_depend dependency
+             JOIN pg_rewrite rule ON rule.oid = dependency.objid
+             JOIN pg_class view ON view.oid = rule.ev_class
+             WHERE dependency.refobjid = to_regclass($1) AND view.oid <> dependency.refobjid
+             ORDER BY 1",
+        )
+        .bind(table)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !views.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "migrate_to_official_layout rebuilds {table}, and views {} depend on it; drop \
+                 them, migrate, then create them again",
+                views.join(", ")
+            )));
+        }
+        let restore = table_privileges_and_indexes(&mut tx, table, id).await?;
         for statement in [
-            format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
             format!("CREATE TABLE {ordered} ({columns})"),
             format!(
                 "INSERT INTO {ordered} ({names}) OVERRIDING SYSTEM VALUE \
@@ -710,7 +765,10 @@ async fn order_positional_tables(pool: &PgPool) -> Result<()> {
             ),
             format!("DROP TABLE {table}"),
             format!("ALTER TABLE {ordered} RENAME TO {table}"),
-        ] {
+        ]
+        .into_iter()
+        .chain(restore)
+        {
             sqlx::query(AssertSqlSafe(statement))
                 .execute(&mut *tx)
                 .await?;
@@ -729,6 +787,71 @@ async fn order_positional_tables(pool: &PgPool) -> Result<()> {
         tx.commit().await?;
     }
     Ok(())
+}
+
+/// The statements that give `table`, once rebuilt under its name, the
+/// original's owner, grants and non-key indexes, and its `id` identity
+/// sequence the original sequence's grants.
+async fn table_privileges_and_indexes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    id: &str,
+) -> Result<Vec<String>> {
+    let owner: String = sqlx::query_scalar(
+        "SELECT quote_ident(pg_get_userbyid(relowner)) FROM pg_class WHERE oid = to_regclass($1)",
+    )
+    .bind(table)
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut statements = vec![format!("ALTER TABLE {table} OWNER TO {owner}")];
+    let sequence: Option<String> = sqlx::query_scalar("SELECT pg_get_serial_sequence($1, $2)")
+        .bind(table)
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    for (object, kind) in std::iter::once((table.to_string(), "TABLE"))
+        .chain(sequence.map(|sequence| (sequence, "SEQUENCE")))
+    {
+        let grants: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT privilege.privilege_type,
+                    CASE WHEN privilege.grantee = 0 THEN 'PUBLIC'
+                         ELSE quote_ident(pg_get_userbyid(privilege.grantee)) END,
+                    privilege.is_grantable
+             FROM pg_class relation, aclexplode(relation.relacl) privilege
+             WHERE relation.oid = to_regclass($1) AND privilege.grantee <> relation.relowner",
+        )
+        .bind(&object)
+        .fetch_all(&mut **tx)
+        .await?;
+        // The rebuilt table's sequence is named after it again once renamed.
+        let target = match kind {
+            "TABLE" => table.to_string(),
+            _ => format!("pg_get_serial_sequence('{table}', '{id}')"),
+        };
+        for (privilege, grantee, grantable) in grants {
+            let option = if grantable {
+                " WITH GRANT OPTION"
+            } else {
+                ""
+            };
+            statements.push(match kind {
+                "TABLE" => format!("GRANT {privilege} ON TABLE {target} TO {grantee}{option}"),
+                _ => format!(
+                    "DO $grant$ BEGIN EXECUTE format('GRANT %s ON SEQUENCE %s TO %s%s', \
+                     '{privilege}', {target}, '{grantee}', '{option}'); END $grant$"
+                ),
+            });
+        }
+    }
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_get_indexdef(indexrelid) FROM pg_index
+         WHERE indrelid = to_regclass($1) AND NOT indisprimary",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?;
+    statements.extend(indexes);
+    Ok(statements)
 }
 
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
@@ -1239,13 +1362,14 @@ async fn finalize_table_snapshot(
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, TRUE, $4)
+                 VALUES ($1, $5::uuid, $2, $3, TRUE, $4)
                  RETURNING schema_id",
             )
             .bind(schema_id)
             .bind(schema_name)
             .bind(directory_path(schema_name))
             .bind(snapshot_id)
+            .bind(uuid::Uuid::now_v7().to_string())
             .fetch_one(&mut **tx)
             .await?
         },
@@ -1270,35 +1394,41 @@ async fn finalize_table_snapshot(
             )));
         },
         None => {
-            // As in the SQLite writer's `insert_new_table_rows`: rows of the id
-            // mean the table was dropped or renamed since the setup, and an
-            // expired base means it may have been dropped and expired since.
-            let known: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = $1)
-                     OR ($2 > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = $2))",
+            // As in the SQLite writer's `insert_new_table_rows`.
+            let (renamed, taken, base_expired): (bool, bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = $1 AND table_name = $2),
+                        EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = $1 AND table_name <> $2)
+                            OR EXISTS (SELECT 1 FROM ducklake_schema WHERE schema_id = $1)
+                            OR EXISTS (SELECT 1 FROM ducklake_view WHERE view_id = $1)
+                            OR EXISTS (SELECT 1 FROM ducklake_partition_info WHERE partition_id = $1)
+                            OR EXISTS (SELECT 1 FROM ducklake_sort_info WHERE sort_id = $1)
+                            OR EXISTS (SELECT 1 FROM ducklake_macro WHERE macro_id = $1),
+                        $3 > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = $3)",
             )
             .bind(table_id_hint)
+            .bind(table_name)
             .bind(base_snapshot)
             .fetch_one(&mut **tx)
             .await?;
-            if known {
-                return Err(crate::DuckLakeError::Conflict(format!(
-                    "table {} was dropped or renamed by another transaction; retry the write",
-                    crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
-                )));
-            }
+            let reserved = ReservedTableId {
+                renamed,
+                taken,
+                base_expired,
+            };
+            refuse_changed_table_id(&reserved, mode, schema_name, table_name)?;
             sqlx::query(
                 "INSERT INTO ducklake_table
                      (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
                       begin_snapshot)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, $4, TRUE, $5)",
+                 VALUES ($1, $6::uuid, $2, $3, $4, TRUE, $5)",
             )
             .bind(table_id_hint)
             .bind(schema_id)
             .bind(table_name)
             .bind(directory_path(table_name))
             .bind(snapshot_id)
+            .bind(uuid::Uuid::now_v7().to_string())
             .execute(&mut **tx)
             .await?;
             table_id_hint
@@ -1875,12 +2005,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, TRUE, $4)",
+                 VALUES ($1, $5::uuid, $2, $3, TRUE, $4)",
             )
             .bind(schema_id)
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
+            .bind(uuid::Uuid::now_v7().to_string())
             .execute(&mut *tx)
             .await?;
 
@@ -1934,13 +2065,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                      (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
                       begin_snapshot)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, $4, TRUE, $5)",
+                 VALUES ($1, $6::uuid, $2, $3, $4, TRUE, $5)",
             )
             .bind(table_id)
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
             .bind(snapshot_id)
+            .bind(uuid::Uuid::now_v7().to_string())
             .execute(&mut *tx)
             .await?;
 
@@ -2947,48 +3079,22 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .execute(&self.pool)
                 .await?;
             }
-            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
-                .execute(&self.pool)
-                .await?;
-            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")
-                .execute(&self.pool)
-                .await?;
-            sqlx::query(
-                "ALTER TABLE ducklake_column
-                 ADD COLUMN IF NOT EXISTS initial_default VARCHAR,
-                 ADD COLUMN IF NOT EXISTS default_value VARCHAR,
-                 ADD COLUMN IF NOT EXISTS default_value_type VARCHAR,
-                 ADD COLUMN IF NOT EXISTS default_value_dialect VARCHAR",
-            )
-            .execute(&self.pool)
-            .await?;
-            // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
-            // (idempotent, lossless — NULL means "not partitioned").
-            sqlx::query(
-                "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
-            )
-            .execute(&self.pool)
-            .await?;
-            // `partial_max` (current DuckLake spec) records the largest embedded
-            // snapshot of a flushed file and of its delete files.
-            sqlx::query(
-                "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
-            )
-            .execute(&self.pool)
-            .await?;
-            sqlx::query(
-                "ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
-            )
-            .execute(&self.pool)
-            .await?;
             // A catalog created elsewhere may have `changes_made` NOT NULL, but the
-            // row is seeded NULL and filled in at commit. Dropping an absent NOT
-            // NULL is a no-op in Postgres, so no probe is needed.
-            sqlx::query(
-                "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
+            // row is seeded NULL and filled in at commit.
+            let changes_not_null: bool = sqlx::query_scalar(
+                "SELECT attnotnull FROM pg_attribute
+                 WHERE attrelid = to_regclass('ducklake_snapshot_changes')
+                   AND attname = 'changes_made'",
             )
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await?;
+            if changes_not_null {
+                sqlx::query(
+                    "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
             add_official_columns(&self.pool).await?;
             // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
             // they are reserved inside a transaction from these counters.

@@ -20,12 +20,12 @@ use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_ta
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
-    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    MultiTableCommit, ReservedTableId, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
+    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
     inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    snapshot_has_change, staged_table_write_changes, table_directory, table_storage_changes,
-    table_write_changes, top_level_column_ids, validate_delete_entries,
+    refuse_changed_table_id, snapshot_has_change, staged_table_write_changes, table_directory,
+    table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
@@ -793,7 +793,7 @@ const POSITIONAL_TABLES: [(&str, &str); 4] = [
          file_order INTEGER,
          path VARCHAR NOT NULL,
          path_is_relative BOOLEAN NOT NULL DEFAULT 1,
-         file_format VARCHAR,
+         file_format VARCHAR DEFAULT 'parquet',
          record_count INTEGER,
          file_size_bytes INTEGER NOT NULL,
          footer_size INTEGER,
@@ -814,7 +814,7 @@ const POSITIONAL_TABLES: [(&str, &str); 4] = [
          data_file_id INTEGER NOT NULL,
          path VARCHAR NOT NULL,
          path_is_relative BOOLEAN NOT NULL DEFAULT 1,
-         format VARCHAR,
+         format VARCHAR DEFAULT 'parquet',
          delete_count INTEGER,
          file_size_bytes INTEGER NOT NULL,
          footer_size INTEGER,
@@ -1518,7 +1518,6 @@ async fn next_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
     )
     .fetch_one(&mut *conn)
     .await?;
-    raise_head_watermark(conn, "next_file_id", id).await?;
     Ok(id)
 }
 
@@ -1628,8 +1627,11 @@ async fn seed_catalog_counter(conn: &mut sqlx::SqliteConnection) -> Result<()> {
 /// so a write can carry the id from setup and insert the row inside its commit.
 /// The id is past every id in use, those official handed out (below the head
 /// snapshot's watermark) and those a release before 0.10 handed out (from row
-/// ids and the [`LEGACY_CATALOG_ID_COUNTERS`]); the head's watermark and those
-/// counters are raised to it, so neither takes it again.
+/// ids and the [`LEGACY_CATALOG_ID_COUNTERS`]); those counters are raised to
+/// it, so that release never takes it. The snapshot a commit writes carries a
+/// watermark past it ([`raise_snapshot_watermarks`]), and a commit of a table
+/// whose id was reserved at setup checks that official did not take it
+/// meanwhile ([`insert_new_table_rows`]).
 async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<i64> {
     seed_catalog_counter(tx).await?;
     let in_use = max_catalog_id(tx).await?;
@@ -1653,23 +1655,32 @@ async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Res
     .bind(id)
     .execute(&mut **tx)
     .await?;
-    raise_head_watermark(tx, "next_catalog_id", id).await?;
     Ok(id)
 }
 
-/// Raise the head snapshot's `watermark` (`next_catalog_id` or `next_file_id`)
-/// past `id`, so official DuckDB, which allocates from it, never hands `id` out.
-/// A reservation made after the commit inserted its snapshot raises that one.
-async fn raise_head_watermark(
+/// Raise `snapshot_id`'s `next_catalog_id` and `next_file_id` past every id in
+/// use and every id this writer reserved, so official DuckDB, which allocates
+/// from them, never hands one out. Only the snapshot an operation writes is
+/// raised: a committed snapshot is never rewritten. A release before 0.10
+/// commits without watermarks, so the previous snapshot's can be missing.
+async fn raise_snapshot_watermarks(
     conn: &mut sqlx::SqliteConnection,
-    watermark: &str,
-    id: i64,
+    snapshot_id: i64,
 ) -> Result<()> {
-    sqlx::query(AssertSqlSafe(format!(
-        "UPDATE ducklake_snapshot SET {watermark} = MAX(COALESCE({watermark}, 0), ?)
-         WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)"
-    )))
-    .bind(id + 1)
+    let catalog = max_catalog_id(conn).await?;
+    let file = max_file_id(conn).await?;
+    sqlx::query(
+        "UPDATE ducklake_snapshot
+         SET next_catalog_id = MAX(COALESCE(next_catalog_id, 0), ? + 1,
+                                   COALESCE((SELECT CAST(value AS INTEGER) + 1
+                                             FROM ducklake_metadata
+                                             WHERE key = 'next_catalog_id' AND scope IS NULL), 0)),
+             next_file_id = MAX(COALESCE(next_file_id, 0), ? + 1)
+         WHERE snapshot_id = ?",
+    )
+    .bind(catalog)
+    .bind(file)
+    .bind(snapshot_id)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -2873,12 +2884,7 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     .await?;
     let snapshot_id = row.try_get(0)?;
     let schema_version = row.try_get(1)?;
-    // A release before 0.10 commits without watermarks, so the previous
-    // head's can be missing while official's ids are in use.
-    let catalog = max_catalog_id(tx).await?;
-    raise_head_watermark(tx, "next_catalog_id", catalog).await?;
-    let file = max_file_id(tx).await?;
-    raise_head_watermark(tx, "next_file_id", file).await?;
+    raise_snapshot_watermarks(tx, snapshot_id).await?;
     sqlx::query(
         "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
          VALUES (?, NULL)",
@@ -3263,6 +3269,7 @@ async fn finalize_table_snapshot(
         schema_name,
         table_name,
         base_snapshot,
+        mode,
     )
     .await?;
 
@@ -3551,6 +3558,7 @@ async fn insert_new_table_rows(
     schema_name: &str,
     table_name: &str,
     base_snapshot: i64,
+    mode: WriteMode,
 ) -> Result<(i64, i64)> {
     let live: Option<(i64, i64, i64)> = sqlx::query_as(
         "SELECT table_meta.table_id, schema.begin_snapshot, table_meta.begin_snapshot
@@ -3572,21 +3580,8 @@ async fn insert_new_table_rows(
         }
         return Ok((schema_begin, table_begin));
     }
-    let known: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ?)
-             OR (? > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = ?))",
-    )
-    .bind(table_id)
-    .bind(base_snapshot)
-    .bind(base_snapshot)
-    .fetch_one(&mut **tx)
-    .await?;
-    if known {
-        return Err(crate::DuckLakeError::Conflict(format!(
-            "table {} was dropped or renamed by another transaction; retry the write",
-            crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
-        )));
-    }
+    let reserved = reserved_table_id(tx, table_id, table_name, base_snapshot).await?;
+    refuse_changed_table_id(&reserved, mode, schema_name, table_name)?;
     let schema: Option<(i64, i64)> = sqlx::query_as(
         "SELECT schema_id, begin_snapshot FROM ducklake_schema
          WHERE schema_name = ? AND end_snapshot IS NULL",
@@ -3604,7 +3599,7 @@ async fn insert_new_table_rows(
                  VALUES (?, ?, ?, ?, 1, ?)",
             )
             .bind(schema_id)
-            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::now_v7().to_string())
             .bind(schema_name)
             .bind(directory_path(schema_name))
             .bind(snapshot_id)
@@ -3619,7 +3614,7 @@ async fn insert_new_table_rows(
          VALUES (?, ?, ?, ?, ?, 1, ?)",
     )
     .bind(table_id)
-    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(uuid::Uuid::now_v7().to_string())
     .bind(schema_id)
     .bind(table_name)
     .bind(directory_path(table_name))
@@ -3627,6 +3622,43 @@ async fn insert_new_table_rows(
     .execute(&mut **tx)
     .await?;
     Ok((schema_begin, snapshot_id))
+}
+
+/// What became of `table_id`, reserved for `table_name` by a setup that saw
+/// `base_snapshot` ([`ReservedTableId`]).
+async fn reserved_table_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    table_name: &str,
+    base_snapshot: i64,
+) -> Result<ReservedTableId> {
+    let present: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&mut **tx)
+            .await?;
+    let others = CATALOG_ID_COLUMNS
+        .iter()
+        .filter(|(table, _)| *table != "ducklake_table" && present.iter().any(|name| name == table))
+        .map(|(table, column)| format!("EXISTS (SELECT 1 FROM {table} WHERE {column} = ?1)"))
+        .collect::<Vec<_>>();
+    let (renamed, taken, base_expired): (bool, bool, bool) =
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ?1 AND table_name = ?2),
+                EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ?1 AND table_name <> ?2)
+                    OR {others},
+                ?3 > 0 AND NOT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = ?3)",
+            others = others.join(" OR ")
+        )))
+        .bind(table_id)
+        .bind(table_name)
+        .bind(base_snapshot)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(ReservedTableId {
+        renamed,
+        taken,
+        base_expired,
+    })
 }
 
 async fn record_snapshot_changes(
@@ -3658,7 +3690,7 @@ async fn record_snapshot_changes(
     for _ in 0..inlined_inserts(changes_made.unwrap_or_default()) {
         next_file_id(tx).await?;
     }
-    Ok(())
+    raise_snapshot_watermarks(tx, snapshot_id).await
 }
 
 async fn validate_staged_table(
@@ -4685,7 +4717,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES (?, ?, ?, ?, 1, ?)",
             )
             .bind(schema_id)
-            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::now_v7().to_string())
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
@@ -4745,7 +4777,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES (?, ?, ?, ?, ?, 1, ?)",
             )
             .bind(table_id)
-            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::now_v7().to_string())
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)

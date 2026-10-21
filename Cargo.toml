@@ -46,7 +46,7 @@ base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
 
 # Write support (optional)
-uuid = { version = "1.0", features = ["v4"], optional = true }
+uuid = { version = "1.0", features = ["v4", "v7"], optional = true }
 # Used by the maintenance API (ExpireCriteria/CleanupCriteria OlderThan).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Staging file for streaming table writes (see table_writer::TableWriteSession).

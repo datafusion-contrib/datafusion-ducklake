@@ -391,7 +391,8 @@ A few highlights worth knowing up front:
 - Official DuckDB can attach and write a catalog the DuckDB, SQLite, MySQL, or single-catalog
   PostgreSQL writer creates. A catalog an earlier release created needs
   `migrate_to_official_layout` first, after which only 0.10 or later should write it, so
-  upgrade every writer of the catalog before migrating.
+  upgrade every writer of the catalog before migrating. On PostgreSQL, drop any view on the
+  catalog tables first; the migration refuses a table a view depends on.
 - Object stores: local filesystem, S3-compatible (S3, MinIO), and any other `object_store`
   backend registered in the `RuntimeEnv` under the `data_path` scheme (`gs://`, `az://`, ...).
 - A catalog from `DuckLakeCatalog::new` or `with_writer` reads the latest snapshot at each

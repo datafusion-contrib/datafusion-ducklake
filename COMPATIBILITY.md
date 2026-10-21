@@ -906,26 +906,34 @@ Known edges:
   it forward, matching upstream's `if (SchemaChangesMade()) schema_version++`. These branches
   deliberately retain their existing counter or sequence allocation instead of adding the
   separate Group 9 snapshot-allocator change.
-- **Official DuckDB can write a catalog this crate created.** On DuckDB, SQLite, MySQL, and
-  single-catalog PostgreSQL metadata, the writers lay out `ducklake_schema`, `ducklake_table`,
-  `ducklake_data_file`, and `ducklake_delete_file` with official's columns, order and keys, since
-  official inserts into them by position and keeps one `ducklake_table` row per version of a
-  table, and create every table official reads. Schema, table, partition, and sort ids come from
-  official's `next_catalog_id` namespace and file ids from its `next_file_id` one, which every
-  snapshot carries as the watermarks official allocates from; either side then allocates past
-  the other's ids, and a commit that inlines rows advances `next_file_id` once per table, as
-  official's does. Initialization only adds what an older catalog lacks, so a release before 0.10
-  keeps writing it; `migrate_to_official_layout` then rebuilds it into official's layout
-  (idempotent, lossless, blocking the tables' writers while it runs), after which only 0.10 or
-  later should write it: an older release fails to create a table (and, on DuckDB, to add a
-  file), and its snapshots lack the watermarks official reads, until the next 0.10 commit
-  raises them past every id in use. Until then the writers also take ids past the counters and
-  sequences older releases allocate from. A column the crate adds to a table takes an id past
-  the table's, as official numbers a table's columns, and a file it writes goes to the
-  directory the table's stored path names, which a rename by official keeps. The multi-catalog
-  PostgreSQL layout is library-specific and stays unattachable by official. Official DuckDB
-  1.5.5's MySQL connector cannot append to an existing table on any MySQL catalog, its own
-  included.
+- **Official DuckDB can write a catalog this crate created.** It applies to DuckDB, SQLite,
+  MySQL, and single-catalog PostgreSQL metadata. The multi-catalog PostgreSQL layout is
+  library-specific and stays unattachable by official.
+  - *Layout:* `ducklake_schema`, `ducklake_table`, `ducklake_data_file`, and
+    `ducklake_delete_file` have official's columns, order and keys, since official inserts into
+    them by position and keeps one `ducklake_table` row per version of a table. The writers
+    create every table official reads, write `parquet` as a file's format and v7 UUIDs.
+  - *Ids:* schema, table, partition, and sort ids come from official's `next_catalog_id`
+    namespace and file ids from its `next_file_id` one. Each commit raises the watermarks of the
+    snapshot it writes past every id in use, never those of a committed snapshot, and a commit
+    that inlines rows advances `next_file_id` once per table, as official's does. A column the
+    crate adds to a table takes an id past the table's, as official numbers a table's columns.
+  - *Conflicts:* a table id reserved when a write begins is checked at its commit, which
+    conflicts when official took it meanwhile. A write creating a table whose base snapshot was
+    expired meanwhile commits as a `Replace` and conflicts as an `Append`, which could bring back
+    a table another transaction dropped.
+  - *Paths:* a file the crate writes goes to the directory the table's stored path names, which
+    a rename by official keeps.
+  - *Migration:* initialization only adds what an older catalog lacks, so a release before 0.10
+    keeps writing it, and the writers take ids past the counters and sequences older releases
+    allocate from. `migrate_to_official_layout` then rebuilds it into official's layout
+    (idempotent, lossless, blocking the tables' writers while it runs). On PostgreSQL the rebuilt
+    tables keep their owner, grants and indexes, and a table a view depends on is refused; on
+    MySQL 8.0 reordering columns copies the table (`ALGORITHM=COPY`). Afterwards only 0.10 or
+    later should write it: an older release fails to create a table (and, on DuckDB, to add a
+    file), and its snapshots lack the watermarks official reads until the next 0.10 commit.
+  - Official DuckDB 1.5.5's MySQL connector cannot append to an existing table on any MySQL
+    catalog, its own included.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

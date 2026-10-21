@@ -39,6 +39,49 @@ pub(crate) fn table_directory(
     resolve_path(&schema_directory, table_path, table_path_is_relative)
 }
 
+/// What a commit finds of the id `begin_write_transaction` reserved for a
+/// table, when no live table has the table's name.
+pub(crate) struct ReservedTableId {
+    /// A row of the id has the table's name: the table existed at the setup,
+    /// and another transaction dropped or renamed it since.
+    pub(crate) renamed: bool,
+    /// Another schema, table, view, partition, sort or macro has the id:
+    /// official DuckDB, or a release before 0.10, allocated it since the setup.
+    pub(crate) taken: bool,
+    /// The snapshot the setup saw was expired since, so a table that existed
+    /// then may have been dropped and expired, leaving no row of the id.
+    pub(crate) base_expired: bool,
+}
+
+/// Refuse a commit that would insert the row of `schema_name.table_name` under
+/// an id that changed hands since the setup, as official DuckLake refuses to
+/// commit a create of a name or id another transaction took. An expired base
+/// matters only to an `Append`: a `Replace` that recreates a dropped table is
+/// a create, so it goes ahead.
+pub(crate) fn refuse_changed_table_id(
+    reserved: &ReservedTableId,
+    mode: WriteMode,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<()> {
+    let table = quote_snapshot_table(schema_name, table_name);
+    let conflict = if reserved.renamed {
+        format!("table {table} was dropped or renamed by another transaction")
+    } else if reserved.taken {
+        format!("the id reserved for table {table} was taken by another transaction")
+    } else if reserved.base_expired && mode == WriteMode::Append {
+        format!(
+            "table {table} may have been dropped by another transaction: the snapshot this \
+             write began on was expired"
+        )
+    } else {
+        return Ok(());
+    };
+    Err(DuckLakeError::Conflict(format!(
+        "{conflict}; retry the write"
+    )))
+}
+
 /// Validate a catalog entity name (schema, table, or column).
 ///
 /// Rejects names that are:
