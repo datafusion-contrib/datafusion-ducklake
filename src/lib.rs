@@ -74,6 +74,8 @@
 
 pub mod catalog;
 mod catalog_read_memo;
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+mod catalog_read_transaction;
 pub mod change_detection;
 pub mod column_rename;
 pub mod delete_filter;
@@ -179,9 +181,9 @@ pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
-    ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
-    DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,
-    TagObjectType, TagTarget,
+    ColumnTag, ConsistentRead, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush,
+    DuckLakeInlinedFlushData, DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag,
+    SnapshotChangeMetadata, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};

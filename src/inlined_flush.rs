@@ -444,8 +444,15 @@ async fn flush_table(
         ..InlinedFlushTable::default()
     };
 
-    let inlined = provider.get_inlined_data_for_flush(table_id, base_snapshot)?;
-    let file_deletes = provider.get_inlined_file_deletes_for_flush(table_id, base_snapshot)?;
+    // Read in one consistent read of the catalog, so that the rows and the
+    // deletions show one state of it.
+    let (inlined, file_deletes) =
+        crate::metadata_provider::read_consistently(provider, |provider| {
+            Ok::<_, DuckLakeError>((
+                provider.get_inlined_data_for_flush(table_id, base_snapshot)?,
+                provider.get_inlined_file_deletes_for_flush(table_id, base_snapshot)?,
+            ))
+        })?;
     if inlined.is_empty() && file_deletes.is_empty() {
         return Ok(plan);
     }

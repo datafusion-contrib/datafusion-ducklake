@@ -299,6 +299,11 @@ async fn postgres_inlined_delete_lookup_reads_native_bigints() {
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
     let pool = PgPool::connect(&url).await.unwrap();
+    // The provider reads the head with a check for the inlined-deletion table.
+    sqlx::query("CREATE TABLE ducklake_snapshot (snapshot_id BIGINT)")
+        .execute(&pool)
+        .await
+        .unwrap();
     let provider = PostgresMetadataProvider::new(&url).await.unwrap();
     assert!(provider.get_inlined_deletes(5, 2).unwrap().is_empty());
     sqlx::query(

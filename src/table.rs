@@ -163,6 +163,21 @@ impl ScanInlinedRows {
     }
 }
 
+/// What [`DuckLakeTable::scan_catalog_reads`] reads for one scan.
+struct ScanCatalogReads {
+    inlined_deletes: HashMap<i64, HashSet<i64>>,
+    inlined: ScanInlinedRows,
+    pages: Vec<ScanPage>,
+}
+
+/// One page of a scan's listing, pruned: the files the scan keeps, with their
+/// statistics.
+struct ScanPage {
+    files: Vec<DuckLakeTableFile>,
+    file_statistics: HashMap<i64, Arc<Statistics>>,
+    summary_statistics: HashMap<i64, Arc<Statistics>>,
+}
+
 /// The lowest next data file id read with those of `rows` that hold rows.
 fn rows_next_file_id(rows: &[DuckLakeInlinedRows]) -> Option<i64> {
     rows.iter()
@@ -1815,17 +1830,23 @@ impl DuckLakeTable {
         let mut encryption_keys = HashMap::new();
 
         let mut matching = Vec::new();
-        for metadata in self.file_metadata_pages("file matching", stats_filter.as_ref()) {
-            let (table_files, mut file_statistics) = self.page_files_with_statistics(metadata?);
-            restate_in_physical_row_space(&mut file_statistics, &table_files);
-            #[cfg(feature = "encryption")]
-            self.collect_encryption_keys(&mut encryption_keys, &table_files)?;
-            matching.extend(
-                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics)
-                    .into_iter()
-                    .cloned(),
-            );
-        }
+        // Every page in one consistent read of the catalog
+        // (`Self::read_consistently`), so that a merge between two pages
+        // cannot list its sources and its output both.
+        self.read_consistently(|table| {
+            for metadata in table.file_metadata_pages("file matching", stats_filter.as_ref()) {
+                let (table_files, mut file_statistics) = self.page_files_with_statistics(metadata?);
+                restate_in_physical_row_space(&mut file_statistics, &table_files);
+                #[cfg(feature = "encryption")]
+                self.collect_encryption_keys(&mut encryption_keys, &table_files)?;
+                matching.extend(
+                    self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics)
+                        .into_iter()
+                        .cloned(),
+                );
+            }
+            Ok::<_, crate::DuckLakeError>(())
+        })?;
         #[cfg(feature = "encryption")]
         self.install_encryption_keys(encryption_keys);
         Ok(matching)
@@ -1881,6 +1902,98 @@ impl DuckLakeTable {
             return Ok((rows.into_iter().map(Into::into).collect(), files));
         }
         Err(inlined_rows_kept_moving(&self.table_name))
+    }
+
+    /// Run `read` against this table with every catalog read it makes seeing
+    /// one state of the catalog: against this table bound to a consistent read
+    /// of its provider ([`MetadataProvider::begin_consistent_read`]), or against
+    /// this table itself when the provider cannot begin one.
+    ///
+    /// `read` is synchronous, so the read never spans object-store I/O. It must
+    /// read the catalog through the table it is given, never through `self`.
+    pub(crate) fn read_consistently<T, E>(
+        &self,
+        read: impl FnOnce(&DuckLakeTable) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::DuckLakeError>,
+    {
+        crate::metadata_provider::read_consistently(&self.provider, |provider| {
+            if Arc::ptr_eq(provider, &self.provider) {
+                read(self)
+            } else {
+                read(&self.with_metadata_provider(Arc::clone(provider)))
+            }
+        })
+    }
+
+    /// The catalog reads of one scan: the inlined deletions, the inlined rows
+    /// (with their row ids for a `rowid` scan, `with_row_ids`), and every page
+    /// of the listing, `stats_filter` narrowing it in the catalog and `pruning`
+    /// pruning each page.
+    ///
+    /// A flush moves inlined rows to files in one commit. Inside a consistent
+    /// read the rows and the listing show one state of the catalog. A provider
+    /// that cannot begin one reads them in separate statements, so the inlined
+    /// rows are read first, with the catalog's next data file id, then the
+    /// files: a listed file at or above that id was committed since, and may
+    /// hold rows also read inlined, so both are read again. Official DuckLake
+    /// reads a scan's inlined rows and files in this order where each of its
+    /// statements commits on its own (`DuckLakeMultiFileList::ReadCommittedFiles`
+    /// under `CommitsEachStatement`, in official DuckLake newer than the
+    /// extension DuckDB 1.5.5 loads).
+    fn scan_catalog_reads(
+        &self,
+        with_row_ids: bool,
+        inlined_filter: Option<&InlinedFilter>,
+        stats_filter: Option<&StatsFilter>,
+        pruning: &[PruningPredicate],
+    ) -> DataFusionResult<ScanCatalogReads> {
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        'read: for _ in 0..SCAN_READ_ATTEMPTS {
+            let inlined = if with_row_ids {
+                ScanInlinedRows::WithRowIds(self.read_inlined_rows_with_row_ids(inlined_filter)?)
+            } else {
+                ScanInlinedRows::Plain(self.scan_inlined_rows(inlined_filter)?)
+            };
+            let next_file_id = inlined.next_file_id();
+            let mut pages = Vec::new();
+            for metadata in self.file_metadata_pages("planning", stats_filter) {
+                let metadata = metadata?;
+                if written_since(&metadata, next_file_id) {
+                    continue 'read;
+                }
+                let (table_files, mut file_statistics, mut summary_statistics) =
+                    self.page_files_with_both_statistics(metadata);
+                #[cfg(feature = "encryption")]
+                self.configure_encryption_factory(&table_files)?;
+                let kept: HashSet<i64> = self
+                    .prune_table_files_iteratively(pruning, &table_files, &file_statistics)
+                    .into_iter()
+                    .map(|file| file.data_file_id)
+                    .collect();
+                // Only the kept files' statistics stay, so that a selective
+                // scan of a large table holds no more than it plans.
+                file_statistics.retain(|data_file_id, _| kept.contains(data_file_id));
+                summary_statistics.retain(|data_file_id, _| kept.contains(data_file_id));
+                pages.push(ScanPage {
+                    files: table_files
+                        .into_iter()
+                        .filter(|file| kept.contains(&file.data_file_id))
+                        .collect(),
+                    file_statistics,
+                    summary_statistics,
+                });
+            }
+            return Ok(ScanCatalogReads {
+                inlined_deletes,
+                inlined,
+                pages,
+            });
+        }
+        Err(DataFusionError::External(Box::new(
+            inlined_rows_kept_moving(&self.table_name),
+        )))
     }
 
     /// Page the catalog's file metadata, optionally handing the provider a
@@ -5707,7 +5820,6 @@ impl TableProvider for DuckLakeTable {
             (None, _) => false,
         };
 
-        let inlined_deletes = self.inlined_deletes_by_file()?;
         // One physical form of the filters feeds both pruning paths; see
         // `physical_conjuncts`, which leaves out any conjunct it cannot convert.
         // A failure to build the schema they convert against means "prune
@@ -5741,120 +5853,48 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
-        // A flush moves inlined rows to files in one commit, but the inlined
-        // rows and the listing are read in separate statements. Read the
-        // inlined rows first, with the catalog's next data file id, then list
-        // the files: a listed file at or above that id was committed since,
-        // and may hold rows also read inlined, so read both again. Official
-        // DuckLake reads a scan's inlined rows and files in this order
-        // (`DuckLakeMultiFileList::ReadCommittedFiles`).
-        let mut attempt = 0;
-        let (mut execs, inlined) = 'read: loop {
-            attempt += 1;
-            let inlined = if rowid_in_proj {
-                ScanInlinedRows::WithRowIds(
-                    self.read_inlined_rows_with_row_ids(inlined_filter.as_ref())?,
-                )
-            } else {
-                ScanInlinedRows::Plain(self.scan_inlined_rows(inlined_filter.as_ref())?)
-            };
-            let next_file_id = inlined.next_file_id();
-            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
-                let metadata = metadata?;
-                if written_since(&metadata, next_file_id) {
-                    if attempt == SCAN_READ_ATTEMPTS {
-                        return Err(DataFusionError::External(Box::new(
-                            inlined_rows_kept_moving(&self.table_name),
-                        )));
-                    }
-                    continue 'read;
-                }
-                let (table_files, file_statistics, summary_statistics) =
-                    self.page_files_with_both_statistics(metadata);
-                #[cfg(feature = "encryption")]
-                self.configure_encryption_factory(&table_files)?;
+        // The inlined deletions, the inlined rows and every page of the
+        // listing, read in one consistent read of the catalog and pruned page
+        // by page (`Self::scan_catalog_reads`). Building the scans below reads
+        // Parquet footers and delete files, so it waits until that read ends.
+        let ScanCatalogReads {
+            inlined_deletes,
+            inlined,
+            pages,
+        } = self.read_consistently(|table| {
+            table.scan_catalog_reads(
+                rowid_in_proj,
+                inlined_filter.as_ref(),
+                stats_filter.as_ref(),
+                &pruning,
+            )
+        })?;
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        for ScanPage {
+            files,
+            file_statistics,
+            summary_statistics,
+        } in &pages
+        {
+            let table_files: Vec<&DuckLakeTableFile> = files.iter().collect();
 
-                let table_files =
-                    self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
-
-                if rowid_in_proj {
-                    let rowid_idx = rowid_idx.unwrap();
-                    let user_proj: Vec<usize> = projection
-                        .cloned()
-                        .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
-                    let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
-                        .into_iter()
-                        .partition(|table_file| self.needs_snapshot_filter(table_file));
-                    if !rest.is_empty() {
-                        execs.push(self.build_exec_for_files_with_rowid(
-                            state,
-                            &rest,
-                            &inlined_deletes,
-                            &file_statistics,
-                            &user_proj,
-                            rowid_idx,
-                            limit,
-                        )?);
-                    }
-                    let (needs_filter, partial_deletes) = self
-                        .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
-                        .await?;
-                    let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
-                        .iter()
-                        .partition(|table_file| table_file.file.mapping_id.is_some());
-                    if !field_id.is_empty() {
-                        execs.push(self.build_exec_for_partial_files(
-                            state,
-                            &field_id,
-                            &partial_deletes,
-                            &file_statistics,
-                            &user_proj,
-                            Some(rowid_idx),
-                        )?);
-                    }
-                    for table_file in mapped {
-                        let output_schema =
-                            self.output_schema_for_projection(&user_proj, rowid_idx);
-                        execs.push(
-                            self.build_exec_for_partial_file(
-                                state,
-                                table_file,
-                                partial_deletes.get(&table_file.data_file_id),
-                                output_schema,
-                            )
-                            .await?,
-                        );
-                    }
-                    continue;
-                }
-
+            if rowid_in_proj {
+                let rowid_idx = rowid_idx.unwrap();
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
                 let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
                     .into_iter()
                     .partition(|table_file| self.needs_snapshot_filter(table_file));
-                let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
-                    rest.into_iter().partition(|table_file| {
-                        table_file.delete_file.is_some()
-                            || inlined_deletes.contains_key(&table_file.data_file_id)
-                    });
-
-                if !files_without_deletes.is_empty() {
-                    execs.push(self.build_exec_for_files_without_deletes(
+                if !rest.is_empty() {
+                    execs.push(self.build_exec_for_files_with_rowid(
                         state,
-                        &files_without_deletes,
-                        &file_statistics,
-                        &summary_statistics,
-                        projection,
-                        limit,
-                    )?);
-                }
-                if !files_with_deletes.is_empty() {
-                    execs.push(self.build_exec_for_files_with_deletes(
-                        state,
-                        &files_with_deletes,
+                        &rest,
                         &inlined_deletes,
-                        &file_statistics,
-                        projection,
+                        file_statistics,
+                        &user_proj,
+                        rowid_idx,
+                        limit,
                     )?);
                 }
                 let (needs_filter, partial_deletes) = self
@@ -5864,23 +5904,17 @@ impl TableProvider for DuckLakeTable {
                     .iter()
                     .partition(|table_file| table_file.file.mapping_id.is_some());
                 if !field_id.is_empty() {
-                    let user_proj: Vec<usize> = projection
-                        .cloned()
-                        .unwrap_or_else(|| (0..self.physical_schema.fields().len()).collect());
                     execs.push(self.build_exec_for_partial_files(
                         state,
                         &field_id,
                         &partial_deletes,
-                        &file_statistics,
+                        file_statistics,
                         &user_proj,
-                        None,
+                        Some(rowid_idx),
                     )?);
                 }
                 for table_file in mapped {
-                    let output_schema = match projection {
-                        Some(indices) => Arc::new(self.schema.project(indices)?),
-                        None => self.schema.clone(),
-                    };
+                    let output_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
                     execs.push(
                         self.build_exec_for_partial_file(
                             state,
@@ -5891,9 +5925,72 @@ impl TableProvider for DuckLakeTable {
                         .await?,
                     );
                 }
+                continue;
             }
-            break (execs, inlined);
-        };
+
+            let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
+                .into_iter()
+                .partition(|table_file| self.needs_snapshot_filter(table_file));
+            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
+                rest.into_iter().partition(|table_file| {
+                    table_file.delete_file.is_some()
+                        || inlined_deletes.contains_key(&table_file.data_file_id)
+                });
+
+            if !files_without_deletes.is_empty() {
+                execs.push(self.build_exec_for_files_without_deletes(
+                    state,
+                    &files_without_deletes,
+                    file_statistics,
+                    summary_statistics,
+                    projection,
+                    limit,
+                )?);
+            }
+            if !files_with_deletes.is_empty() {
+                execs.push(self.build_exec_for_files_with_deletes(
+                    state,
+                    &files_with_deletes,
+                    &inlined_deletes,
+                    file_statistics,
+                    projection,
+                )?);
+            }
+            let (needs_filter, partial_deletes) = self
+                .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
+                .await?;
+            let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
+                .iter()
+                .partition(|table_file| table_file.file.mapping_id.is_some());
+            if !field_id.is_empty() {
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.physical_schema.fields().len()).collect());
+                execs.push(self.build_exec_for_partial_files(
+                    state,
+                    &field_id,
+                    &partial_deletes,
+                    file_statistics,
+                    &user_proj,
+                    None,
+                )?);
+            }
+            for table_file in mapped {
+                let output_schema = match projection {
+                    Some(indices) => Arc::new(self.schema.project(indices)?),
+                    None => self.schema.clone(),
+                };
+                execs.push(
+                    self.build_exec_for_partial_file(
+                        state,
+                        table_file,
+                        partial_deletes.get(&table_file.data_file_id),
+                        output_schema,
+                    )
+                    .await?,
+                );
+            }
+        }
 
         if rowid_in_proj {
             let rowid_idx = rowid_idx.unwrap();
@@ -6179,15 +6276,20 @@ impl TableProvider for DuckLakeTable {
         // `scan()` does — but no data scan and no mutation happen here; the exec
         // collects each scan and performs the rewrite + atomic commit at execute
         // time.
-        // The inlined rows are read before the files, so that a flush between
-        // the reads moves no row out of both (`inlined_rows_then_files`).
-        let inlined_deletes = self.inlined_deletes_by_file()?;
-        let (inlined, table_files) = if writer.supports_inlined_row_mutations() {
-            self.inlined_rows_then_files(|| self.files(), |file| file.data_file_id)
-        } else {
-            self.files().map(|files| (Vec::new(), files))
-        }
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        // The inlined deletions, the inlined rows and the files, read in one
+        // consistent read of the catalog (`Self::read_consistently`); the rows
+        // before the files, as `inlined_rows_then_files` reads them for a
+        // provider that cannot begin one.
+        let (inlined_deletes, (inlined, table_files)) = self.read_consistently(|table| {
+            let inlined_deletes = table.inlined_deletes_by_file()?;
+            let rows_and_files = if writer.supports_inlined_row_mutations() {
+                table.inlined_rows_then_files(|| table.files(), |file| file.data_file_id)
+            } else {
+                table.files().map(|files| (Vec::new(), files))
+            }
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            Ok::<_, DataFusionError>((inlined_deletes, rows_and_files))
+        })?;
         let mut scans = Vec::with_capacity(table_files.len());
         for tf in &table_files {
             scans.push(

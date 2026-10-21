@@ -267,37 +267,52 @@ impl MulticatalogManager {
                 .unwrap_or_default(),
         };
 
-        // Each live file with its statistics and partition values, listed
-        // after the source's inlined deletions and inlined rows, so that a
-        // flush of the source between the reads moves no row or deletion out
-        // of all of them (`DuckLakeTable::inlined_rows_then_files`).
+        // The source's inlined deletions, its inlined rows, each live file
+        // with its statistics and partition values, and the inlined rows a
+        // flush would write, read in one consistent read of the catalog
+        // (`DuckLakeTable::read_consistently`), so that a flush or a merge of
+        // the source that commits meanwhile moves no row or deletion out of
+        // all of them, or into two. The rows are read before the files, as
+        // `DuckLakeTable::inlined_rows_then_files` reads them for a provider
+        // that cannot begin such a read.
         let adopted: HashSet<i64> = column_ids.iter().copied().collect();
-        let inlined_deletes = source.inlined_deletes_by_file().map_err(df_error)?;
-        let (rows, mut metadata) = source.inlined_rows_then_files(
-            || {
-                let mut metadata = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = provider.get_table_file_metadata_page(
-                        source_table_id,
-                        snapshot,
-                        after,
-                        crate::metadata_provider::FILE_METADATA_BATCH_SIZE,
-                    )?;
-                    let Some(last) = page.last() else {
-                        break;
-                    };
-                    after = Some(last.file.data_file_id);
-                    let last_page = page.len() < crate::metadata_provider::FILE_METADATA_BATCH_SIZE;
-                    metadata.extend(page);
-                    if last_page {
-                        break;
-                    }
-                }
-                Ok(metadata)
-            },
-            |entry| entry.file.data_file_id,
-        )?;
+        let (inlined_deletes, rows, mut metadata, flush_rows) =
+            source.read_consistently(|source| {
+                let provider = source.provider();
+                let inlined_deletes = source.inlined_deletes_by_file().map_err(df_error)?;
+                let (rows, metadata) = source.inlined_rows_then_files(
+                    || {
+                        let mut metadata = Vec::new();
+                        let mut after = None;
+                        loop {
+                            let page = provider.get_table_file_metadata_page(
+                                source_table_id,
+                                snapshot,
+                                after,
+                                crate::metadata_provider::FILE_METADATA_BATCH_SIZE,
+                            )?;
+                            let Some(last) = page.last() else {
+                                break;
+                            };
+                            after = Some(last.file.data_file_id);
+                            let last_page =
+                                page.len() < crate::metadata_provider::FILE_METADATA_BATCH_SIZE;
+                            metadata.extend(page);
+                            if last_page {
+                                break;
+                            }
+                        }
+                        Ok(metadata)
+                    },
+                    |entry| entry.file.data_file_id,
+                )?;
+                let flush_rows = if rows.is_empty() {
+                    Vec::new()
+                } else {
+                    provider.get_inlined_data_for_flush(source_table_id, snapshot)?
+                };
+                Ok::<_, DuckLakeError>((inlined_deletes, rows, metadata, flush_rows))
+            })?;
         // A file of no rows holds nothing the fork reads: the 0-row file a
         // Replace with no rows commits to retire the prior generation (with no
         // partition values on a partitioned table). Official writes no file for
@@ -465,8 +480,7 @@ impl MulticatalogManager {
                     .iter()
                     .flat_map(|data| data.row_ids.iter().copied())
                     .collect();
-                let omitted: std::collections::BTreeSet<i64> = provider
-                    .get_inlined_data_for_flush(source_table_id, snapshot)?
+                let omitted: std::collections::BTreeSet<i64> = flush_rows
                     .iter()
                     .flat_map(|data| {
                         data.rows

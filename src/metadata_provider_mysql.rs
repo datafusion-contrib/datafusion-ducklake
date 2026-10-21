@@ -1,23 +1,24 @@
 //! MySQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::catalog_read_transaction::{CatalogConnection, ReadTransaction, catalog_connection};
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
     render_inlined_filter,
 };
 use crate::metadata_provider::SQL_NEXT_FILE_ID;
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
-    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout, MetadataProvider,
-    MetadataSetting, ObjectTag, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC,
-    SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotChangeMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
-    block_on, inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
-    parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
-    resolve_metadata_settings,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
+    DuckLakeInlinedDelete, DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile,
+    DuckLakeTableStatistics, DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout,
+    MetadataProvider, MetadataSetting, ObjectTag, SQL_GET_FILE_PARTITION_VALUES,
+    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS, SchemaMetadata,
+    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget,
+    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
+    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
@@ -35,7 +36,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::mysql::{MySql, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -55,7 +56,7 @@ fn mysql_lookup(ledger: SchemaVersionLedger) -> crate::metadata_provider::Inline
 /// was written with. `None` when no row matches.
 #[allow(clippy::too_many_arguments)]
 async fn read_mysql_inlined_table(
-    pool: &MySqlPool,
+    connection: &mut MySqlConnection,
     table_id: i64,
     table: &str,
     ledger: SchemaVersionLedger,
@@ -69,12 +70,12 @@ async fn read_mysql_inlined_table(
         system,
         present,
         physical_types,
-    } = inlined_table_layout(pool, table).await?;
+    } = inlined_table_layout(&mut *connection, table).await?;
     let version_columns: Vec<InlinedVersionColumn> = sqlx::query_as(AssertSqlSafe(
         inlined_version_columns_sql(table, mysql_lookup(ledger), "?"),
     ))
     .bind(table_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present)?;
     let decode_columns = mapping.decode_columns(columns);
@@ -134,7 +135,7 @@ async fn read_mysql_inlined_table(
             };
         }
     }
-    let rows = query.fetch_all(pool).await?;
+    let rows = query.fetch_all(&mut *connection).await?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -182,6 +183,20 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("doesn't exist")
         || message.contains("does not exist")
         || message.contains("unknown table")
+}
+
+/// Whether a read of a table's inlined-deletion table found none at its
+/// snapshot: the table is missing, or a consistent read reached a table created
+/// after its snapshot (`ER_TABLE_DEF_CHANGED`), which holds nothing at that
+/// snapshot. DuckLake creates and drops an inlined-deletion table, and never
+/// alters it, so for it that error means a table created since.
+fn is_absent_inlined_deletion_table(error: &sqlx::Error) -> bool {
+    const ER_TABLE_DEF_CHANGED: u16 = 1412;
+    is_missing_statistics_table(error)
+        || error
+            .as_database_error()
+            .and_then(|error| error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+            .is_some_and(|error| error.number() == ER_TABLE_DEF_CHANGED)
 }
 
 /// The system column names DuckLake gives a new inlined data table in this
@@ -715,6 +730,9 @@ pub struct MySqlMetadataProvider {
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    // The consistent read every catalog read runs on, when this provider is
+    // bound to one (see `MetadataProvider::begin_consistent_read`).
+    read: Option<Arc<ReadTransaction<MySql>>>,
 }
 
 impl MySqlMetadataProvider {
@@ -732,6 +750,7 @@ impl MySqlMetadataProvider {
         Ok(Self {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
+            read: None,
         })
     }
 
@@ -752,6 +771,7 @@ impl MySqlMetadataProvider {
         Self {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
+            read: None,
         }
     }
 
@@ -765,7 +785,7 @@ impl MySqlMetadataProvider {
             "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
         )
         .bind(table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.connection().await?)
         .await?;
         Ok(names
             .into_iter()
@@ -789,12 +809,19 @@ impl MySqlMetadataProvider {
              FROM ducklake_inlined_data_tables WHERE table_id = ?"
         )))
         .bind(table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *self.connection().await?)
         .await?;
         Ok(tables
             .into_iter()
             .filter(|(name, _)| is_inlined_data_table(name))
             .collect())
+    }
+
+    /// The connection for one catalog statement: the consistent read's while
+    /// this provider is bound to an open one, else one from the pool. See
+    /// [`catalog_connection`] for how long to hold it.
+    async fn connection(&self) -> std::result::Result<CatalogConnection<'_, MySql>, sqlx::Error> {
+        catalog_connection(self.read.as_deref(), &self.pool).await
     }
 
     /// Read the inlined row versions `selection` picks, one entry per physical
@@ -814,7 +841,14 @@ impl MySqlMetadataProvider {
             .await?
         {
             if let Some(mut rows) = read_mysql_inlined_table(
-                &self.pool, table_id, &table, ledger, columns, selection, filter, shape,
+                &mut *self.connection().await?,
+                table_id,
+                &table,
+                ledger,
+                columns,
+                selection,
+                filter,
+                shape,
             )
             .await?
             {
@@ -885,7 +919,7 @@ impl MySqlMetadataProvider {
                 WHERE table_schema = DATABASE()
                   AND table_name = 'ducklake_schema_versions')",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *self.connection().await?)
         .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.0 > 0,
@@ -923,16 +957,45 @@ impl MySqlMetadataProvider {
             .bind(snapshot_id)
             .bind(after_data_file_id.unwrap_or(i64::MIN))
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
     }
 }
 
 impl MetadataProvider for MySqlMetadataProvider {
+    /// One pooled connection inside `START TRANSACTION READ ONLY` at
+    /// `REPEATABLE READ`, whatever the server's default isolation level: InnoDB
+    /// takes the snapshot at the transaction's first read.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        if self.read.as_ref().is_some_and(|read| read.is_open()) {
+            return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
+        }
+        let read = Arc::new(block_on(ReadTransaction::begin(
+            &self.pool,
+            &[
+                // Official DuckLake begins its metadata transaction at the
+                // server's default isolation level. At `READ COMMITTED` each
+                // statement would see the commits since the last, and a merge
+                // between two pages of a listing would list rows twice; official
+                // lists a table's files in one statement, so it does not need
+                // this.
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "START TRANSACTION READ ONLY",
+            ],
+        ))?);
+        let provider = Self {
+            read: Some(Arc::clone(&read)),
+            ..self.clone()
+        };
+        Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
+            Ok(block_on(read.commit())?)
+        })))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *self.connection().await?)
                 .await?;
             Ok(row.try_get(0)?)
         })
@@ -961,11 +1024,11 @@ impl MetadataProvider for MySqlMetadataProvider {
                  WHERE table_schema = DATABASE() AND table_name = 'ducklake_metadata' \
                  AND column_name IN ('scope', 'scope_id')",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
             let rows = if scope_column_count == 2 {
                 sqlx::query("SELECT `key`, value, scope, scope_id FROM ducklake_metadata")
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await?
                     .into_iter()
                     .map(|row| {
@@ -979,7 +1042,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .collect::<Result<Vec<_>>>()?
             } else {
                 sqlx::query("SELECT `key`, value FROM ducklake_metadata")
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await?
                     .into_iter()
                     .map(|row| {
@@ -1003,7 +1066,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                  FROM ducklake_snapshot s
                  ORDER BY s.snapshot_id",
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1032,7 +1095,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             )
             .bind(from_snapshot)
             .bind(through_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?)
         })
     }
@@ -1057,7 +1120,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(after_snapshot)
             .bind(through_snapshot)
             .bind(pattern)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?)
         })
     }
@@ -1076,7 +1139,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                    ON changes.snapshot_id = snapshot.snapshot_id
                  ORDER BY snapshot.snapshot_id",
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1111,7 +1174,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             )
             .bind(needle)
             .bind(needle)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
@@ -1126,7 +1189,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1153,7 +1216,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(schema_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -1184,7 +1247,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(schema_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter().map(|row| decode_view(&row)).collect()
@@ -1201,7 +1264,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await?;
 
             let raw: Result<Vec<(DuckLakeTableColumn, Option<i64>)>> = rows
@@ -1243,7 +1306,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             rows.into_iter()
                 .map(|row| {
@@ -1272,7 +1335,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                  ORDER BY name.parent_column IS NOT NULL, name.parent_column, name.column_id",
             )
             .bind(mapping_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             let first = rows.first().ok_or_else(|| {
                 crate::DuckLakeError::InvalidConfig(format!(
@@ -1342,7 +1405,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             let mut files = rows
@@ -1364,7 +1427,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .bind(table_id)
                     .bind(min - 1)
                     .bind(max)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await
                 {
                     Ok(rows) => {
@@ -1401,7 +1464,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ?",
             )
             .bind(table_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await
             {
                 Ok(count) => count,
@@ -1413,7 +1476,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await
             {
                 Ok(rows) => rows,
@@ -1441,7 +1504,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await
             {
                 Ok(rows) => rows,
@@ -1635,7 +1698,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(last_data_file_id)
             // Cacheable only while the text is stable; see the note above.
             .persistent(page_ids.is_none())
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -1676,7 +1739,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(last_data_file_id)
             // Cacheable only while the text is stable; see the note above.
             .persistent(page_ids.is_none())
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => {
@@ -1722,7 +1785,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                  FROM ducklake_table_stats WHERE table_id = ?",
             )
             .bind(table_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await
             {
                 Ok(row) => row
@@ -1763,7 +1826,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -1788,14 +1851,14 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
             let columns = match sqlx::query(
                 "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = ?",
             )
             .bind(table_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -1831,7 +1894,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                  FROM ducklake_table_stats WHERE table_id = ?",
             )
             .bind(table_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await
             {
                 Ok(row) => row
@@ -1851,7 +1914,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                  FROM ducklake_table_column_stats WHERE table_id = ?",
             )
             .bind(table_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -1893,7 +1956,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await
             {
                 Ok(rows) => rows
@@ -1999,29 +2062,34 @@ impl MetadataProvider for MySqlMetadataProvider {
         let ledger = block_on(self.schema_version_ledger())?;
         let mut oldest: Option<i64> = None;
         for table in block_on(self.registered_inlined_tables(table_id))? {
-            let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
+            let system = block_on(async {
+                inlined_table_layout(&mut *self.connection().await?, &table).await
+            })?
+            .system;
             let sql = format!(
                 "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
                 quote_ident(&table),
                 begin = system.begin_snapshot,
             );
-            let first: Option<i64> = block_on(
+            let first: Option<i64> = block_on(async {
                 sqlx::query_scalar(AssertSqlSafe(sql))
                     .bind(snapshot_id)
-                    .fetch_one(&self.pool),
-            )?;
+                    .fetch_one(&mut *self.connection().await?)
+                    .await
+            })?;
             // As the flush, which skips a table whose schema version it
             // cannot resolve.
             if first.is_none() {
                 continue;
             }
-            let version: Option<i64> = block_on(
+            let version: Option<i64> = block_on(async {
                 sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT {}",
                     inlined_version_snapshot_sql(&table, mysql_lookup(ledger))
                 )))
-                .fetch_one(&self.pool),
-            )?;
+                .fetch_one(&mut *self.connection().await?)
+                .await
+            })?;
             if version.is_some() {
                 oldest = oldest.into_iter().chain(first).min();
             }
@@ -2038,41 +2106,49 @@ impl MetadataProvider for MySqlMetadataProvider {
         let ledger = block_on(self.schema_version_ledger())?;
         let mut flushed = Vec::new();
         for table in tables {
-            let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
+            let system = block_on(async {
+                inlined_table_layout(&mut *self.connection().await?, &table).await
+            })?
+            .system;
             let sql = format!(
                 "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
                 quote_ident(&table),
                 begin = system.begin_snapshot,
             );
-            let first: Option<i64> = block_on(
+            let first: Option<i64> = block_on(async {
                 sqlx::query_scalar(AssertSqlSafe(sql))
                     .bind(snapshot_id)
-                    .fetch_one(&self.pool),
-            )?;
+                    .fetch_one(&mut *self.connection().await?)
+                    .await
+            })?;
             if first.is_none() {
                 continue;
             }
-            let version: Option<i64> = block_on(
+            let version: Option<i64> = block_on(async {
                 sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT {}",
                     inlined_version_snapshot_sql(&table, mysql_lookup(ledger))
                 )))
-                .fetch_one(&self.pool),
-            )?;
+                .fetch_one(&mut *self.connection().await?)
+                .await
+            })?;
             let Some(version) = version else {
                 continue;
             };
             let columns = self.get_table_structure(table_id, version)?;
-            if let Some(rows) = block_on(read_mysql_inlined_table(
-                &self.pool,
-                table_id,
-                &table,
-                ledger,
-                &columns,
-                InlinedRowSelection::WrittenUpTo(snapshot_id),
-                None,
-                InlinedReadShape::Flush,
-            ))? {
+            if let Some(rows) = block_on(async {
+                read_mysql_inlined_table(
+                    &mut *self.connection().await?,
+                    table_id,
+                    &table,
+                    ledger,
+                    &columns,
+                    InlinedRowSelection::WrittenUpTo(snapshot_id),
+                    None,
+                    InlinedReadShape::Flush,
+                )
+                .await
+            })? {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
@@ -2098,9 +2174,9 @@ impl MetadataProvider for MySqlMetadataProvider {
             for _ in 0..crate::metadata_provider::INLINED_FILE_DELETES_FOR_FLUSH_PARAMS {
                 query = query.bind(snapshot_id);
             }
-            let rows = match query.fetch_all(&self.pool).await {
+            let rows = match query.fetch_all(&mut *self.connection().await?).await {
                 Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => return Ok(Vec::new()),
                 Err(error) => return Err(error.into()),
             };
             rows.iter()
@@ -2149,11 +2225,11 @@ impl MetadataProvider for MySqlMetadataProvider {
                 .bind(table_id)
                 .bind(start_snapshot)
                 .bind(end_snapshot)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await
             {
                 Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
         })
@@ -2165,7 +2241,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 "SELECT begin_snapshot FROM ducklake_delete_file WHERE delete_file_id = ?",
             )
             .bind(delete_file_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?)
         })
     }
@@ -2183,7 +2259,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             );
             match sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *self.connection().await?)
                 .await
             {
                 Ok(rows) => rows
@@ -2195,7 +2271,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         })
                     })
                     .collect(),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
         })
@@ -2212,7 +2288,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             match row {
@@ -2245,7 +2321,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             match row {
@@ -2282,7 +2358,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await?;
 
             row.map(|row| decode_view(&row)).transpose()
@@ -2304,7 +2380,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.connection().await?)
             .await?;
 
             let count: i64 = row.try_get(0)?;
@@ -2329,7 +2405,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         .bind(object_id)
                         .bind(snapshot_id)
                         .bind(snapshot_id)
-                        .fetch_all(&self.pool)
+                        .fetch_all(&mut *self.connection().await?)
                         .await
                     },
                     TagTarget::Column {
@@ -2345,7 +2421,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .bind(column_id)
                     .bind(snapshot_id)
                     .bind(snapshot_id)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *self.connection().await?)
                     .await,
                 };
             let rows = match result {
@@ -2382,7 +2458,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.connection().await?)
             .await;
             match result {
                 Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
@@ -2409,7 +2485,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -2450,7 +2526,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
             rows.into_iter()
                 .map(|row| {
@@ -2494,7 +2570,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             let raw: Result<Vec<(ColumnWithTable, Option<i64>)>> = rows
@@ -2542,7 +2618,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await;
             let rows = match result {
                 Ok(rows) => rows,
@@ -2577,7 +2653,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             )
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await;
             let rows = match result {
                 Ok(rows) => rows,
@@ -2644,7 +2720,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -2731,7 +2807,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .bind(end_snapshot)
             .bind(start_snapshot)
             .bind(start_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()
@@ -2874,7 +2950,7 @@ WHERE data.table_id = ?
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *self.connection().await?)
             .await?;
 
             rows.into_iter()

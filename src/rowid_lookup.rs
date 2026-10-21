@@ -132,9 +132,12 @@ impl DuckLakeTable {
                 inlined_deletes: std::collections::HashMap::new(),
             });
         }
-        let inlined_deletes = self.inlined_deletes_by_file().map_err(df_error)?;
-        let (inlined, files) =
-            self.inlined_rows_then_files(|| self.files(), |file| file.data_file_id)?;
+        let (inlined_deletes, (inlined, files)) = self.read_consistently(|table| {
+            Ok::<_, DuckLakeError>((
+                table.inlined_deletes_by_file().map_err(df_error)?,
+                table.inlined_rows_then_files(|| table.files(), |file| file.data_file_id)?,
+            ))
+        })?;
         let mut located = Vec::new();
         for rows in &inlined {
             for row_id in &rows.row_ids {

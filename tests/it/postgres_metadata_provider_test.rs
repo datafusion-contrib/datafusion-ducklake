@@ -1285,8 +1285,9 @@ async fn test_query_with_filter() {
 
 /// Bring the minimal fixture schema up to a fully-migrated catalog: every
 /// optional capability the provider probes (`partial_max` columns, the
-/// `ducklake_schema_versions` ledger, and the inlined-data registry) plus the
-/// file columns the scan projection reads.
+/// `ducklake_schema_versions` ledger, the inlined-data registry, and the
+/// optional statistics, partition, sort and tag tables) plus the file columns
+/// the scan projection reads.
 async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
         "ALTER TABLE ducklake_data_file
@@ -1326,6 +1327,52 @@ async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> 
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+             data_file_id BIGINT NOT NULL, table_id BIGINT NOT NULL, column_id BIGINT NOT NULL,
+             column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT,
+             min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+             data_file_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             partition_key_index BIGINT NOT NULL, partition_value VARCHAR)",
+    )
+    .execute(pool)
+    .await?;
+    for statement in [
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+             partition_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT)",
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+             partition_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             partition_key_index BIGINT NOT NULL, column_id BIGINT NOT NULL,
+             transform VARCHAR NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+             sort_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT)",
+        "CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+             sort_id BIGINT NOT NULL, table_id BIGINT NOT NULL,
+             sort_key_index BIGINT NOT NULL, expression VARCHAR NOT NULL,
+             dialect VARCHAR NOT NULL, sort_direction VARCHAR NOT NULL,
+             null_order VARCHAR NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS ducklake_table_stats (
+             table_id BIGINT PRIMARY KEY, record_count BIGINT NOT NULL DEFAULT 0,
+             next_row_id BIGINT NOT NULL DEFAULT 0, file_size_bytes BIGINT NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+             table_id BIGINT NOT NULL, column_id BIGINT NOT NULL, contains_null BOOLEAN,
+             contains_nan BOOLEAN, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR)",
+        "CREATE TABLE IF NOT EXISTS ducklake_tag (
+             object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT,
+             key VARCHAR, value VARCHAR)",
+        "CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT,
+             end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     Ok(())
 }
 
@@ -1340,23 +1387,53 @@ async fn test_schema_capability_probe_memoized_positive_only() {
     migrate_fixture_to_current_schema(&provider.pool)
         .await
         .expect("Failed to migrate fixture schema");
+    sqlx::query("DROP TABLE ducklake_column_tag")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
 
-    // Fully-migrated catalog: the first scan probes once (all capabilities
-    // true) and memoizes; the second scan reuses the memo and must return
-    // identical results.
+    // One optional table missing: the probe memoizes the capabilities it finds
+    // present, but not the missing one, so the memo is incomplete and every
+    // call probes again. The results do not change.
     assert!(!provider.schema_capabilities_cached());
     let first = provider
         .get_table_files_for_select(1, 1)
         .expect("Should get table files");
+    assert_eq!(first.len(), 2);
     assert!(
-        provider.schema_capabilities_cached(),
-        "an all-true probe result must be cached after the first call"
+        !provider.schema_capabilities_cached(),
+        "a capability found missing must not be cached"
     );
     let second = provider
         .get_table_files_for_select(1, 1)
         .expect("Should get table files");
-    assert_eq!(first.len(), 2);
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    assert!(!provider.schema_capabilities_cached());
+
+    // The catalog gains the missing table. The next call probes only the
+    // capabilities not yet found present, so it completes the memo even though
+    // a table found present before is gone now: DuckLake never drops one, and
+    // a capability found present is not probed again.
+    sqlx::query("DROP TABLE ducklake_tag")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_column_tag (
+             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT,
+             end_snapshot BIGINT, key VARCHAR, value VARCHAR)",
+    )
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+    let third = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        provider.schema_capabilities_cached(),
+        "every catalog capability is known present after the upgrade"
+    );
+    assert_eq!(format!("{first:?}"), format!("{third:?}"));
 
     // Clones share the memo (the cell is Arc-shared).
     assert!(provider.clone().schema_capabilities_cached());

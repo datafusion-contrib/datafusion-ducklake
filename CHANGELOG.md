@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latest snapshot through which a table has none, and the catalog's next data file id.
 - `MulticatalogProvider::begin_read_session` and `with_read_session` run a query's catalog
   reads on one pooled connection (#338).
+- `MetadataProvider::begin_consistent_read` and `ConsistentRead`: reads that see one catalog
+  state; every built-in provider holds one in a read-only transaction (#383).
 - `DuckLakeTable::with_metadata_provider` binds a cached table to a read session per query.
 - `TableWriteSession::write_batch_async` writes a batch, then waits until every finished file
   is uploading, so a session holds at most `upload_concurrency` finished files on disk.
@@ -73,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- In SQLite rollback-journal mode, a commit can fail with "database is locked" once its busy
+  timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
+- A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only
+  transaction, so a pooler in statement mode, such as PgBouncer's, is unsupported (#383).
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
@@ -314,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and row id, as official's join does, instead of an update preimage without its postimage.
 - A scan, `rowid` lookup, `DELETE`, `UPDATE`, keyed mutation or fork no longer misses or
   doubles inlined rows that a concurrent flush moves to a file between its catalog reads.
+- A scan, mutation, fork or change feed reads the catalog in one transaction: a merge between
+  two listing pages or a flush of only inlined deletions no longer splits its reads (#383).
 
 ## [0.9.0] - 2026-10-07
 

@@ -3321,6 +3321,146 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<DeleteFileChange>>;
+
+    /// Begin reading the catalog at one state of it: every read through the
+    /// provider of the returned [`ConsistentRead`] sees the catalog as one
+    /// transaction sees it, until [`ConsistentRead::end`].
+    ///
+    /// A scan reads its inlined deletions, its inlined rows and every page of
+    /// its file listing through one, and so do the reads a mutation, a change
+    /// feed or a fork plans from. Official DuckLake likewise reads all of a
+    /// transaction's metadata on one connection, in one metadata transaction
+    /// (`DuckLakeTransaction::GetConnection`). Separate statements can each see
+    /// another commit: a merge between two listing pages lists its sources and
+    /// its output both, and a flush between two reads moves rows or deletions
+    /// out of both.
+    ///
+    /// A provider already bound to an open consistent read returns
+    /// [`ConsistentRead::within`] itself, so a caller inside a read shares it.
+    /// A provider bound to a read that has ended begins a new one.
+    ///
+    /// This API may change as the crate moves to one catalog transaction per
+    /// query (#394).
+    ///
+    /// The default returns `None`: each read sees the catalog as of its own
+    /// statement. A scan then checks its listing against the next data file id
+    /// read with its inlined rows ([`DuckLakeInlinedRows::next_file_id`]) and
+    /// reads both again when a flush wrote a file since, as official DuckLake
+    /// does where each statement commits on its own
+    /// (`DuckLakeMultiFileList::ReadCommittedFiles` under
+    /// `CommitsEachStatement`, in official DuckLake newer than the extension
+    /// DuckDB 1.5.5 loads). That check does not see a merge between two
+    /// listing pages, nor a flush that moves only inlined deletions.
+    ///
+    /// # Wrapping providers
+    ///
+    /// A provider that wraps another (to cache reads, or to check access)
+    /// keeps the default unless it forwards this call. Not forwarding keeps
+    /// the default's per-statement reads. A wrapper that forwards must wrap the
+    /// provider of the read it gets back, and return that, so that the reads
+    /// inside the transaction still go through the wrapper; returning the
+    /// inner provider's read bypasses its caching and its checks.
+    /// [`MemoizedMetadataProvider`](crate::MemoizedMetadataProvider) is the
+    /// model: its read's provider serves the memo and passes the rest to the
+    /// wrapped provider's read.
+    ///
+    /// A clone of the read's provider keeps the read's transaction open (on
+    /// SQLite, with its shared lock) until the last clone drops, even after
+    /// [`ConsistentRead::end`]: through it, reads after `end` see the catalog
+    /// as of their own statement.
+    fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        Ok(None)
+    }
+}
+
+/// The catalog reads [`MetadataProvider::begin_consistent_read`] began: a
+/// provider whose every read sees one state of the catalog, until
+/// [`Self::end`].
+///
+/// Keep one for the catalog reads of one scan or one plan, not for execution:
+/// on a backend that holds the state with a transaction, a writer can wait on
+/// it (a SQLite catalog in rollback-journal mode), and the database keeps the
+/// rows it shows until it ends. See
+/// [`MetadataProvider::begin_consistent_read`] for wrapping providers.
+///
+/// This API may change as the crate moves to one catalog transaction per query
+/// (#394).
+#[must_use = "a consistent read holds a transaction until it ends or drops"]
+pub struct ConsistentRead {
+    provider: Arc<dyn MetadataProvider>,
+    end: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,
+}
+
+impl ConsistentRead {
+    /// A read through `provider`, which [`Self::end`] ends by calling `end`.
+    ///
+    /// A read dropped without [`Self::end`] drops `end` uncalled, so a provider
+    /// must also release what the read holds when its last handle drops.
+    pub fn new(
+        provider: Arc<dyn MetadataProvider>,
+        end: impl FnOnce() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            provider,
+            end: Some(Box::new(end)),
+        }
+    }
+
+    /// A read through `provider`, which is already bound to a consistent read
+    /// that someone else ends. [`Self::end`] ends nothing.
+    pub fn within(provider: Arc<dyn MetadataProvider>) -> Self {
+        Self {
+            provider,
+            end: None,
+        }
+    }
+
+    /// The provider every read of this one goes through.
+    pub fn provider(&self) -> &Arc<dyn MetadataProvider> {
+        &self.provider
+    }
+
+    /// End the read. Reads through [`Self::provider`] after this see the
+    /// catalog as of their own statement again.
+    pub fn end(mut self) -> Result<()> {
+        match self.end.take() {
+            Some(end) => end(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ConsistentRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsistentRead")
+            .field("provider", &self.provider)
+            .field("ends", &self.end.is_some())
+            .finish()
+    }
+}
+
+/// Run `read` with every catalog read it makes through its provider seeing one
+/// state of the catalog: through a [`ConsistentRead`] of `provider`, or through
+/// `provider` itself when it cannot begin one.
+///
+/// `read` is synchronous, so the read never spans an await: it holds no
+/// catalog state across object-store I/O, and on a single-threaded runtime no
+/// other scan runs inside it.
+pub(crate) fn read_consistently<T, E>(
+    provider: &Arc<dyn MetadataProvider>,
+    read: impl FnOnce(&Arc<dyn MetadataProvider>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: From<DuckLakeError>,
+{
+    let Some(consistent) = provider.begin_consistent_read()? else {
+        return read(provider);
+    };
+    let result = read(consistent.provider());
+    let ended = consistent.end();
+    let value = result?;
+    ended?;
+    Ok(value)
 }
 
 #[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]

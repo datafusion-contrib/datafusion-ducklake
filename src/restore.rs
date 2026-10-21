@@ -236,6 +236,16 @@ fn remaining(rows: i64, removed: &HashSet<i64>) -> u64 {
 }
 
 /// The rows a restore removes and inserts again.
+/// What a restore reads from the catalog, in one consistent read.
+struct RestoreReads {
+    head_files: Vec<DuckLakeTableFile>,
+    mark_files: Vec<DuckLakeTableFile>,
+    head_inlined: HashMap<i64, HashSet<i64>>,
+    mark_inlined: HashMap<i64, HashSet<i64>>,
+    head_rows: Vec<crate::metadata_provider::DuckLakeInlinedData>,
+    head_rows_at_mark: Vec<crate::metadata_provider::DuckLakeInlinedData>,
+}
+
 #[derive(Default)]
 struct RestoreDiff {
     ended: Vec<DroppedDataFile>,
@@ -343,14 +353,35 @@ impl<'a> RestoreContext<'a> {
     async fn diff(&self, state: &dyn Session) -> crate::Result<RestoreDiff> {
         let head = self.head;
         let mark = &self.mark;
-        let head_files = head.files()?;
-        let mut mark_files: HashMap<i64, DuckLakeTableFile> = mark
-            .files()?
+        // Both snapshots' files, inlined deletions and inlined rows, read in
+        // one consistent read of the catalog (`DuckLakeTable::read_consistently`).
+        let reads = head.read_consistently(|head_read| {
+            let mark_read = if Arc::ptr_eq(head_read.provider(), head.provider()) {
+                mark.clone()
+            } else {
+                mark.with_metadata_provider(Arc::clone(head_read.provider()))
+            };
+            Ok::<_, DuckLakeError>(RestoreReads {
+                head_files: head_read.files()?,
+                mark_files: mark_read.files()?,
+                head_inlined: head_read.inlined_deletes_by_file().map_err(from_df)?,
+                mark_inlined: mark_read.inlined_deletes_by_file().map_err(from_df)?,
+                head_rows: head_read.inlined_data_with_row_ids()?,
+                head_rows_at_mark: head_read.inlined_data_with_row_ids_at(mark.snapshot_id())?,
+            })
+        })?;
+        let RestoreReads {
+            head_files,
+            mark_files,
+            head_inlined,
+            mark_inlined,
+            head_rows,
+            head_rows_at_mark,
+        } = reads;
+        let mut mark_files: HashMap<i64, DuckLakeTableFile> = mark_files
             .into_iter()
             .map(|file| (file.data_file_id, file))
             .collect();
-        let head_inlined = head.inlined_deletes_by_file().map_err(from_df)?;
-        let mark_inlined = mark.inlined_deletes_by_file().map_err(from_df)?;
 
         let mut pending: Vec<BoxFuture<'_, DataFusionResult<FileDiff>>> = Vec::new();
         for file in head_files {
@@ -425,7 +456,7 @@ impl<'a> RestoreContext<'a> {
         // when its table, row id and begin snapshot agree: an update ends a
         // version and inserts its successor with the same row id.
         let mut at_head = HashSet::new();
-        for rows in head.inlined_data_with_row_ids()? {
+        for rows in head_rows {
             check_aligned(&rows)?;
             for (row_id, begin) in rows.row_ids.iter().zip(&rows.begin_snapshots) {
                 at_head.insert((rows.table_name.clone(), *row_id, *begin));
@@ -440,7 +471,7 @@ impl<'a> RestoreContext<'a> {
         diff.rows_removed += diff.removed_inlined.len() as u64;
         let out_schema = rewrite_output_schema(&self.physical_schema);
         // Read in the head's columns, as the head reads them.
-        for rows in head.inlined_data_with_row_ids_at(mark.snapshot_id())? {
+        for rows in head_rows_at_mark {
             check_aligned(&rows)?;
             let keep = BooleanArray::from(
                 rows.row_ids
