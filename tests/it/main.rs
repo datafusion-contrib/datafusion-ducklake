@@ -91,6 +91,7 @@ mod positional_delete_oracle_tests;
 mod positional_delete_tests;
 mod positional_pushdown_tests;
 mod postgres_metadata_provider_test;
+mod postgres_shared_catalog_tests;
 mod postgres_single_catalog_write_tests;
 mod pushdown_row_preservation_tests;
 mod renamed_columns_tests;
