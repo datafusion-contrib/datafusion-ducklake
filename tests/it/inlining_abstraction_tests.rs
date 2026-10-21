@@ -2304,7 +2304,9 @@ async fn age_trigger_on_non_utc_postgres_sessions() {
             .unwrap();
             let (dir, data) = scratch();
             let writer =
-                datafusion_ducklake::PostgresSingleCatalogMetadataWriter::from_pool(pool.clone());
+                datafusion_ducklake::PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+                    .await
+                    .unwrap();
             writer.set_data_path(data.to_str().unwrap()).unwrap();
             let lake = Lake {
                 writer: Arc::new(writer),

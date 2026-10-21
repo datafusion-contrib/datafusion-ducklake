@@ -48,15 +48,16 @@ use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
     DataFileInfo, DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn,
     INLINED_INDEX_COLUMNS_SETTING, InlinedFlushDeleteFile, InlinedFlushTable, InlinedRowRef,
-    MetadataWriter, MultiTableCommit, ReservedTableId, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    carried_row_id_start, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
-    inlined_delete_groups, inlined_flush_changes, inlined_flush_conflict, inlined_inserts,
-    live_inlined_index_columns, parse_inlined_index_columns, positional_columns,
-    quote_snapshot_name, quote_snapshot_table, refuse_changed_table_id, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, top_level_column_ids,
-    validate_delete_entries, validate_inlined_flush, validate_inlined_index_columns, validate_name,
+    MetadataWriter, MultiTableCommit, ReservedTableId, ReservedTables, SnapshotCommitMetadata,
+    SourceRetirement, StagedTableData, StagedTableWrite, StoredTablePaths, WriteMode,
+    WriteSetupResult, assign_column_ids, carried_row_id_start, catalog_column_defs,
+    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
+    encode_inlined_index_columns, inlined_delete_groups, inlined_flush_changes,
+    inlined_flush_conflict, inlined_inserts, live_inlined_index_columns,
+    parse_inlined_index_columns, positional_columns, quote_snapshot_name, quote_snapshot_table,
+    refuse_changed_table_id, reserved_id_taken, snapshot_has_change, staged_table_write_changes,
+    table_storage_changes, top_level_column_ids, validate_delete_entries, validate_inlined_flush,
+    validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_GLOBAL_INLINING_COLUMNS,
@@ -949,6 +950,7 @@ pub struct DuckdbMetadataWriter {
     catalog_path: String,
     commit_lock: Arc<Mutex<()>>,
     data_inlining_row_limit: Option<usize>,
+    reserved_tables: ReservedTables,
 }
 
 /// The writer's locked connection, with its `data_inlining_row_limit` in
@@ -1000,6 +1002,7 @@ impl DuckdbMetadataWriter {
             column_ids,
             mode,
             base_snapshot,
+            self.reserved_tables.take(table_id),
         )?;
         if !deletes.is_empty() {
             let ours = TableChanges {
@@ -1111,6 +1114,7 @@ impl DuckdbMetadataWriter {
             catalog_path,
             commit_lock: Arc::new(Mutex::new(())),
             data_inlining_row_limit: None,
+            reserved_tables: ReservedTables::default(),
         })
     }
 
@@ -1547,6 +1551,7 @@ fn seed_id_allocator(tx: &Transaction<'_>, allocator: IdAllocator) -> Result<()>
 /// reservation only while `base_snapshot`, the head the setup saw, is kept
 /// (`0`, an empty catalog's, has no table to drop): once that is expired, the
 /// table may have been dropped and expired since, so the write conflicts.
+#[allow(clippy::too_many_arguments)]
 fn insert_new_table_rows(
     tx: &Transaction<'_>,
     snapshot_id: i64,
@@ -1555,6 +1560,7 @@ fn insert_new_table_rows(
     table_name: &str,
     base_snapshot: i64,
     mode: WriteMode,
+    reserved_at_setup: bool,
 ) -> Result<()> {
     let live: Option<i64> = tx
         .query_row(
@@ -1568,7 +1574,14 @@ fn insert_new_table_rows(
         )
         .optional()?;
     match live {
-        Some(live_id) if live_id == table_id => return Ok(()),
+        Some(live_id) if live_id == table_id => {
+            // A setup that reserved the id found no table, and writes none, so a
+            // live table of the id is another transaction's create that took it.
+            if reserved_at_setup {
+                refuse_changed_table_id(&reserved_id_taken(), mode, schema_name, table_name)?;
+            }
+            return Ok(());
+        },
         Some(_) => {
             return Err(crate::DuckLakeError::Conflict(format!(
                 "table {} was created by another transaction; retry the write",
@@ -1592,6 +1605,7 @@ fn insert_new_table_rows(
                 renamed: row.get(0)?,
                 taken: row.get(1)?,
                 base_expired: row.get(2)?,
+                reserved_at_setup,
             })
         },
     )?;
@@ -2625,6 +2639,7 @@ fn finalize_snapshot(
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
+    reserved_at_setup: bool,
 ) -> Result<i64> {
     let (snapshot_id, _) = insert_snapshot(tx)?;
     insert_new_table_rows(
@@ -2635,6 +2650,7 @@ fn finalize_snapshot(
         table_name,
         base_snapshot,
         mode,
+        reserved_at_setup,
     )?;
     finalize_table_snapshot(
         tx,
@@ -4206,6 +4222,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             column_ids,
             mode,
             base_snapshot,
+            self.reserved_tables.take(table_id),
         )?;
 
         // Partition-spec fence: this file must be consistent with the table's live
@@ -4360,6 +4377,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             column_ids,
             mode,
             base_snapshot,
+            self.reserved_tables.take(table_id),
         )?;
         // Partition-spec fence (both directions, every file): each file must be
         // consistent with the table's live partition generation at commit time. The
@@ -4541,6 +4559,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             column_ids,
             mode,
             base_snapshot,
+            self.reserved_tables.take(table_id),
         )?;
         if mode != WriteMode::Replace
             && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
@@ -4733,6 +4752,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 &write.table_name,
                 write.base_snapshot_id,
                 write.mode,
+                self.reserved_tables.take(write.table_id),
             )?;
             let schema_id = validate_staged_table(&tx, write)?;
             finalize_table_snapshot(
@@ -5915,6 +5935,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             column_ids,
             mode,
             base_snapshot,
+            self.reserved_tables.take(table_id),
         )?;
         record_table_write_changes(
             &tx,
@@ -5977,14 +5998,14 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         let conn = self.connection();
-        let row: Option<(String, Option<bool>, String, Option<bool>)> = conn
+        let row: Option<StoredTablePaths> = conn
             .query_row(
                 "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_table t
-                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                   AND t.table_name = ? AND t.end_snapshot IS NULL",
-                params![schema_name, table_name],
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
+                params![table_name, schema_name],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
@@ -5993,7 +6014,10 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 table_directory(
                     &data_path,
                     (&schema_path, schema_relative.unwrap_or(true)),
-                    (&table_path, table_relative.unwrap_or(true)),
+                    (
+                        &table_path.unwrap_or_else(|| directory_path(table_name)),
+                        table_relative.unwrap_or(true),
+                    ),
                 )
             },
         )
@@ -6172,7 +6196,14 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 |row| row.get(0),
             )
             .optional()?
-            .map_or_else(|| reserve_ids_of(&tx, IdAllocator::Catalog, 1), Ok)?;
+            .map_or_else(
+                || {
+                    let id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
+                    self.reserved_tables.insert(id);
+                    Ok::<_, crate::DuckLakeError>(id)
+                },
+                Ok,
+            )?;
         // Freshly reserved ids. Only a genuinely-new column consumes one below; an
         // existing column keeps its current id, so some may go unused (harmless
         // monotonic-counter gaps).

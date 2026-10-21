@@ -2827,9 +2827,9 @@ impl DuckLakeTableWriter {
     }
 
     /// Object-store key of a table's directory: where its stored schema and
-    /// table paths put it, as readers resolve them, since a table official
-    /// DuckDB renamed keeps its directory. A table that does not exist yet, or a
-    /// writer that does not look the paths up, gets
+    /// table paths put it, as readers resolve them
+    /// ([`MetadataWriter::get_table_directory`]). A table whose schema does not
+    /// exist yet, or a writer that does not look the paths up, gets
     /// `{base}/[cat_{id}/]{schema}/{table}`.
     fn table_key(&self, schema_name: &str, table_name: &str) -> Result<String> {
         if let Some(directory) = self.metadata.get_table_directory(schema_name, table_name)? {

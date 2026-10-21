@@ -1520,7 +1520,9 @@ async fn from_pool_shares_an_existing_connection_pool() {
         .await
         .unwrap();
 
-    let adopted = PostgresSingleCatalogMetadataWriter::from_pool(pool.clone());
+    let adopted = PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+        .await
+        .unwrap();
     assert_eq!(adopted.catalog_id(), None);
     let head: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
         .fetch_one(&pool)

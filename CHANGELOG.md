@@ -84,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction, so a pooler in statement mode, such as PgBouncer's, is unsupported (#383).
 - **BREAKING**: write a catalog these writers create, or `migrate_to_official_layout` migrates,
   only with 0.10 or later; upgrade every writer of a catalog, then migrate it.
+- **BREAKING**: `PostgresSingleCatalogMetadataWriter::from_pool` is async and returns `Result`,
+  bringing an earlier catalog up to date as `new` does; add `.await?` at the call.
 - Schema, table, partition and sort ids come from one `next_catalog_id` counter starting at
   `0`, as official's do; a column added to a table takes an id past the table's.
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the

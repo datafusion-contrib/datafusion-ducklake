@@ -42,19 +42,19 @@ use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
     DataFileInfo, DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn,
     INLINED_INDEX_COLUMNS_SETTING, InlinedFlushDeleteFile, InlinedFlushTable, InlinedRowRef,
-    MetadataWriter, MultiTableCommit, ReservedTableId, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    carried_row_id_start, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
-    inlined_delete_groups, inlined_flush_changes, inlined_flush_conflict,
-    live_inlined_index_columns, parse_inlined_index_columns, quote_snapshot_name,
-    quote_snapshot_table, refuse_changed_table_id, snapshot_has_change, staged_table_write_changes,
-    table_storage_changes, top_level_column_ids, validate_delete_entries, validate_inlined_flush,
-    validate_inlined_index_columns, validate_name,
+    MetadataWriter, MultiTableCommit, ReservedTableId, ReservedTables, SnapshotCommitMetadata,
+    SourceRetirement, StagedTableData, StagedTableWrite, StoredTablePaths, WriteMode,
+    WriteSetupResult, assign_column_ids, carried_row_id_start, catalog_column_defs,
+    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
+    encode_inlined_index_columns, inlined_delete_groups, inlined_flush_changes,
+    inlined_flush_conflict, live_inlined_index_columns, parse_inlined_index_columns,
+    quote_snapshot_name, quote_snapshot_table, refuse_changed_table_id, reserved_id_taken,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_inlined_flush, validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, LEGACY_CATALOG_ID_COUNTERS,
-    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, enables_inlining,
+    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, created_name, enables_inlining,
     inlined_deletion_conflict, inlined_inserts, positional_columns,
     reject_reserved_inlining_columns, rewritten_delete_conflict, rewritten_deletes_snapshot,
     row_mutation_source_files, source_file_id_list, staged_conflict, table_conflict,
@@ -661,6 +661,7 @@ const POSITIONAL_TABLES: [(&str, &str); 4] = [
 pub struct MySqlMetadataWriter {
     pool: MySqlPool,
     data_inlining_row_limit: Option<usize>,
+    reserved_tables: ReservedTables,
 }
 
 impl MySqlMetadataWriter {
@@ -694,9 +695,7 @@ impl MySqlMetadataWriter {
         .fetch_one(&pool)
         .await?;
         if initialized == 1 {
-            for ddl in SQL_CREATE_TABLES {
-                sqlx::query(*ddl).execute(&pool).await?;
-            }
+            create_missing_tables(&pool).await?;
             add_official_columns(&pool).await?;
             seed_counter(&pool, "next_file_id", SQL_MAX_FILE_ID).await?;
             seed_counter(&pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
@@ -704,6 +703,7 @@ impl MySqlMetadataWriter {
         Ok(Self {
             pool,
             data_inlining_row_limit: None,
+            reserved_tables: ReservedTables::default(),
         })
     }
 
@@ -721,7 +721,17 @@ impl MySqlMetadataWriter {
     /// every writer of the catalog runs 0.10 or later. Idempotent.
     pub fn migrate_to_official_layout(&self) -> Result<()> {
         self.initialize_schema()?;
-        self.block_on(order_positional_tables(&self.pool))
+        // A write it deadlocks with may roll it back; each table it changed
+        // stays changed, so another pass finishes the rest.
+        let mut attempts = 0;
+        loop {
+            match self.block_on(order_positional_tables(&self.pool)) {
+                Err(crate::DuckLakeError::Conflict(_)) if attempts < MIGRATION_ATTEMPTS => {
+                    attempts += 1;
+                },
+                outcome => return outcome,
+            }
+        }
     }
 
     /// Set the `data_inlining_row_limit` this writer applies where the
@@ -737,10 +747,11 @@ impl MySqlMetadataWriter {
 
     /// Drive `future`, a catalog call of this writer, with its
     /// `data_inlining_row_limit` in effect for the call.
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+    fn block_on<T, F: std::future::Future<Output = Result<T>>>(&self, future: F) -> Result<T> {
         crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
             crate::metadata_provider::block_on(future)
         })
+        .map_err(retryable_conflict)
     }
 
     /// Expire snapshots and remove catalog rows no longer reachable from a
@@ -1263,6 +1274,7 @@ async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Resu
 /// reservation only while `base_snapshot`, the head the setup saw, is kept
 /// (`0`, an empty catalog's, has no table to drop): once that is expired, the
 /// table may have been dropped and expired since, so the write conflicts.
+#[allow(clippy::too_many_arguments)]
 async fn insert_new_table_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     snapshot_id: i64,
@@ -1271,6 +1283,7 @@ async fn insert_new_table_rows(
     table_name: &str,
     base_snapshot: i64,
     mode: WriteMode,
+    reserved_at_setup: bool,
 ) -> Result<()> {
     let live: Option<i64> = sqlx::query_scalar(
         "SELECT t.table_id
@@ -1284,7 +1297,14 @@ async fn insert_new_table_rows(
     .fetch_optional(&mut **tx)
     .await?;
     match live {
-        Some(live_id) if live_id == table_id => return Ok(()),
+        Some(live_id) if live_id == table_id => {
+            // A setup that reserved the id found no table, and writes none, so a
+            // live table of the id is another transaction's create that took it.
+            if reserved_at_setup {
+                refuse_changed_table_id(&reserved_id_taken(), mode, schema_name, table_name)?;
+            }
+            return Ok(());
+        },
         Some(_) => {
             return Err(crate::DuckLakeError::Conflict(format!(
                 "table {} was created by another transaction; retry the write",
@@ -1320,6 +1340,7 @@ async fn insert_new_table_rows(
         renamed: renamed == 1,
         taken: taken == 1,
         base_expired: base_expired == 1,
+        reserved_at_setup,
     };
     refuse_changed_table_id(&reserved, mode, schema_name, table_name)?;
     let schema_id: i64 = match sqlx::query_scalar(
@@ -1391,6 +1412,52 @@ async fn add_column(pool: &MySqlPool, table: &str, column: &str, alter: &str) ->
     .await?;
     if exists == 0 {
         return Err(error.into());
+    }
+    Ok(())
+}
+
+/// How many times [`MySqlMetadataWriter::migrate_to_official_layout`] retries a
+/// pass a concurrent write rolled back.
+const MIGRATION_ATTEMPTS: usize = 5;
+
+/// The MySQL errors that roll back a transaction which a retry can commit:
+/// `ER_TABLE_DEF_CHANGED`, when a table the transaction reads was altered
+/// after it took its snapshot, as the migration's `ALTER TABLE` does to a
+/// concurrent write, and `ER_LOCK_DEADLOCK`, which either side can get.
+const RETRYABLE_ERRORS: [u16; 2] = [1412, 1213];
+
+/// A [`crate::DuckLakeError::Conflict`] for one of [`RETRYABLE_ERRORS`], after
+/// which nothing committed; any other error as it is.
+fn retryable_conflict(e: crate::DuckLakeError) -> crate::DuckLakeError {
+    match &e {
+        crate::DuckLakeError::Sqlx(sqlx::Error::Database(database))
+            if database
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .is_some_and(|mysql| RETRYABLE_ERRORS.contains(&mysql.number())) =>
+        {
+            crate::DuckLakeError::Conflict(format!(
+                "another transaction changed the catalog's tables ({database}); retry the write"
+            ))
+        },
+        _ => e,
+    }
+}
+
+/// Run each of [`SQL_CREATE_TABLES`] whose table the catalog lacks. A role
+/// that reads and writes the catalog without owning it may not run a `CREATE`,
+/// even one `IF NOT EXISTS` skips, so a current catalog runs none.
+async fn create_missing_tables(pool: &MySqlPool) -> Result<()> {
+    for ddl in SQL_CREATE_TABLES {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = DATABASE() AND table_name = ?)",
+        )
+        .bind(created_name(ddl))
+        .fetch_one(pool)
+        .await?;
+        if present == 0 {
+            sqlx::query(*ddl).execute(pool).await?;
+        }
     }
     Ok(())
 }
@@ -1509,16 +1576,33 @@ async fn order_positional_tables(pool: &MySqlPool) -> Result<()> {
             .iter()
             .find(|(column, ..)| column.ends_with("_uuid"))
         {
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET {uuid} = UUID() WHERE {uuid} IS NULL"
-            )))
-            .execute(pool)
-            .await?;
+            backfill_uuids(pool, table, uuid).await?;
         }
         sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE {table} {}",
             clauses.join(", ")
         )))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Give each `{table}` id without a `uuid` one, a v7 UUID as official writes,
+/// the same for every row of the id, as a renamed table keeps its UUID.
+async fn backfill_uuids(pool: &MySqlPool, table: &str, uuid: &str) -> Result<()> {
+    let id = uuid.replace("_uuid", "_id");
+    let ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT DISTINCT {id} FROM {table} WHERE {uuid} IS NULL"
+    )))
+    .fetch_all(pool)
+    .await?;
+    for row_id in ids {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {table} SET {uuid} = ? WHERE {id} = ? AND {uuid} IS NULL"
+        )))
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(row_id)
         .execute(pool)
         .await?;
     }
@@ -2637,6 +2721,7 @@ async fn finalize_snapshot(
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
+    reserved_at_setup: bool,
 ) -> Result<i64> {
     let (snapshot_id, _) = insert_snapshot(tx).await?;
     insert_new_table_rows(
@@ -2647,6 +2732,7 @@ async fn finalize_snapshot(
         table_name,
         base_snapshot,
         mode,
+        reserved_at_setup,
     )
     .await?;
     finalize_table_snapshot(
@@ -4482,6 +4568,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
 
@@ -4658,6 +4745,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             // Partition-spec fence (both directions, every file): each file must be
@@ -4940,6 +5028,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if !deletes.is_empty() {
@@ -5786,6 +5875,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -6003,6 +6093,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     &write.table_name,
                     write.base_snapshot_id,
                     write.mode,
+                    self.reserved_tables.take(write.table_id),
                 )
                 .await?;
                 let schema_id = validate_staged_table(&mut tx, write).await?;
@@ -6518,6 +6609,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             record_table_write_changes(
@@ -6591,15 +6683,15 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         self.block_on(async {
-            let row: Option<(String, Option<bool>, String, Option<bool>)> = sqlx::query_as(
+            let row: Option<StoredTablePaths> = sqlx::query_as(
                 "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_table t
-                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
             )
-            .bind(schema_name)
             .bind(table_name)
+            .bind(schema_name)
             .fetch_optional(&self.pool)
             .await?;
             row.map(
@@ -6607,7 +6699,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                     table_directory(
                         &data_path,
                         (&schema_path, schema_relative.unwrap_or(true)),
-                        (&table_path, table_relative.unwrap_or(true)),
+                        (
+                            &table_path.unwrap_or_else(|| directory_path(table_name)),
+                            table_relative.unwrap_or(true),
+                        ),
                     )
                 },
             )
@@ -6952,7 +7047,11 @@ impl MetadataWriter for MySqlMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_catalog_id(&mut tx).await?,
+                None => {
+                    let id = reserve_catalog_id(&mut tx).await?;
+                    self.reserved_tables.insert(id);
+                    id
+                },
             };
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these

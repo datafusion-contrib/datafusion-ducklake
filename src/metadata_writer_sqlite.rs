@@ -20,11 +20,12 @@ use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_ta
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, ReservedTableId, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
-    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
-    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    refuse_changed_table_id, snapshot_has_change, staged_table_write_changes, table_directory,
+    MultiTableCommit, ReservedTableId, ReservedTables, SnapshotCommitMetadata, StagedTableData,
+    StagedTableWrite, StoredTablePaths, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_groups,
+    live_inlined_index_columns, parse_inlined_index_columns, refuse_changed_table_id,
+    reserved_id_taken, snapshot_has_change, staged_table_write_changes, table_directory,
     table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name,
 };
@@ -743,15 +744,6 @@ CREATE TABLE IF NOT EXISTS ducklake_macro_parameters (
 );
 "#;
 
-/// A random version 4 UUID, which [`order_positional_tables`] gives the rows of
-/// a catalog that predates `schema_uuid` and `table_uuid`. Not a column
-/// default: official DuckDB binds column defaults itself and has no
-/// `randomblob`.
-const SQL_RANDOM_UUID: &str = "(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) \
-     || '-4' || substr(lower(hex(randomblob(2))), 2) || '-' \
-     || substr('89ab', 1 + abs(random()) % 4, 1) || substr(lower(hex(randomblob(2))), 2) \
-     || '-' || lower(hex(randomblob(6))))";
-
 /// The catalog tables official DuckDB inserts into by position, with their
 /// columns, keys and order as official has them. `ducklake_table` has no key:
 /// official keeps one row per version of a table, a rename's included. A
@@ -858,6 +850,7 @@ pub struct SqliteMetadataWriter {
     lock_path: Option<PathBuf>,
     commit_lock: Arc<Mutex<()>>,
     data_inlining_row_limit: Option<usize>,
+    reserved_tables: ReservedTables,
 }
 
 impl SqliteMetadataWriter {
@@ -908,6 +901,7 @@ impl SqliteMetadataWriter {
             lock_path,
             commit_lock: Arc::new(Mutex::new(())),
             data_inlining_row_limit: None,
+            reserved_tables: ReservedTables::default(),
         })
     }
 
@@ -1768,13 +1762,34 @@ async fn order_positional_tables(pool: &SqlitePool) -> Result<()> {
             .iter()
             .find(|(column, _)| column.ends_with("_uuid"))
         {
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET {uuid} = {SQL_RANDOM_UUID} WHERE {uuid} IS NULL"
-            )))
-            .execute(&mut *tx)
-            .await?;
+            backfill_uuids(&mut tx, table, uuid).await?;
         }
         tx.commit().await?;
+    }
+    Ok(())
+}
+
+/// Give each `{table}` id without a `uuid` one, a v7 UUID as official writes,
+/// the same for every row of the id, as a renamed table keeps its UUID.
+async fn backfill_uuids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    uuid: &str,
+) -> Result<()> {
+    let id = uuid.replace("_uuid", "_id");
+    let ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT DISTINCT {id} FROM {table} WHERE {uuid} IS NULL"
+    )))
+    .fetch_all(&mut **tx)
+    .await?;
+    for row_id in ids {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {table} SET {uuid} = ? WHERE {id} = ? AND {uuid} IS NULL"
+        )))
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(row_id)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -3218,6 +3233,7 @@ async fn finalize_snapshot(
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
+    reserved_at_setup: bool,
 ) -> Result<i64> {
     // One write-lock-first snapshot is shared by every table finalized by a
     // multi-table transaction. A single-table write uses the same path once.
@@ -3236,6 +3252,7 @@ async fn finalize_snapshot(
         mode,
         base_snapshot,
         true,
+        reserved_at_setup,
     )
     .await?;
     Ok(snapshot_id)
@@ -3258,6 +3275,7 @@ async fn finalize_table_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
     inserts: bool,
+    reserved_at_setup: bool,
 ) -> Result<()> {
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
     // identifies creation even when it has no columns; using an empty live-column
@@ -3270,6 +3288,7 @@ async fn finalize_table_snapshot(
         table_name,
         base_snapshot,
         mode,
+        reserved_at_setup,
     )
     .await?;
 
@@ -3551,6 +3570,7 @@ async fn finalize_table_snapshot(
 /// setup saw, is kept (`0`, an empty catalog's, has no table to drop): once
 /// that is expired, the table may have been dropped and expired since, so the
 /// write conflicts.
+#[allow(clippy::too_many_arguments)]
 async fn insert_new_table_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     snapshot_id: i64,
@@ -3559,6 +3579,7 @@ async fn insert_new_table_rows(
     table_name: &str,
     base_snapshot: i64,
     mode: WriteMode,
+    reserved_at_setup: bool,
 ) -> Result<(i64, i64)> {
     let live: Option<(i64, i64, i64)> = sqlx::query_as(
         "SELECT table_meta.table_id, schema.begin_snapshot, table_meta.begin_snapshot
@@ -3578,9 +3599,15 @@ async fn insert_new_table_rows(
                 crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
             )));
         }
+        // A setup that reserved the id found no table, and writes none, so a
+        // live table of the id is another transaction's create that took it.
+        if reserved_at_setup {
+            refuse_changed_table_id(&reserved_id_taken(), mode, schema_name, table_name)?;
+        }
         return Ok((schema_begin, table_begin));
     }
-    let reserved = reserved_table_id(tx, table_id, table_name, base_snapshot).await?;
+    let reserved =
+        reserved_table_id(tx, table_id, table_name, base_snapshot, reserved_at_setup).await?;
     refuse_changed_table_id(&reserved, mode, schema_name, table_name)?;
     let schema: Option<(i64, i64)> = sqlx::query_as(
         "SELECT schema_id, begin_snapshot FROM ducklake_schema
@@ -3631,6 +3658,7 @@ async fn reserved_table_id(
     table_id: i64,
     table_name: &str,
     base_snapshot: i64,
+    reserved_at_setup: bool,
 ) -> Result<ReservedTableId> {
     let present: Vec<String> =
         sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -3658,6 +3686,7 @@ async fn reserved_table_id(
         renamed,
         taken,
         base_expired,
+        reserved_at_setup,
     })
 }
 
@@ -5360,6 +5389,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -5537,6 +5567,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -5742,6 +5773,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -5967,6 +5999,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     write.mode,
                     write.base_snapshot_id,
                     !matches!(write.data, StagedTableData::None),
+                    self.reserved_tables.take(write.table_id),
                 )
                 .await?;
             }
@@ -6235,6 +6268,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -6498,6 +6532,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -7660,6 +7695,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids,
                 mode,
                 base_snapshot,
+                self.reserved_tables.take(table_id),
             )
             .await?;
             let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
@@ -7729,15 +7765,15 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         self.block_on(async {
-            let row: Option<(String, Option<bool>, String, Option<bool>)> = sqlx::query_as(
+            let row: Option<StoredTablePaths> = sqlx::query_as(
                 "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_table t
-                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
             )
-            .bind(schema_name)
             .bind(table_name)
+            .bind(schema_name)
             .fetch_optional(&self.pool)
             .await?;
             row.map(
@@ -7745,7 +7781,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     table_directory(
                         &data_path,
                         (&schema_path, schema_relative.unwrap_or(true)),
-                        (&table_path, table_relative.unwrap_or(true)),
+                        (
+                            &table_path.unwrap_or_else(|| directory_path(table_name)),
+                            table_relative.unwrap_or(true),
+                        ),
                     )
                 },
             )
@@ -7936,7 +7975,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_catalog_id(&mut tx).await?,
+                None => {
+                    let id = reserve_catalog_id(&mut tx).await?;
+                    self.reserved_tables.insert(id);
+                    id
+                },
             };
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these
