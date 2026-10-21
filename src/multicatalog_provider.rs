@@ -267,7 +267,8 @@ impl SchemaCapabilities {
 /// and each consistent read on a connection of its own, so a read that comes
 /// late still works. Dropping the last handle to an open session gives the
 /// connection back as well, rolling back the transaction of any read still
-/// open on it.
+/// open on it. A consistent read dropped without its end, while it is the only
+/// one open on a session no statement is using, ends the session the same way.
 #[derive(Debug, Clone)]
 pub struct MetadataReadSession {
     inner: Arc<ReadSessionInner>,
@@ -452,18 +453,44 @@ impl SessionRead {
 
 impl Drop for SessionRead {
     fn drop(&mut self) {
-        if !*self.ended.get_mut() {
-            let read = Self {
-                session: Arc::clone(&self.session),
-                ended: std::sync::atomic::AtomicBool::new(false),
-            };
-            *self.ended.get_mut() = true;
-            crate::metadata_provider::catalog_runtime().spawn(async move {
-                // The transaction ends when its last read does; a failed commit
-                // has no caller left to report to.
-                let _ = read.end().await;
-            });
+        if *self.ended.get_mut() {
+            return;
         }
+        // Count the read out now when the session is free, so that no read
+        // begun after this drop joins the transaction: an earlier read keeps
+        // it, and the last read's transaction ends with the session, whose
+        // connection is rolled back and pooled again. A later read on the
+        // session then reads through the pool, as after `end`.
+        if let Ok(mut session) = self.session.connection.try_lock() {
+            *self.ended.get_mut() = true;
+            if session.open_reads > 1 {
+                session.open_reads -= 1;
+                return;
+            }
+            session.open_reads = 0;
+            if let Some(mut connection) = session.connection.take() {
+                crate::metadata_provider::catalog_runtime().spawn(async move {
+                    if sqlx::raw_sql("ROLLBACK")
+                        .execute(&mut *connection)
+                        .await
+                        .is_err()
+                    {
+                        connection.close_on_drop();
+                    }
+                });
+            }
+            return;
+        }
+        let read = Self {
+            session: Arc::clone(&self.session),
+            ended: std::sync::atomic::AtomicBool::new(false),
+        };
+        *self.ended.get_mut() = true;
+        crate::metadata_provider::catalog_runtime().spawn(async move {
+            // The transaction ends when its last read does; a failed commit
+            // has no caller left to report to.
+            let _ = read.end().await;
+        });
     }
 }
 

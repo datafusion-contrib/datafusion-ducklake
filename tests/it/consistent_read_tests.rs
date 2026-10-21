@@ -930,6 +930,86 @@ mod multicatalog {
         fourth.end().unwrap();
     }
 
+    /// One of two overlapping reads on a read session dropped without `end`
+    /// leaves the other its snapshot, and the session open.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    async fn a_read_dropped_beside_another_leaves_it_its_snapshot() {
+        let (_container, writer, provider) = store(1).await;
+        let temp = TempDir::new().unwrap();
+        writer
+            .set_data_path(temp.path().join("data").to_str().unwrap())
+            .unwrap();
+        let tables =
+            DuckLakeTableWriter::new(Arc::clone(&writer), Arc::new(LocalFileSystem::new()))
+                .unwrap();
+        tables
+            .write_table("public", "t", &[batch(0..1)])
+            .await
+            .unwrap();
+
+        let session = provider.begin_read_session().await.unwrap();
+        let bound = provider.with_read_session(&session).unwrap();
+        let kept = bound.begin_consistent_read().unwrap().expect("a read");
+        let head = kept.provider().get_current_snapshot().unwrap();
+        let dropped = bound.begin_consistent_read().unwrap().expect("a read");
+        tables
+            .append_table("public", "t", &[batch(1..2)])
+            .await
+            .unwrap();
+        drop(dropped);
+        assert_eq!(kept.provider().get_current_snapshot().unwrap(), head);
+        kept.end().unwrap();
+        // The session is still open: its next read begins a transaction on it
+        // and sees the commit.
+        let next = bound.begin_consistent_read().unwrap().expect("a read");
+        assert!(next.provider().get_current_snapshot().unwrap() > head);
+        next.end().unwrap();
+        session.end().await.unwrap();
+    }
+
+    /// A read on a read session dropped without `end` (a panic inside it)
+    /// leaves no transaction for a later read to join: a read begun right
+    /// after the drop sees a commit made while the dropped read was open.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    async fn a_read_dropped_without_end_leaves_no_transaction_to_join() {
+        let (_container, writer, provider) = store(1).await;
+        let temp = TempDir::new().unwrap();
+        writer
+            .set_data_path(temp.path().join("data").to_str().unwrap())
+            .unwrap();
+        let tables =
+            DuckLakeTableWriter::new(Arc::clone(&writer), Arc::new(LocalFileSystem::new()))
+                .unwrap();
+        tables
+            .write_table("public", "t", &[batch(0..1)])
+            .await
+            .unwrap();
+
+        // The drop ends a read from a task of its own when the session is
+        // busy, so repeat to give a later read every chance to join it.
+        for round in 1..=30 {
+            let session = provider.begin_read_session().await.unwrap();
+            let bound = provider.with_read_session(&session).unwrap();
+            let dropped = bound.begin_consistent_read().unwrap().expect("a read");
+            let head = dropped.provider().get_current_snapshot().unwrap();
+            tables
+                .append_table("public", "t", &[batch(round..round + 1)])
+                .await
+                .unwrap();
+            drop(dropped);
+            let next = bound.begin_consistent_read().unwrap().expect("a read");
+            let seen = next.provider().get_current_snapshot().unwrap();
+            next.end().unwrap();
+            assert!(
+                seen > head,
+                "round {round}: a later read joined the dropped read's snapshot"
+            );
+            session.end().await.unwrap();
+        }
+    }
+
     /// A consistent read on a read session of a store without its optional
     /// tables reads each as empty, and its transaction on the session's
     /// connection stays usable to its end.
