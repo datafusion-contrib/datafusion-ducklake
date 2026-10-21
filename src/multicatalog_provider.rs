@@ -253,9 +253,12 @@ impl SchemaCapabilities {
 /// one read-only `REPEATABLE READ` transaction, begun by the first and committed
 /// by the last to end. So the scans of a query that read the catalog at once
 /// read one snapshot of it, as official DuckLake reads all of a transaction's
-/// metadata in one metadata transaction. Every other read sees the catalog as
-/// of its own statement: a writer commits on connections of its own, and a
-/// maintenance step that reads the head after its own commit sees it. One
+/// metadata in one metadata transaction. While no consistent read is open, each
+/// read sees the catalog as of its own statement: a writer commits on
+/// connections of its own, and a maintenance step that reads the head after
+/// its own commit sees it. While one is open, every read through a provider
+/// bound to the session, a maintenance step's included, sees that read's
+/// snapshot, so keep a session for the reads of one query. One
 /// transaction for all of a query's catalog reads and writes is tracked in
 /// #394.
 ///
@@ -809,7 +812,7 @@ impl MulticatalogProvider {
     /// capabilities it does not know (see [`CapabilityMemo`]).
     async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
         let known = self.schema_capabilities.known();
-        if self.schema_capabilities.complete() {
+        if CapabilityMemo::covers(known) {
             return Ok(SchemaCapabilities::from_bits(known));
         }
         self.on_connection(async |connection| {

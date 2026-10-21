@@ -1093,6 +1093,16 @@ async fn a_mysql_read_before_the_inlined_deletion_table_reads_none() {
         .unwrap();
     let error = bound.list_views(schema_id, head).unwrap_err().to_string();
     assert!(error.contains("1412"), "{error}");
+    // A read that tolerates a missing table does not read that error as one.
+    sqlx::query("ALTER TABLE ducklake_partition_info ENGINE = InnoDB")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let error = bound
+        .get_partition_spec(table_id, head)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("1412"), "{error}");
     drop(bound);
     let _ = read.end();
 

@@ -545,8 +545,15 @@ impl CapabilityMemo {
 
     /// Whether every catalog capability is known present, so no probe runs.
     pub(crate) fn complete(&self) -> bool {
+        Self::covers(self.known())
+    }
+
+    /// Whether `known`, bits read from the memo, holds every catalog
+    /// capability. A caller that answers from `known` decides with this, so
+    /// its answer and its decision come from one read of the memo.
+    pub(crate) fn covers(known: u32) -> bool {
         let catalog = ((1u32 << CAPABILITY_BITS) - 1) & !CAPABILITY_SERVER_BITS;
-        self.known() & catalog == catalog
+        known & catalog == catalog
     }
 
     /// Probe, in one statement on `connection`, the capabilities `probes` lists
@@ -1585,7 +1592,7 @@ impl PostgresMetadataProvider {
     /// capabilities it does not know (see [`CapabilityMemo`]).
     async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
         let known = self.schema_capabilities.known();
-        if self.schema_capabilities.complete() {
+        if CapabilityMemo::covers(known) {
             return Ok(SchemaCapabilities::from_bits(known));
         }
         let bits = self
