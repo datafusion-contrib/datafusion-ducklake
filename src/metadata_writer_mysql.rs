@@ -38,7 +38,6 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::InlinedSystemColumns;
 use crate::metadata_provider_mysql::{catalog_inlined_system_columns, inlined_table_layout};
-use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
     DataFileInfo, DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn,
@@ -60,6 +59,7 @@ use crate::metadata_writer::{
     row_mutation_source_files, source_file_id_list, staged_conflict, table_conflict,
     validate_row_mutation_stage,
 };
+use crate::metadata_writer::{directory_path, table_directory};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
@@ -683,6 +683,19 @@ impl MySqlMetadataWriter {
                 .await
         })
         .await?;
+        // A catalog an earlier release created lacks columns and counters this
+        // writer uses, even when the caller skips `initialize_schema`.
+        let initialized: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = DATABASE() AND table_name = 'ducklake_snapshot')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if initialized == 1 {
+            add_official_columns(&pool).await?;
+            seed_counter(&pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+            seed_counter(&pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
+        }
         Ok(Self {
             pool,
             data_inlining_row_limit: None,
@@ -1101,6 +1114,33 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Raise the `next_column_id` counter, which `n` column ids were just reserved
+/// from, past `table_id`'s columns, returning its last id. Official numbers a
+/// column it adds from the table's largest column id, never from this counter.
+async fn raise_column_ids_past_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    n: i64,
+) -> Result<i64> {
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET `value` = CAST(GREATEST(CAST(`value` AS SIGNED),
+                                     COALESCE((SELECT MAX(column_id) FROM ducklake_column
+                                               WHERE table_id = ?), 0) + ?) AS CHAR)
+         WHERE `key` = 'next_column_id' AND scope IS NULL",
+    )
+    .bind(table_id)
+    .bind(n)
+    .execute(&mut **tx)
+    .await?;
+    Ok(sqlx::query_scalar(
+        "SELECT CAST(`value` AS SIGNED) FROM ducklake_metadata
+         WHERE `key` = 'next_column_id' AND scope IS NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// The largest schema, table, view, partition, sort or macro id in use, `-1`
 /// in an empty catalog, so the first id is `0` as in official.
 const SQL_MAX_CATALOG_ID: &str = "SELECT GREATEST(
@@ -1310,6 +1350,31 @@ async fn add_column(pool: &MySqlPool, table: &str, column: &str, alter: &str) ->
     Ok(())
 }
 
+/// Add the snapshot id watermarks and the [`POSITIONAL_TABLES`] columns a
+/// catalog an earlier release created lacks.
+async fn add_official_columns(pool: &MySqlPool) -> Result<()> {
+    for watermark in ["next_catalog_id", "next_file_id"] {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                            WHERE table_schema = DATABASE() AND table_name = 'ducklake_snapshot'
+                              AND column_name = ?)",
+        )
+        .bind(watermark)
+        .fetch_one(pool)
+        .await?;
+        if present == 0 {
+            add_column(
+                pool,
+                "ducklake_snapshot",
+                watermark,
+                &format!("ALTER TABLE ducklake_snapshot ADD COLUMN {watermark} BIGINT"),
+            )
+            .await?;
+        }
+    }
+    add_missing_positional_columns(pool).await
+}
+
 /// Add each of [`POSITIONAL_TABLES`]' columns a catalog that predates it lacks,
 /// last, as a release before 0.10, which names the columns it writes, still
 /// writes the table.
@@ -1322,6 +1387,10 @@ async fn add_missing_positional_columns(pool: &MySqlPool) -> Result<()> {
         .bind(table)
         .fetch_all(pool)
         .await?;
+        // `initialize_schema` creates a table a catalog lacks whole.
+        if current.is_empty() {
+            continue;
+        }
         for (name, definition, _) in positional_columns(columns) {
             if !current.iter().any(|column| column == name) {
                 add_column(
@@ -1760,18 +1829,18 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<
             .await?
             .try_get(0)?;
     // The id watermarks official DuckDB allocates from: the previous head's,
-    // raised past every id this writer reserved.
-    let (next_catalog_id, next_file_id): (i64, i64) = sqlx::query_as(
+    // raised past every id in use and every id this writer reserved. A release
+    // before 0.10 commits without watermarks, so the previous head's can be
+    // missing while official's ids are in use.
+    let (next_catalog_id, next_file_id): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT
-             GREATEST(COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
-                                ORDER BY snapshot_id DESC LIMIT 1), 0),
+             GREATEST(({SQL_MAX_CATALOG_ID}) + 1,
                       COALESCE((SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
                                 WHERE `key` = 'next_catalog_id' AND scope IS NULL), 0)),
-             GREATEST(COALESCE((SELECT next_file_id FROM ducklake_snapshot
-                                ORDER BY snapshot_id DESC LIMIT 1), 0),
+             GREATEST(({SQL_MAX_FILE_ID}) + 1,
                       COALESCE((SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
-                                WHERE `key` = 'next_file_id' AND scope IS NULL), 0))",
-    )
+                                WHERE `key` = 'next_file_id' AND scope IS NULL), 0))"
+    )))
     .fetch_one(&mut **tx)
     .await?;
     sqlx::query(
@@ -4251,7 +4320,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             // insert with explicit ids, keeping the allocator authoritative.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
             let first_column_id = last_column_id - n + 1;
             let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
             for (column, column_id) in catalog_columns.iter().zip(field_ids.iter()) {
@@ -6467,6 +6537,33 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let data_path = self.get_data_path()?;
+        self.block_on(async {
+            let row: Option<(String, Option<bool>, String, Option<bool>)> = sqlx::query_as(
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(
+                |(schema_path, schema_relative, table_path, table_relative)| {
+                    table_directory(
+                        &data_path,
+                        (&schema_path, schema_relative.unwrap_or(true)),
+                        (&table_path, table_relative.unwrap_or(true)),
+                    )
+                },
+            )
+            .transpose()
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -6718,26 +6815,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
             )
             .await?;
-            for watermark in ["next_catalog_id", "next_file_id"] {
-                let present: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM information_schema.columns
-                     WHERE table_schema = DATABASE() AND table_name = 'ducklake_snapshot'
-                       AND column_name = ?",
-                )
-                .bind(watermark)
-                .fetch_one(&self.pool)
-                .await?;
-                if present == 0 {
-                    add_column(
-                        &self.pool,
-                        "ducklake_snapshot",
-                        watermark,
-                        &format!("ALTER TABLE ducklake_snapshot ADD COLUMN {watermark} BIGINT"),
-                    )
-                    .await?;
-                }
-            }
-            add_missing_positional_columns(&self.pool).await?;
+            add_official_columns(&self.pool).await?;
             seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID).await?;
             seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
             migrate_directory_paths(&self.pool).await?;
@@ -6784,11 +6862,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // lock up front. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -6829,6 +6903,11 @@ impl MetadataWriter for MySqlMetadataWriter {
                 Some(id) => id,
                 None => reserve_catalog_id(&mut tx).await?,
             };
+            // Freshly reserved ids. Only a genuinely-new column actually consumes
+            // one below; an existing column keeps its current id, so some of these
+            // may go unused (harmless monotonic-counter gaps).
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
+            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id (column_id == parquet field_id; an

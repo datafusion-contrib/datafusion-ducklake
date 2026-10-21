@@ -22,7 +22,6 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::{TagObjectType, TagTarget};
-use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, ExistingCatalogColumn,
     MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
@@ -35,6 +34,7 @@ use crate::metadata_writer::{
     InlinedFlushTable, LEGACY_CATALOG_ID_COUNTERS, inlined_flush_changes, inlined_inserts,
     positional_columns, validate_inlined_flush,
 };
+use crate::metadata_writer::{directory_path, table_directory};
 use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
 use crate::metadata_writer_postgres::{
     PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
@@ -400,6 +400,16 @@ impl PostgresSingleCatalogMetadataWriter {
                 .await
         })
         .await?;
+        // A catalog an earlier release created lacks columns and counters this
+        // writer uses, even when the caller skips `initialize_schema`.
+        let initialized: bool =
+            sqlx::query_scalar("SELECT to_regclass('ducklake_snapshot') IS NOT NULL")
+                .fetch_one(&pool)
+                .await?;
+        if initialized {
+            add_official_columns(&pool).await?;
+            seed_counter(&pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
+        }
         Ok(Self {
             pool,
             commit_guard: None,
@@ -492,25 +502,26 @@ async fn reserve_ids(
     Ok(last)
 }
 
-/// Take one id from the sequence backing an IDENTITY column without inserting a row,
-/// so `begin_write_transaction` can hand out a schema/table id that only becomes a
-/// visible row at commit. Sequences are non-transactional, so an unused reservation
-/// just leaves a gap. The sequence first skips the ids official DuckDB allocated
-/// from `watermark` ([`skip_official_ids`]).
-async fn reserve_identity(
+/// Raise the `next_column_id` counter, which `n` column ids were just reserved
+/// from, past `table_id`'s columns, returning its last id. Official numbers a
+/// column it adds from the table's largest column id, never from this counter.
+async fn raise_column_ids_past_table(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table: &str,
-    column: &str,
-    watermark: &str,
+    table_id: i64,
+    n: i64,
 ) -> Result<i64> {
-    skip_official_ids(tx, table, column, watermark).await?;
-    Ok(
-        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1, $2))")
-            .bind(table)
-            .bind(column)
-            .fetch_one(&mut **tx)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "UPDATE ducklake_metadata
+         SET value = CAST(GREATEST(CAST(value AS BIGINT),
+                                   COALESCE((SELECT MAX(column_id) FROM ducklake_column
+                                             WHERE table_id = $1), 0) + $2) AS VARCHAR)
+         WHERE key = 'next_column_id' AND scope IS NULL
+         RETURNING CAST(value AS BIGINT)",
     )
+    .bind(table_id)
+    .bind(n)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 /// Advance the identity sequence of `table.column` past every id in the
@@ -539,11 +550,13 @@ async fn skip_official_ids(
     Ok(())
 }
 
-/// Take the next partition or sort id from the `next_catalog_id` counter,
-/// past every id in use, every id official DuckDB allocated (those below the
-/// head snapshot's watermark) and the [`LEGACY_CATALOG_ID_COUNTERS`] a release
-/// before 0.10 took the same ids from, which are raised to it, so it never
-/// takes the id either.
+/// Take the next schema, table, partition or sort id from the
+/// `next_catalog_id` counter official DuckDB allocates the same ids from,
+/// without inserting a row. The id is past every id in use, every id official
+/// allocated (those below the head snapshot's watermark) and the
+/// [`LEGACY_CATALOG_ID_COUNTERS`] a release before 0.10 took the same ids from.
+/// Those counters, and the identity sequences that release took schema and
+/// table ids from, are raised to it, so it never takes the id either.
 async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "UPDATE ducklake_metadata
@@ -563,6 +576,17 @@ async fn reserve_catalog_id(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> R
         "UPDATE ducklake_metadata SET value = CAST($1 AS VARCHAR)
          WHERE key IN {LEGACY_CATALOG_ID_COUNTERS} AND scope IS NULL"
     )))
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT setval(sequence, $1)
+         FROM (SELECT pg_get_serial_sequence(name, id) AS sequence
+               FROM (VALUES ('ducklake_schema', 'schema_id'), ('ducklake_table', 'table_id'))
+                   AS legacy(name, id)) AS legacy
+         WHERE sequence IS NOT NULL
+           AND $1 > COALESCE(pg_sequence_last_value(sequence::regclass), 0)",
+    )
     .bind(id)
     .execute(&mut **tx)
     .await?;
@@ -587,16 +611,40 @@ async fn raise_head_watermarks(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
     Ok(())
 }
 
-/// Add each of [`POSITIONAL_TABLES`]' columns a catalog that predates it lacks,
-/// last, as a release before 0.10, which names the columns it writes, still
-/// writes the table.
-async fn add_missing_positional_columns(pool: &PgPool) -> Result<()> {
-    for (table, id, columns) in POSITIONAL_TABLES {
-        // Every catalog has its id column, and `ADD COLUMN IF NOT EXISTS` of
-        // an identity column creates its sequence even when it skips the
-        // column.
-        for (name, definition, _) in positional_columns(columns) {
-            if name != id {
+/// Add the snapshot id watermarks and each of [`POSITIONAL_TABLES`]' columns a
+/// catalog that predates them lacks, last, as a release before 0.10, which
+/// names the columns it writes, still writes the table. Only a missing column
+/// is altered in, since `ADD COLUMN IF NOT EXISTS` takes the table's
+/// `ACCESS EXCLUSIVE` lock even when it adds nothing.
+async fn add_official_columns(pool: &PgPool) -> Result<()> {
+    let watermarks =
+        [("next_catalog_id", "next_catalog_id BIGINT"), ("next_file_id", "next_file_id BIGINT")];
+    let tables = std::iter::once(("ducklake_snapshot", watermarks.to_vec())).chain(
+        POSITIONAL_TABLES.iter().map(|(table, id, columns)| {
+            // Every catalog has its id column, and adding an identity column
+            // creates its sequence even when the column exists.
+            let missing = positional_columns(columns)
+                .into_iter()
+                .filter(|(name, _, _)| name != id)
+                .map(|(name, definition, _)| (name, definition))
+                .collect::<Vec<_>>();
+            (*table, missing)
+        }),
+    );
+    for (table, columns) in tables {
+        let current: Vec<String> = sqlx::query_scalar(
+            "SELECT attname::text FROM pg_attribute
+             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+        // `initialize_schema` creates a table a catalog lacks whole.
+        if current.is_empty() {
+            continue;
+        }
+        for (name, definition) in columns {
+            if !current.iter().any(|column| column == name) {
                 sqlx::query(AssertSqlSafe(format!(
                     "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {definition}"
                 )))
@@ -1186,12 +1234,15 @@ async fn finalize_table_snapshot(
     {
         Some(id) => id,
         None => {
+            let schema_id = reserve_catalog_id(tx).await?;
             sqlx::query_scalar(
                 "INSERT INTO ducklake_schema
-                     (schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (md5(random()::text || clock_timestamp()::text)::uuid, $1, $2, TRUE, $3)
+                     (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, TRUE, $4)
                  RETURNING schema_id",
             )
+            .bind(schema_id)
             .bind(schema_name)
             .bind(directory_path(schema_name))
             .bind(snapshot_id)
@@ -1819,18 +1870,19 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // single-catalog backend (the multicatalog writer scopes to
             // `cat_{id}/{schema}` instead).
             let schema_path = directory_path(path.unwrap_or(name));
-            let schema_id: i64 = sqlx::query(
+            let schema_id = reserve_catalog_id(&mut tx).await?;
+            sqlx::query(
                 "INSERT INTO ducklake_schema
-                     (schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (md5(random()::text || clock_timestamp()::text)::uuid, $1, $2, TRUE, $3)
-                 RETURNING schema_id",
+                     (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, TRUE, $4)",
             )
+            .bind(schema_id)
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
+            .execute(&mut *tx)
+            .await?;
 
             record_snapshot_changes(
                 &mut tx,
@@ -1876,19 +1928,21 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .await?;
 
             let table_path = directory_path(path.unwrap_or(name));
-            let table_id: i64 = sqlx::query(
+            let table_id = reserve_catalog_id(&mut tx).await?;
+            sqlx::query(
                 "INSERT INTO ducklake_table
-                     (table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES (md5(random()::text || clock_timestamp()::text)::uuid, $1, $2, $3, TRUE, $4)
-                 RETURNING table_id",
+                     (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
+                      begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, md5(random()::text || clock_timestamp()::text)::uuid, $2, $3, $4, TRUE, $5)",
             )
+            .bind(table_id)
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
+            .execute(&mut *tx)
+            .await?;
 
             record_snapshot_changes(
                 &mut tx,
@@ -1931,7 +1985,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // insert with explicit ids, keeping the allocator authoritative.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
             let first_column_id = last_column_id - n + 1;
             let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
             for (column, column_id) in catalog_columns.iter().zip(field_ids.iter()) {
@@ -2786,6 +2841,33 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         })
     }
 
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let data_path = self.get_data_path()?;
+        self.block_on(async {
+            let row: Option<(String, Option<bool>, String, Option<bool>)> = sqlx::query_as(
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                   AND t.table_name = $2 AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(
+                |(schema_path, schema_relative, table_path, table_relative)| {
+                    table_directory(
+                        &data_path,
+                        (&schema_path, schema_relative.unwrap_or(true)),
+                        (&table_path, table_relative.unwrap_or(true)),
+                    )
+                },
+            )
+            .transpose()
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -2907,14 +2989,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .execute(&self.pool)
             .await?;
-            sqlx::query(
-                "ALTER TABLE ducklake_snapshot
-                 ADD COLUMN IF NOT EXISTS next_catalog_id BIGINT,
-                 ADD COLUMN IF NOT EXISTS next_file_id BIGINT",
-            )
-            .execute(&self.pool)
-            .await?;
-            add_missing_positional_columns(&self.pool).await?;
+            add_official_columns(&self.pool).await?;
             // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
             // they are reserved inside a transaction from these counters.
             seed_counter(
@@ -2964,11 +3039,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // lock up front. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -2982,13 +3053,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // from the counter, so under concurrency it may differ from this.
             let snapshot_id: i64 = base_snapshot_id + 1;
 
-            // Look up, do NOT create. Reserving from the IDENTITY sequence hands out
-            // an id without inserting a row, so a write that dies before commit
-            // leaves nothing behind — schema/table visibility is
+            // Look up, do NOT create. Reserving from the `next_catalog_id` counter
+            // hands out an id without inserting a row, so a write that dies before
+            // commit leaves nothing behind — schema/table visibility is
             // `snapshot >= begin_snapshot` with no check that the snapshot exists,
             // so a row written here against a guessed id would become readable the
-            // moment any writer reached it. Unused reservations leave sequence gaps,
-            // which are expected and harmless.
+            // moment any writer reached it. Unused reservations leave gaps, which
+            // are expected and harmless.
             let schema_id: i64 = match sqlx::query_scalar(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = $1 AND end_snapshot IS NULL",
@@ -2998,7 +3069,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_schema", "schema_id", "next_catalog_id").await?,
+                None => reserve_catalog_id(&mut tx).await?,
             };
 
             let table_id: i64 = match sqlx::query_scalar(
@@ -3013,8 +3084,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_table", "table_id", "next_catalog_id").await?,
+                None => reserve_catalog_id(&mut tx).await?,
             };
+            // Freshly reserved ids. Only a genuinely-new column actually consumes
+            // one below; an existing column keeps its current id, so some of these
+            // may go unused (harmless monotonic-counter gaps).
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
+            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id (column_id == parquet field_id; an

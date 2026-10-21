@@ -191,6 +191,25 @@ impl Lake {
         }
     }
 
+    /// The crate's writer, as a caller that skips initialization opens it.
+    async fn uninitialized_writer(&self) -> Arc<dyn MetadataWriter> {
+        let url = self.url();
+        match self.backend {
+            Backend::DuckDb => Arc::new(DuckdbMetadataWriter::new(url).unwrap()),
+            Backend::Sqlite => Arc::new(SqliteMetadataWriter::new(&url).await.unwrap()),
+            Backend::Postgres {
+                ..
+            } => Arc::new(
+                PostgresSingleCatalogMetadataWriter::new(&url)
+                    .await
+                    .unwrap(),
+            ),
+            Backend::Mysql {
+                ..
+            } => Arc::new(MySqlMetadataWriter::new(&url).await.unwrap()),
+        }
+    }
+
     /// Migrate the catalog to official's layout.
     async fn migrate(&self) {
         let url = self.url();
@@ -366,17 +385,19 @@ impl Lake {
     }
 }
 
-/// Write `ids` as the only column of a new `main.<table>` through `writer`, to
-/// a Parquet file.
-async fn write_ids(writer: Arc<dyn MetadataWriter>, table: &str, ids: Vec<i32>) {
+/// Write `ids` as the only column of `main.<table>` through `writer`, to a
+/// Parquet file: as a new table with [`WriteMode::Replace`], else appended.
+async fn write_ids(writer: Arc<dyn MetadataWriter>, table: &str, ids: Vec<i32>, mode: WriteMode) {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap();
-    DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+    let writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
         .unwrap()
-        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
-        .write_table("main", table, &[batch])
-        .await
-        .unwrap();
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    match mode {
+        WriteMode::Replace => writer.write_table("main", table, &[batch]).await,
+        WriteMode::Append => writer.append_table("main", table, &[batch]).await,
+    }
+    .unwrap();
 }
 
 /// The `id` values of `lake.main.<table>`, in order.
@@ -391,6 +412,22 @@ fn official_ids(oracle: &duckdb::Connection, table: &str) -> Vec<i32> {
         .unwrap()
 }
 
+/// Every `(table_id, table_name)` row of `lake`'s `ducklake_table`, by id and
+/// version.
+fn official_tables(oracle: &duckdb::Connection) -> Vec<(i64, String)> {
+    let mut statement = oracle
+        .prepare(
+            "SELECT table_id, table_name FROM __ducklake_metadata_lake.ducklake_table
+             ORDER BY table_id, begin_snapshot",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 /// Official DuckDB writes into a catalog the crate created, renaming a table
 /// among others, and the crate writes after it, each allocating ids past the
 /// other's: the catalog tables official inserts into by position follow its
@@ -400,7 +437,13 @@ fn official_ids(oracle: &duckdb::Connection, table: &str) -> Vec<i32> {
 /// append to a table.
 async fn duckdb_and_the_crate_write_one_catalog_in_turn(kind: Kind) {
     let lake = Lake::new(kind).await;
-    write_ids(lake.writer().await, "readable", vec![7, 11, 13]).await;
+    write_ids(
+        lake.writer().await,
+        "readable",
+        vec![7, 11, 13],
+        WriteMode::Replace,
+    )
+    .await;
 
     let oracle = lake.official();
     oracle
@@ -412,7 +455,7 @@ async fn duckdb_and_the_crate_write_one_catalog_in_turn(kind: Kind) {
         )
         .unwrap();
     drop(oracle);
-    write_ids(lake.writer().await, "after", vec![23]).await;
+    write_ids(lake.writer().await, "after", vec![23], WriteMode::Replace).await;
     let oracle = lake.official();
     oracle
         .execute_batch("CREATE TABLE lake.main.official_after AS SELECT 29 AS id;")
@@ -422,19 +465,7 @@ async fn duckdb_and_the_crate_write_one_catalog_in_turn(kind: Kind) {
     let after = official_ids(&oracle, "after");
     let renamed = official_ids(&oracle, "renamed");
     let official_after = official_ids(&oracle, "official_after");
-    let tables: Vec<(i64, String)> = {
-        let mut statement = oracle
-            .prepare(
-                "SELECT table_id, table_name FROM __ducklake_metadata_lake.ducklake_table
-                 ORDER BY table_id, begin_snapshot",
-            )
-            .unwrap();
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
+    let tables = official_tables(&oracle);
     let files: (i64, i64) = oracle
         .query_row(
             "SELECT COUNT(*), COUNT(DISTINCT file_id) FROM (
@@ -472,7 +503,7 @@ async fn duckdb_and_the_crate_write_one_catalog_in_turn(kind: Kind) {
 /// statistics are stale.
 async fn inlined_inserts_advance_next_file_id(kind: Kind) {
     let lake = Lake::new(kind).await;
-    write_ids(lake.writer().await, "files", vec![1]).await;
+    write_ids(lake.writer().await, "files", vec![1], WriteMode::Replace).await;
     let head_file_id = || {
         lake.official()
             .query_row(
@@ -505,6 +536,200 @@ async fn inline_ids(writer: Arc<dyn MetadataWriter>, mode: WriteMode) {
         WriteMode::Append => inlining.append_table("main", "inlined", &[batch]).await,
     }
     .unwrap();
+}
+
+/// The crate appends to a table official DuckDB renamed in the directory the
+/// table keeps, where official reads the table whole.
+async fn the_crate_appends_to_a_table_official_renamed(kind: Kind) {
+    let lake = Lake::new(kind).await;
+    write_ids(lake.writer().await, "named", vec![1, 2], WriteMode::Replace).await;
+    lake.official()
+        .execute_batch("ALTER TABLE lake.main.named RENAME TO renamed;")
+        .unwrap();
+    write_ids(lake.writer().await, "renamed", vec![3], WriteMode::Append).await;
+    let data = lake.temp.path().join("data").join("main");
+    let files = std::fs::read_dir(data.join("named")).unwrap().count();
+    let renamed = official_ids(&lake.official(), "renamed");
+
+    assert_eq!(renamed, vec![1, 2, 3]);
+    assert_eq!(files, 2);
+    assert!(!data.join("renamed").exists());
+}
+
+/// A commit after one that left the head's id watermarks unset, as a release
+/// before 0.10 does, raises them past the ids official DuckDB handed out, also
+/// from a writer that skipped the repair initialization makes, so official
+/// never takes an id again.
+async fn a_commit_after_unset_watermarks_keeps_official_ids_unique(kind: Kind) {
+    let lake = Lake::new(kind).await;
+    write_ids(lake.writer().await, "crate", vec![1], WriteMode::Replace).await;
+    lake.official()
+        .execute_batch(
+            "CREATE TABLE lake.main.first AS SELECT 2 AS id;
+             CREATE TABLE lake.main.second AS SELECT 3 AS id;",
+        )
+        .unwrap();
+    lake.execute_metadata_sql(match lake.backend {
+        // The DuckDB writer's watermark columns default to these.
+        Backend::DuckDb => "UPDATE ducklake_snapshot SET next_catalog_id = 1, next_file_id = 0",
+        _ => "UPDATE ducklake_snapshot SET next_catalog_id = NULL, next_file_id = NULL",
+    })
+    .await;
+    write_ids(
+        lake.uninitialized_writer().await,
+        "crate",
+        vec![4],
+        WriteMode::Append,
+    )
+    .await;
+    let oracle = lake.official();
+    oracle
+        .execute_batch("CREATE TABLE lake.main.third AS SELECT 5 AS id;")
+        .unwrap();
+    let tables = official_tables(&oracle);
+    let third = official_ids(&oracle, "third");
+
+    assert_eq!(
+        tables
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["crate", "first", "second", "third"]
+    );
+    assert!(
+        tables.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "{tables:?}"
+    );
+    assert_eq!(third, vec![5]);
+}
+
+/// The crate adds a column to a table official DuckDB added one to, numbering
+/// it past the table's columns as official does, so official reads the table.
+async fn the_crate_adds_a_column_after_official_added_one(kind: Kind) {
+    let lake = Lake::new(kind).await;
+    write_ids(lake.writer().await, "evolving", vec![1], WriteMode::Replace).await;
+    lake.official()
+        .execute_batch("ALTER TABLE lake.main.evolving ADD COLUMN official_column INTEGER;")
+        .unwrap();
+    // The crate column comes first, so it takes the first id the write
+    // reserves, the one official took when the counter lags official's.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("crate_column", DataType::Int32, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("official_column", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![4])),
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(lake.writer().await, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
+        .append_table("main", "evolving", &[batch])
+        .await
+        .unwrap();
+    let oracle = lake.official();
+    let rows: Vec<(i32, Option<i32>, Option<i32>)> = {
+        let mut statement = oracle
+            .prepare("SELECT id, official_column, crate_column FROM lake.main.evolving ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let columns: Vec<(i64, String)> = {
+        let mut statement = oracle
+            .prepare(
+                "SELECT c.column_id, c.column_name
+                 FROM __ducklake_metadata_lake.ducklake_column c
+                 JOIN __ducklake_metadata_lake.ducklake_table t ON t.table_id = c.table_id
+                 WHERE t.table_name = 'evolving' AND c.end_snapshot IS NULL
+                 ORDER BY c.column_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(rows, vec![(1, None, None), (2, Some(3), Some(4))]);
+    assert_eq!(
+        columns,
+        vec![
+            (1, "id".to_string()),
+            (2, "official_column".to_string()),
+            (3, "crate_column".to_string())
+        ]
+    );
+}
+
+/// The crate takes schema and table ids, a schema it creates alone included,
+/// from the one `next_catalog_id` namespace official DuckDB allocates both
+/// from, so no schema shares an id with a table.
+async fn schemas_and_tables_share_one_id_namespace(kind: Kind) {
+    let lake = Lake::new(kind).await;
+    write_ids(lake.writer().await, "zeroth", vec![0], WriteMode::Replace).await;
+    lake.official()
+        .execute_batch(
+            "CREATE SCHEMA lake.official;
+             CREATE TABLE lake.official.first AS SELECT 1 AS id;",
+        )
+        .unwrap();
+    let writer = lake.writer().await;
+    let snapshot = writer.create_snapshot().unwrap();
+    writer
+        .get_or_create_schema("crate", None, snapshot)
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+    DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("crate", "second", &[batch])
+        .await
+        .unwrap();
+    let oracle = lake.official();
+    oracle
+        .execute_batch("CREATE TABLE lake.official.third AS SELECT 3 AS id;")
+        .unwrap();
+    let ids: Vec<(i64, String)> = {
+        let mut statement = oracle
+            .prepare(
+                "SELECT id, name FROM (
+                     SELECT schema_id AS id, schema_name AS name
+                     FROM __ducklake_metadata_lake.ducklake_schema
+                     UNION ALL
+                     SELECT DISTINCT table_id, table_name
+                     FROM __ducklake_metadata_lake.ducklake_table)
+                 ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let second: i32 = oracle
+        .query_row("SELECT id FROM lake.crate.second", [], |row| row.get(0))
+        .unwrap();
+
+    assert_eq!(
+        ids.iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["zeroth", "main", "official", "first", "crate", "second", "third"]
+    );
+    assert!(ids.windows(2).all(|pair| pair[0].0 < pair[1].0), "{ids:?}");
+    assert_eq!(second, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -564,11 +789,17 @@ const SQL_EARLIER_LAYOUT: &str = "
 /// A catalog written in this crate's earlier layout (columns out of
 /// official's order or missing, id watermarks unset) keeps its column order on
 /// initialization, so a release before 0.10 still writes it, and the crate
-/// writes it too; the migration then brings it to official's layout, keeping
+/// writes it too, even through a writer that skips initialization; the migration then brings it to official's layout, keeping
 /// its rows, and official DuckDB writes it, a rename included.
 async fn migration_brings_an_earlier_layout_to_duckdb_writes(kind: Kind) {
     let lake = Lake::new(kind).await;
-    write_ids(lake.writer().await, "readable", vec![7, 11, 13]).await;
+    write_ids(
+        lake.writer().await,
+        "readable",
+        vec![7, 11, 13],
+        WriteMode::Replace,
+    )
+    .await;
     lake.execute_metadata_sql(SQL_EARLIER_LAYOUT).await;
     if let Backend::Postgres {
         ..
@@ -614,9 +845,16 @@ async fn migration_brings_an_earlier_layout_to_duckdb_writes(kind: Kind) {
     })
     .await;
 
+    write_ids(
+        lake.uninitialized_writer().await,
+        "uninitialized",
+        vec![19],
+        WriteMode::Replace,
+    )
+    .await;
     let writer = lake.writer().await;
     let initialized_columns = lake.column_order("ducklake_table").await;
-    write_ids(writer, "unmigrated", vec![17]).await;
+    write_ids(writer, "unmigrated", vec![17], WriteMode::Replace).await;
     lake.migrate().await;
     let schema_columns = lake.column_order("ducklake_schema").await;
     let table_columns = lake.column_order("ducklake_table").await;
@@ -668,6 +906,7 @@ async fn migration_brings_an_earlier_layout_to_duckdb_writes(kind: Kind) {
         ]
     );
     assert_eq!(official_ids(&oracle, "readable"), vec![7, 11, 13]);
+    assert_eq!(official_ids(&oracle, "uninitialized"), vec![19]);
     assert_eq!(official_ids(&oracle, "unmigrated"), vec![17]);
     assert_eq!(official_ids(&oracle, "renamed"), vec![31]);
 }
@@ -704,4 +943,92 @@ async fn duckdb_and_the_crate_write_one_mysql_catalog_in_turn() {
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn migration_brings_an_earlier_mysql_catalog_to_duckdb_writes() {
     migration_brings_an_earlier_layout_to_duckdb_writes(Kind::Mysql).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crate_appends_to_a_table_official_renamed_on_duckdb() {
+    the_crate_appends_to_a_table_official_renamed(Kind::DuckDb).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crate_appends_to_a_table_official_renamed_on_sqlite() {
+    the_crate_appends_to_a_table_official_renamed(Kind::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_crate_appends_to_a_table_official_renamed_on_postgres() {
+    the_crate_appends_to_a_table_official_renamed(Kind::Postgres).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_crate_appends_to_a_table_official_renamed_on_mysql() {
+    the_crate_appends_to_a_table_official_renamed(Kind::Mysql).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_after_unset_watermarks_keeps_official_ids_unique_on_duckdb() {
+    a_commit_after_unset_watermarks_keeps_official_ids_unique(Kind::DuckDb).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_after_unset_watermarks_keeps_official_ids_unique_on_sqlite() {
+    a_commit_after_unset_watermarks_keeps_official_ids_unique(Kind::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_commit_after_unset_watermarks_keeps_official_ids_unique_on_postgres() {
+    a_commit_after_unset_watermarks_keeps_official_ids_unique(Kind::Postgres).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_commit_after_unset_watermarks_keeps_official_ids_unique_on_mysql() {
+    a_commit_after_unset_watermarks_keeps_official_ids_unique(Kind::Mysql).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crate_adds_a_column_after_official_added_one_on_duckdb() {
+    the_crate_adds_a_column_after_official_added_one(Kind::DuckDb).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crate_adds_a_column_after_official_added_one_on_sqlite() {
+    the_crate_adds_a_column_after_official_added_one(Kind::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_crate_adds_a_column_after_official_added_one_on_postgres() {
+    the_crate_adds_a_column_after_official_added_one(Kind::Postgres).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_crate_adds_a_column_after_official_added_one_on_mysql() {
+    the_crate_adds_a_column_after_official_added_one(Kind::Mysql).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schemas_and_tables_share_one_id_namespace_on_duckdb() {
+    schemas_and_tables_share_one_id_namespace(Kind::DuckDb).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schemas_and_tables_share_one_id_namespace_on_sqlite() {
+    schemas_and_tables_share_one_id_namespace(Kind::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn schemas_and_tables_share_one_id_namespace_on_postgres() {
+    schemas_and_tables_share_one_id_namespace(Kind::Postgres).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn schemas_and_tables_share_one_id_namespace_on_mysql() {
+    schemas_and_tables_share_one_id_namespace(Kind::Mysql).await;
 }

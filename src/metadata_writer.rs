@@ -4,6 +4,7 @@
 //! along with helper types for column definitions and data file registration.
 
 use crate::metadata_provider::{TagObjectType, TagTarget, snapshot_change_tokens};
+use crate::path_resolver::resolve_path;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -24,6 +25,18 @@ pub(crate) fn directory_path(path: &str) -> String {
     } else {
         format!("{path}/")
     }
+}
+
+/// The directory of a table's files, as readers resolve it: the table's stored
+/// `path` under its schema's under `data_path`, each relative to the directory
+/// above unless stored absolute.
+pub(crate) fn table_directory(
+    data_path: &str,
+    (schema_path, schema_path_is_relative): (&str, bool),
+    (table_path, table_path_is_relative): (&str, bool),
+) -> Result<String> {
+    let schema_directory = resolve_path(data_path, schema_path, schema_path_is_relative)?;
+    resolve_path(&schema_directory, table_path, table_path_is_relative)
 }
 
 /// Validate a catalog entity name (schema, table, or column).
@@ -4741,6 +4754,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
+
+    /// The directory of a live table's files, resolved from its stored schema
+    /// and table paths ([`table_directory`]), or `None` when the table does not
+    /// exist. A table official DuckDB renamed keeps its directory, so its files
+    /// must not go where its new name points. The default, `None`, leaves the
+    /// directory to the names, as the multi-catalog layout lays files out.
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let _ = (schema_name, table_name);
+        Ok(None)
+    }
 
     /// Return the live top-level column nullability for an existing table.
     ///

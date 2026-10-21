@@ -918,12 +918,14 @@ Known edges:
   keeps writing it; `migrate_to_official_layout` then rebuilds it into official's layout
   (idempotent, lossless, blocking the tables' writers while it runs), after which only 0.10 or
   later should write it: an older release fails to create a table (and, on DuckDB, to add a
-  file), and its snapshots lack the watermarks official reads. Until then the writers also take
-  ids past the counters and sequences older releases allocate from. The multi-catalog PostgreSQL layout is library-specific and stays
-  unattachable by official. Official DuckDB 1.5.5's MySQL connector cannot append to an existing
-  table on any MySQL catalog, its own included. This crate writes a table's files under its
-  schema and table names, not its stored path, so a file it writes to a table official renamed
-  lands outside the table's directory, and neither side reads it.
+  file), and its snapshots lack the watermarks official reads, until the next 0.10 commit
+  raises them past every id in use. Until then the writers also take ids past the counters and
+  sequences older releases allocate from. A column the crate adds to a table takes an id past
+  the table's, as official numbers a table's columns, and a file it writes goes to the
+  directory the table's stored path names, which a rename by official keeps. The multi-catalog
+  PostgreSQL layout is library-specific and stays unattachable by official. Official DuckDB
+  1.5.5's MySQL connector cannot append to an existing table on any MySQL catalog, its own
+  included.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

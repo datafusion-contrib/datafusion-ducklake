@@ -28,7 +28,7 @@ use crate::metadata_writer::{
     SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode, WriteResult,
     WriteSetupResult, validate_delete_entries,
 };
-use crate::path_resolver::join_paths;
+use crate::path_resolver::{join_paths, parse_object_store_url};
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
 use crate::write_encoding::RowGroupSampledWriter;
@@ -732,7 +732,7 @@ impl DuckLakeTableWriter {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         let data_path_str = metadata.get_data_path()?;
-        let (_, key_path) = crate::path_resolver::parse_object_store_url(&data_path_str)?;
+        let (_, key_path) = parse_object_store_url(&data_path_str)?;
 
         Ok(Self {
             metadata,
@@ -1018,18 +1018,7 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        // Multicatalog backends share one physical `data_path`, so without a
-        // per-catalog segment two catalogs writing the same (schema, table)
-        // would dump files into the same directory. Prepend `cat_{id}` to keep
-        // them physically isolated. Single-catalog backends report `None` and
-        // skip the segment, preserving the historical `{schema}/{table}/…`
-        // layout. `cat_` prefix + numeric id is rename-safe and needs no
-        // sanitisation.
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1065,11 +1054,7 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1147,11 +1132,7 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1775,11 +1756,7 @@ impl DuckLakeTableWriter {
         self.refuse_encrypted_parquet("write a delete file")?;
         use arrow::array::{Int64Array, StringArray};
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         let object_path_str = join_paths(&table_key, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys).
@@ -1860,11 +1837,7 @@ impl DuckLakeTableWriter {
         written: &mut Vec<ObjectPath>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let schema_with_ids = {
             let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
             let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -1984,11 +1957,7 @@ impl DuckLakeTableWriter {
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
         self.refuse_encrypted_parquet("write a compacted data file")?;
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         // A compacted file of a partitioned table lands in its partition's Hive
         // directory, like every other write of that partition; the returned
         // `DataFileInfo.path` is relative to the table dir either way.
@@ -2290,11 +2259,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
 
         let groups = match &sort_spec {
             Some(spec) => groups
@@ -2531,11 +2496,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
 
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
@@ -2693,11 +2654,7 @@ impl DuckLakeTableWriter {
 
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
@@ -2869,8 +2826,22 @@ impl DuckLakeTableWriter {
         )
     }
 
-    /// Object-store key of a table's directory: `{base}/[cat_{id}/]{schema}/{table}`.
+    /// Object-store key of a table's directory: where its stored schema and
+    /// table paths put it, as readers resolve them, since a table official
+    /// DuckDB renamed keeps its directory. A table that does not exist yet, or a
+    /// writer that does not look the paths up, gets
+    /// `{base}/[cat_{id}/]{schema}/{table}`.
     fn table_key(&self, schema_name: &str, table_name: &str) -> Result<String> {
+        if let Some(directory) = self.metadata.get_table_directory(schema_name, table_name)? {
+            return Ok(parse_object_store_url(&directory)?.1);
+        }
+        // Multicatalog backends share one physical `data_path`, so without a
+        // per-catalog segment two catalogs writing the same (schema, table)
+        // would dump files into the same directory. Prepend `cat_{id}` to keep
+        // them physically isolated. Single-catalog backends report `None` and
+        // skip the segment, preserving the historical `{schema}/{table}/…`
+        // layout. `cat_` prefix + numeric id is rename-safe and needs no
+        // sanitisation.
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),

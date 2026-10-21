@@ -24,8 +24,9 @@ use crate::metadata_writer::{
     WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
     inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
-    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
+    snapshot_has_change, staged_table_write_changes, table_directory, table_storage_changes,
+    table_write_changes, top_level_column_ids, validate_delete_entries,
+    validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, LEGACY_CATALOG_ID_COUNTERS,
@@ -888,6 +889,16 @@ impl SqliteMetadataWriter {
 
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
+        let initialized: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                            WHERE type = 'table' AND name = 'ducklake_snapshot')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if initialized {
+            migrate_add_snapshot_watermarks(&pool).await?;
+            add_missing_positional_columns(&pool).await?;
+        }
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
             .execute(&pool)
             .await?;
@@ -1530,6 +1541,28 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Raise the `next_column_id` counter, which `n` column ids were just reserved
+/// from, past `table_id`'s columns, returning its last id. Official numbers a
+/// column it adds from the table's largest column id, never from this counter.
+async fn raise_column_ids_past_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    n: i64,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "UPDATE ducklake_metadata
+         SET value = CAST(MAX(CAST(value AS INTEGER),
+                              COALESCE((SELECT MAX(column_id) FROM ducklake_column
+                                        WHERE table_id = ?), 0) + ?) AS TEXT)
+         WHERE key = 'next_column_id' AND scope IS NULL
+         RETURNING CAST(value AS INTEGER)",
+    )
+    .bind(table_id)
+    .bind(n)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// The catalog tables whose ids share official's `next_catalog_id` namespace.
 const CATALOG_ID_COLUMNS: [(&str, &str); 6] = [
     ("ducklake_schema", "schema_id"),
@@ -1657,6 +1690,10 @@ async fn add_missing_positional_columns(pool: &SqlitePool) -> Result<()> {
             .bind(table)
             .fetch_all(pool)
             .await?;
+        // `initialize_schema` creates a table a catalog lacks whole.
+        if current.is_empty() {
+            continue;
+        }
         for (name, definition, _) in positional_columns(columns) {
             if !current.iter().any(|column| column == name) {
                 sqlx::query(AssertSqlSafe(format!(
@@ -1759,14 +1796,7 @@ async fn raise_head_watermarks_past_ids_in_use(pool: &SqlitePool) -> Result<()> 
     let mut conn = pool.acquire().await?;
     seed_catalog_counter(&mut conn).await?;
     let catalog = max_catalog_id(&mut conn).await?;
-    let file: i64 = sqlx::query_scalar(
-        "SELECT MAX(COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), -1),
-                    COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), -1),
-                    COALESCE((SELECT CAST(value AS INTEGER) FROM ducklake_metadata
-                              WHERE key = 'next_file_id' AND scope IS NULL), -1))",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
+    let file = max_file_id(&mut conn).await?;
     sqlx::query(
         "UPDATE ducklake_snapshot
          SET next_catalog_id = MAX(COALESCE(next_catalog_id, 0), ?),
@@ -1782,6 +1812,19 @@ async fn raise_head_watermarks_past_ids_in_use(pool: &SqlitePool) -> Result<()> 
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// The largest data or delete file id in use or reserved by this writer, `-1`
+/// in an empty catalog.
+async fn max_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT MAX(COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), -1),
+                    COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), -1),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM ducklake_metadata
+                              WHERE key = 'next_file_id' AND scope IS NULL), -1))",
+    )
+    .fetch_one(&mut *conn)
+    .await?)
 }
 
 /// Upgrade an existing `ducklake_column` from the legacy shape
@@ -2830,6 +2873,12 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     .await?;
     let snapshot_id = row.try_get(0)?;
     let schema_version = row.try_get(1)?;
+    // A release before 0.10 commits without watermarks, so the previous
+    // head's can be missing while official's ids are in use.
+    let catalog = max_catalog_id(tx).await?;
+    raise_head_watermark(tx, "next_catalog_id", catalog).await?;
+    let file = max_file_id(tx).await?;
+    raise_head_watermark(tx, "next_file_id", file).await?;
     sqlx::query(
         "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
          VALUES (?, NULL)",
@@ -5177,7 +5226,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             // write path's begin/commit reserve column ids from the same counter).
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
             let first_column_id = last_column_id - n + 1;
             let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
             for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
@@ -7644,6 +7694,33 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let data_path = self.get_data_path()?;
+        self.block_on(async {
+            let row: Option<(String, Option<bool>, String, Option<bool>)> = sqlx::query_as(
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(
+                |(schema_path, schema_relative, table_path, table_relative)| {
+                    table_directory(
+                        &data_path,
+                        (&schema_path, schema_relative.unwrap_or(true)),
+                        (&table_path, table_relative.unwrap_or(true)),
+                    )
+                },
+            )
+            .transpose()
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -7788,11 +7865,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // begins. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -7833,6 +7906,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 Some(id) => id,
                 None => reserve_catalog_id(&mut tx).await?,
             };
+            // Freshly reserved ids. Only a genuinely-new column actually consumes
+            // one below; an existing column keeps its current id, so some of these
+            // may go unused (harmless monotonic-counter gaps).
+            let last_column_id = raise_column_ids_past_table(&mut tx, table_id, n).await?;
+            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id. column_id == parquet field_id == a

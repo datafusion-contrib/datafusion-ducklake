@@ -44,7 +44,6 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::InlinedSystemColumns;
 use crate::metadata_provider_duckdb::{catalog_inlined_system_columns, inlined_table_layout};
-use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
     DataFileInfo, DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn,
@@ -65,6 +64,7 @@ use crate::metadata_writer::{
     rewritten_deletes_snapshot, row_mutation_source_files, source_file_id_list, staged_conflict,
     table_conflict, validate_row_mutation_stage,
 };
+use crate::metadata_writer::{directory_path, table_directory};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
@@ -1066,6 +1066,18 @@ impl DuckdbMetadataWriter {
     pub fn new(path: impl Into<String>) -> Result<Self> {
         let catalog_path = path.into();
         let conn = Connection::open(&catalog_path)?;
+        // A catalog an earlier release created lacks columns this writer
+        // inserts, even when the caller skips `initialize_schema`.
+        let initialized: bool = conn.query_row(
+            "SELECT COUNT(*) = 5 FROM duckdb_tables()
+             WHERE table_name IN ('ducklake_snapshot', 'ducklake_schema', 'ducklake_table',
+                                  'ducklake_data_file', 'ducklake_delete_file')",
+            [],
+            |row| row.get(0),
+        )?;
+        if initialized {
+            conn.execute_batch(SQL_ADD_OFFICIAL_COLUMNS)?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             catalog_path,
@@ -1347,6 +1359,33 @@ fn reserve_ids(tx: &Transaction<'_>, key: &str, n: i64) -> Result<i64> {
     )?;
     Ok(last)
 }
+
+/// Raise the `next_column_id` counter, which `n` column ids were just reserved
+/// from, past `table_id`'s columns, returning its last id. Official numbers a
+/// column it adds from the table's largest column id, never from this counter.
+fn raise_column_ids_past_table(tx: &Transaction<'_>, table_id: i64, n: i64) -> Result<i64> {
+    Ok(tx.query_row(
+        "UPDATE ducklake_metadata
+         SET value = CAST(GREATEST(CAST(value AS BIGINT),
+                                   COALESCE((SELECT MAX(column_id) FROM ducklake_column
+                                             WHERE table_id = ?), 0) + ?) AS VARCHAR)
+         WHERE key = 'next_column_id' AND scope IS NULL
+         RETURNING CAST(value AS BIGINT)",
+        params![table_id, n],
+        |row| row.get(0),
+    )?)
+}
+
+/// Add the columns of official's layout a catalog an earlier release created
+/// lacks, last.
+const SQL_ADD_OFFICIAL_COLUMNS: &str = "
+    ALTER TABLE ducklake_snapshot ADD COLUMN IF NOT EXISTS next_catalog_id BIGINT DEFAULT 1;
+    ALTER TABLE ducklake_snapshot ADD COLUMN IF NOT EXISTS next_file_id BIGINT DEFAULT 0;
+    ALTER TABLE ducklake_schema ADD COLUMN IF NOT EXISTS schema_uuid UUID;
+    ALTER TABLE ducklake_table ADD COLUMN IF NOT EXISTS table_uuid UUID;
+    ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS file_order BIGINT;
+    ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS file_format VARCHAR;
+    ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS format VARCHAR";
 
 /// An id namespace official DuckDB allocates from a snapshot watermark.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1669,21 +1708,29 @@ fn insert_snapshot(tx: &Transaction<'_>) -> Result<(i64, i64)> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     // The id watermarks official DuckDB allocates from: the previous head's,
-    // raised past every id this writer reserved.
+    // raised past every id in use and every id this writer reserved. A release
+    // before 0.10 commits without watermarks, so the previous head's can be
+    // missing while official's ids are in use.
     tx.execute(
-        "INSERT INTO ducklake_snapshot
-             (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
-         SELECT ?, CURRENT_TIMESTAMP, ?,
-             GREATEST(
-                 COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
-                           ORDER BY snapshot_id DESC LIMIT 1), 0),
-                 COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
-                           WHERE key = 'next_catalog_id' AND scope IS NULL), 0)),
-             GREATEST(
-                 COALESCE((SELECT next_file_id FROM ducklake_snapshot
-                           ORDER BY snapshot_id DESC LIMIT 1), 0),
-                 COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
-                           WHERE key = 'next_file_id' AND scope IS NULL), 0))",
+        &format!(
+            "INSERT INTO ducklake_snapshot
+                 (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+             SELECT ?, CURRENT_TIMESTAMP, ?,
+                 GREATEST(
+                     COALESCE((SELECT next_catalog_id FROM ducklake_snapshot
+                               ORDER BY snapshot_id DESC LIMIT 1), 0),
+                     ({max_catalog}) + 1,
+                     COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                               WHERE key = 'next_catalog_id' AND scope IS NULL), 0)),
+                 GREATEST(
+                     COALESCE((SELECT next_file_id FROM ducklake_snapshot
+                               ORDER BY snapshot_id DESC LIMIT 1), 0),
+                     ({max_file}) + 1,
+                     COALESCE((SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                               WHERE key = 'next_file_id' AND scope IS NULL), 0))",
+            max_catalog = IdAllocator::Catalog.max_id_sql(),
+            max_file = IdAllocator::File.max_id_sql(),
+        ),
         params![snapshot_id, schema_version],
     )?;
     tx.execute(
@@ -3997,7 +4044,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // insert with explicit ids, keeping the allocator authoritative.
         let catalog_columns = catalog_column_defs(columns)?;
         let n = catalog_columns.len() as i64;
-        let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
+        reserve_ids(&tx, "next_column_id", n)?;
+        let last_column_id = raise_column_ids_past_table(&tx, table_id, n)?;
         let first_column_id = last_column_id - n + 1;
         let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
         for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
@@ -5871,6 +5919,32 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
     }
 
+    fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
+        let data_path = self.get_data_path()?;
+        let conn = self.connection();
+        let row: Option<(String, Option<bool>, String, Option<bool>)> = conn
+            .query_row(
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+                params![schema_name, table_name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(
+            |(schema_path, schema_relative, table_path, table_relative)| {
+                table_directory(
+                    &data_path,
+                    (&schema_path, schema_relative.unwrap_or(true)),
+                    (&table_path, table_relative.unwrap_or(true)),
+                )
+            },
+        )
+        .transpose()
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -5933,20 +6007,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         conn.execute_batch(
             "ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT",
         )?;
-        conn.execute_batch(
-            "ALTER TABLE ducklake_snapshot
-                 ADD COLUMN IF NOT EXISTS next_catalog_id BIGINT DEFAULT 1;
-             ALTER TABLE ducklake_snapshot
-                 ADD COLUMN IF NOT EXISTS next_file_id BIGINT DEFAULT 0;
-             ALTER TABLE ducklake_schema ADD COLUMN IF NOT EXISTS schema_uuid UUID;
-             ALTER TABLE ducklake_table ADD COLUMN IF NOT EXISTS table_uuid UUID;
-             ALTER TABLE ducklake_data_file
-                 ADD COLUMN IF NOT EXISTS file_order BIGINT;
-             ALTER TABLE ducklake_data_file
-                 ADD COLUMN IF NOT EXISTS file_format VARCHAR;
-             ALTER TABLE ducklake_delete_file
-                 ADD COLUMN IF NOT EXISTS format VARCHAR",
-        )?;
+        conn.execute_batch(SQL_ADD_OFFICIAL_COLUMNS)?;
         // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
         // (CREATE TABLE IF NOT EXISTS never alters an existing table). DuckDB supports
         // ADD COLUMN IF NOT EXISTS, so this is idempotent and lossless (NULL means
@@ -6021,11 +6082,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // Reserve the column ids first. These match the staged parquet field ids.
         let catalog_columns = catalog_column_defs(columns)?;
         let n = catalog_columns.len() as i64;
-        let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
-        // Freshly reserved ids. Only a genuinely-new column consumes one below; an
-        // existing column keeps its current id, so some may go unused (harmless
-        // monotonic-counter gaps).
-        let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+        reserve_ids(&tx, "next_column_id", n)?;
 
         // The catalog head this write is based on; a Replace commit aborts if
         // another writer published a newer generation of the table past it.
@@ -6061,6 +6118,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
             )
             .optional()?
             .map_or_else(|| reserve_ids_of(&tx, IdAllocator::Catalog, 1), Ok)?;
+        // Freshly reserved ids. Only a genuinely-new column consumes one below; an
+        // existing column keeps its current id, so some may go unused (harmless
+        // monotonic-counter gaps).
+        let last_column_id = raise_column_ids_past_table(&tx, table_id, n)?;
+        let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
         // Existing columns to (a) check schema compatibility and (b) REUSE each
         // column's id (column_id == parquet field_id == a column's stable
