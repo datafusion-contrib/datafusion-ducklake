@@ -78,6 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- PostgreSQL initialization of a current store is one read and runs no DDL, so it no longer
+  waits behind writers (#370).
 - In SQLite rollback-journal mode, a commit can fail with "database is locked" once its busy
   timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
 - A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only

@@ -39,9 +39,10 @@ use crate::metadata_writer::{
 use crate::metadata_writer::{created_name, directory_path, table_directory};
 use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
 use crate::metadata_writer_postgres::{
-    PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
-    apply_positional_deletes_at_snapshot, apply_row_mutation_at_snapshot, check_staged_conflicts,
-    commit_files_at_snapshot, commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
+    ExpectedSchema, PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES,
+    apply_inlined_deletes_at_snapshot, apply_positional_deletes_at_snapshot,
+    apply_row_mutation_at_snapshot, check_staged_conflicts, commit_files_at_snapshot,
+    commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
     detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict,
     detect_row_mutation_conflicts, drop_empty_superseded_inlined_tables_in, quote_ident,
     set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
@@ -49,7 +50,7 @@ use crate::metadata_writer_postgres::{
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -663,42 +664,257 @@ async fn raise_head_watermarks(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
 /// counters this writer uses, even when the caller skips `initialize_schema`.
 /// A database without a catalog is left to `initialize_schema`.
 async fn upgrade_earlier_catalog(pool: &PgPool) -> Result<()> {
-    let initialized: bool =
-        sqlx::query_scalar("SELECT to_regclass('ducklake_snapshot') IS NOT NULL")
-            .fetch_one(pool)
-            .await?;
-    if initialized {
-        create_missing_tables(pool).await?;
-        add_official_columns(pool).await?;
-        seed_counter(pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-        seed_counter(pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+    initialize(pool, Initialization::Open).await
+}
+
+/// How far [`initialize`] brings a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Initialization {
+    /// The tables, columns and counters a writer opened on an existing catalog
+    /// uses. A database without a catalog is left as it is.
+    Open,
+    /// Everything [`MetadataWriter::initialize_schema`] creates and migrates,
+    /// also in a database without a catalog.
+    Create,
+}
+
+/// The `ducklake_metadata` counters each [`Initialization`] seeds, with the
+/// query of the largest id in use each starts past.
+const OPEN_COUNTERS: [(&str, &str); 2] =
+    [("next_catalog_id", SQL_MAX_CATALOG_ID), ("next_file_id", SQL_MAX_FILE_ID)];
+const CREATE_COUNTERS: [(&str, &str); 2] = [
+    (
+        "next_column_id",
+        "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column",
+    ),
+    (
+        "next_snapshot_id",
+        "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+    ),
+];
+
+impl Initialization {
+    fn counters(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        let create: &[_] = match self {
+            Self::Open => &[],
+            Self::Create => &CREATE_COUNTERS,
+        };
+        OPEN_COUNTERS.into_iter().chain(create.iter().copied())
     }
+
+    /// The relations and columns this initialization guarantees: the tables of
+    /// [`SQL_CREATE_TABLES`] and its index, and [`official_columns`] where
+    /// their table exists. [`Self::Create`] also creates [`POSITIONAL_TABLES`].
+    fn expected(self) -> &'static ExpectedSchema {
+        static OPEN: LazyLock<ExpectedSchema> =
+            LazyLock::new(|| expected_schema(Initialization::Open));
+        static CREATE: LazyLock<ExpectedSchema> =
+            LazyLock::new(|| expected_schema(Initialization::Create));
+        match self {
+            Self::Open => &OPEN,
+            Self::Create => &CREATE,
+        }
+    }
+
+    /// A SQL boolean that holds when this initialization would change nothing.
+    /// It reads catalog tables, so it fails in a database that lacks one.
+    fn sql_current(self) -> String {
+        let counters = self
+            .counters()
+            .map(|(key, _)| format!("'{key}'"))
+            .collect::<Vec<_>>();
+        let mut sql = format!(
+            "({present})
+             AND (SELECT count(DISTINCT key) FROM ducklake_metadata
+                  WHERE scope IS NULL AND key IN ({keys})) = {count}",
+            present = ExpectedSchema::SQL_PRESENT,
+            keys = counters.join(", "),
+            count = counters.len(),
+        );
+        if self == Self::Create {
+            sql.push_str(&format!(
+                " AND to_regprocedure('ducklake_next_file_id()') IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_attribute
+                      WHERE attrelid = to_regclass('ducklake_snapshot_changes')
+                        AND attname = 'changes_made' AND attnotnull)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ducklake_metadata
+                      WHERE key = 'data_path' AND scope IS NULL
+                        AND value <> '' AND value NOT LIKE '%/')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ducklake_schema WHERE path <> '' AND path NOT LIKE '%/')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ducklake_table WHERE path <> '' AND path NOT LIKE '%/')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ducklake_metadata
+                      WHERE key IN ('sort_on_insert', 'hive_file_pattern')
+                        AND LOWER(value) = 'true' AND value <> 'true')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ducklake_snapshot,
+                           ({SQL_MAX_CATALOG_ID}) AS catalog(catalog),
+                           ({SQL_MAX_FILE_ID}) AS file(file)
+                      WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+                        AND (next_catalog_id IS NULL OR next_catalog_id <= catalog
+                             OR next_file_id IS NULL OR next_file_id <= file))"
+            ));
+        }
+        sql
+    }
+}
+
+fn expected_schema(scope: Initialization) -> ExpectedSchema {
+    let mut expected = ExpectedSchema::default();
+    for ddl in SQL_CREATE_TABLES {
+        expected.add_relation(created_name(ddl));
+    }
+    if scope == Initialization::Create {
+        for (table, _, _) in POSITIONAL_TABLES {
+            expected.add_relation(table);
+        }
+    }
+    for (table, columns) in official_columns() {
+        for (column, _) in columns {
+            expected.add_column(table, column);
+        }
+    }
+    expected
+}
+
+/// Whether `scope` would change nothing in the catalog, in one read. A
+/// database that lacks a table or column the read names is not current.
+async fn catalog_current(pool: &PgPool, scope: Initialization) -> Result<bool> {
+    let read = scope
+        .expected()
+        .bind(sqlx::query_as::<_, (bool,)>(AssertSqlSafe(format!(
+            "SELECT {}",
+            scope.sql_current()
+        ))))
+        .fetch_one(pool)
+        .await;
+    match read {
+        Ok((current,)) => Ok(current),
+        // undefined_table, undefined_column
+        Err(sqlx::Error::Database(error))
+            if matches!(error.code().as_deref(), Some("42P01" | "42703")) =>
+        {
+            Ok(false)
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Bring the catalog up to `scope`. A catalog that is already there costs one
+/// read and runs no DDL, so a role that reads and writes it without owning it
+/// can open it. Otherwise one transaction creates and alters only what the
+/// catalog lacks, and a failed one changes nothing. As in official DuckLake,
+/// two initializations racing to create or upgrade a catalog may fail one of
+/// them; a retry finds the catalog current.
+///
+/// Official migrates from the `version` a catalog stores, and only when
+/// attached with `AUTOMATIC_MIGRATION`. This writer's catalogs store no version
+/// (#372), so their schema is checked instead.
+async fn initialize(pool: &PgPool, scope: Initialization) -> Result<()> {
+    if catalog_current(pool, scope).await? {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    if scope == Initialization::Open && !relation_exists(&mut tx, "ducklake_snapshot").await? {
+        return Ok(());
+    }
+    create_missing_tables(&mut tx).await?;
+    if scope == Initialization::Create {
+        let function: bool =
+            sqlx::query_scalar("SELECT to_regprocedure('ducklake_next_file_id()') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if !function {
+            sqlx::query(SQL_CREATE_NEXT_FILE_ID)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for (table, _, columns) in POSITIONAL_TABLES {
+            if !relation_exists(&mut tx, table).await? {
+                sqlx::query(AssertSqlSafe(format!("CREATE TABLE {table} ({columns})")))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        // A catalog created elsewhere may have `changes_made` NOT NULL, but the
+        // row is seeded NULL and filled in at commit.
+        let changes_not_null: bool = sqlx::query_scalar(
+            "SELECT attnotnull FROM pg_attribute
+             WHERE attrelid = to_regclass('ducklake_snapshot_changes')
+               AND attname = 'changes_made'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if changes_not_null {
+            sqlx::query(
+                "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    add_official_columns(&mut tx).await?;
+    // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
+    // they are reserved inside a transaction from these counters.
+    for (key, max_sql) in scope.counters() {
+        seed_counter(&mut tx, key, max_sql).await?;
+    }
+    if scope == Initialization::Create {
+        crate::metadata_writer_postgres::migrate_directory_paths(&mut tx).await?;
+        sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+            .execute(&mut *tx)
+            .await?;
+        // A catalog this writer created before it kept the id watermarks has
+        // none; raise the head's past every id in use.
+        raise_head_watermarks(&mut tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
+}
+
+async fn relation_exists(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(name)
+        .fetch_one(conn)
+        .await?)
 }
 
 /// Run each of [`SQL_CREATE_TABLES`] whose table or index the catalog lacks. A
 /// role that reads and writes the catalog without owning it may not run a
-/// `CREATE`, even one `IF NOT EXISTS` skips, so a current catalog runs none.
-async fn create_missing_tables(pool: &PgPool) -> Result<()> {
+/// `CREATE`, even one `IF NOT EXISTS` skips, so a current catalog runs none. An
+/// invalid index, which an interrupted `CREATE INDEX CONCURRENTLY` leaves, is
+/// dropped and built again.
+async fn create_missing_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
     for ddl in SQL_CREATE_TABLES {
-        let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(created_name(ddl))
-            .fetch_one(pool)
-            .await?;
-        if !present {
-            sqlx::query(*ddl).execute(pool).await?;
+        let name = created_name(ddl);
+        let invalid: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_index
+                            WHERE indexrelid = to_regclass($1) AND NOT indisvalid)",
+        )
+        .bind(name)
+        .fetch_one(&mut *conn)
+        .await?;
+        if invalid {
+            sqlx::query(AssertSqlSafe(format!("DROP INDEX {name}")))
+                .execute(&mut *conn)
+                .await?;
+        }
+        if invalid || !relation_exists(conn, name).await? {
+            sqlx::query(*ddl).execute(&mut *conn).await?;
         }
     }
     Ok(())
 }
 
-/// Add the columns a catalog an earlier release created lacks: the snapshot id
-/// watermarks, each of [`POSITIONAL_TABLES`]' columns, and those of earlier
-/// spec versions, last, as a release before 0.10, which names the columns it
-/// writes, still writes the table. Only a missing column
-/// is altered in, since `ADD COLUMN IF NOT EXISTS` takes the table's
-/// `ACCESS EXCLUSIVE` lock even when it adds nothing.
-async fn add_official_columns(pool: &PgPool) -> Result<()> {
+/// The columns a catalog an earlier release created may lack, by table: the
+/// snapshot id watermarks, each of [`POSITIONAL_TABLES`]' columns, and those of
+/// earlier spec versions, last, as a release before 0.10, which names the
+/// columns it writes, still writes the table. Each with its definition.
+fn official_columns() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
     let watermarks =
         [("next_catalog_id", "next_catalog_id BIGINT"), ("next_file_id", "next_file_id BIGINT")];
     let earlier = [
@@ -725,7 +941,7 @@ async fn add_official_columns(pool: &PgPool) -> Result<()> {
         ),
         ("ducklake_snapshot", watermarks.to_vec()),
     ];
-    let tables = earlier
+    earlier
         .into_iter()
         .chain(POSITIONAL_TABLES.iter().map(|(table, id, columns)| {
             // Every catalog has its id column, and adding an identity column
@@ -736,14 +952,21 @@ async fn add_official_columns(pool: &PgPool) -> Result<()> {
                 .map(|(name, definition, _)| (name, definition))
                 .collect::<Vec<_>>();
             (*table, missing)
-        }));
-    for (table, columns) in tables {
+        }))
+        .collect()
+}
+
+/// Add each of [`official_columns`] the catalog lacks. Only a missing column
+/// is altered in, since `ADD COLUMN IF NOT EXISTS` takes the table's
+/// `ACCESS EXCLUSIVE` lock even when it adds nothing.
+async fn add_official_columns(conn: &mut sqlx::PgConnection) -> Result<()> {
+    for (table, columns) in official_columns() {
         let current: Vec<String> = sqlx::query_scalar(
             "SELECT attname::text FROM pg_attribute
              WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped",
         )
         .bind(table)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         // `initialize_schema` creates a table a catalog lacks whole.
         if current.is_empty() {
@@ -754,7 +977,7 @@ async fn add_official_columns(pool: &PgPool) -> Result<()> {
                 sqlx::query(AssertSqlSafe(format!(
                     "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {definition}"
                 )))
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
             }
         }
@@ -965,8 +1188,15 @@ async fn grants(
 
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
 /// catalog keeps allocating without reuse. `WHERE NOT EXISTS` makes a re-open a no-op.
-async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result<()> {
-    let start: i64 = sqlx::query(max_sql).fetch_one(pool).await?.try_get(0)?;
+async fn seed_counter(
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+    max_sql: &'static str,
+) -> Result<()> {
+    let start: i64 = sqlx::query(max_sql)
+        .fetch_one(&mut *conn)
+        .await?
+        .try_get(0)?;
     sqlx::query(
         "INSERT INTO ducklake_metadata (key, value, scope)
          SELECT $1, $2, NULL
@@ -976,7 +1206,7 @@ async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result
     )
     .bind(key)
     .bind(start.to_string())
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
@@ -3193,72 +3423,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        self.block_on(async {
-            // sqlx runs each query() as a single prepared statement, so create each
-            // table separately (see SQL_CREATE_TABLES).
-            for ddl in SQL_CREATE_TABLES {
-                sqlx::query(*ddl).execute(&self.pool).await?;
-            }
-            let function: bool =
-                sqlx::query_scalar("SELECT to_regprocedure('ducklake_next_file_id()') IS NOT NULL")
-                    .fetch_one(&self.pool)
-                    .await?;
-            if !function {
-                sqlx::query(SQL_CREATE_NEXT_FILE_ID)
-                    .execute(&self.pool)
-                    .await?;
-            }
-            for (table, _, columns) in POSITIONAL_TABLES {
-                sqlx::query(AssertSqlSafe(format!(
-                    "CREATE TABLE IF NOT EXISTS {table} ({columns})"
-                )))
-                .execute(&self.pool)
-                .await?;
-            }
-            // A catalog created elsewhere may have `changes_made` NOT NULL, but the
-            // row is seeded NULL and filled in at commit.
-            let changes_not_null: bool = sqlx::query_scalar(
-                "SELECT attnotnull FROM pg_attribute
-                 WHERE attrelid = to_regclass('ducklake_snapshot_changes')
-                   AND attname = 'changes_made'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if changes_not_null {
-                sqlx::query(
-                    "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
-                )
-                .execute(&self.pool)
-                .await?;
-            }
-            add_official_columns(&self.pool).await?;
-            // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
-            // they are reserved inside a transaction from these counters.
-            seed_counter(
-                &self.pool,
-                "next_column_id",
-                "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column",
-            )
-            .await?;
-            seed_counter(
-                &self.pool,
-                "next_snapshot_id",
-                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
-            )
-            .await?;
-            seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-            seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID).await?;
-            crate::metadata_writer_postgres::migrate_directory_paths(&self.pool).await?;
-            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
-                .execute(&self.pool)
-                .await?;
-            // A catalog this writer created before it kept the id watermarks has
-            // none; raise the head's past every id in use.
-            let mut tx = self.pool.begin().await?;
-            raise_head_watermarks(&mut tx).await?;
-            tx.commit().await?;
-            Ok(())
-        })
+        self.block_on(initialize(&self.pool, Initialization::Create))
     }
 
     fn begin_write_transaction(

@@ -271,8 +271,20 @@ async fn ensure_postgres_physical_indexes(
     Ok(())
 }
 
-/// Each standard DuckLake table as a separate CREATE TABLE IF NOT EXISTS.
-/// sqlx executes each `query()` as a single statement, so we split.
+/// The standard DuckLake tables, one statement each, so that
+/// [`ExpectedSchema::from_ddl`] reads what each creates. A statement that would
+/// change an existing table checks the system catalogs first: `ALTER TABLE`
+/// takes an `ACCESS EXCLUSIVE` lock and `CREATE INDEX` a `SHARE` lock before
+/// finding there is nothing to do, and initialization applies every statement
+/// in one transaction, which holds each lock it takes until it commits.
+/// `CREATE TABLE IF NOT EXISTS` takes no lock on a table that exists.
+///
+/// Each index guard first drops an invalid index of its name: a `CREATE INDEX
+/// CONCURRENTLY` that is interrupted leaves one behind, which `CREATE INDEX IF
+/// NOT EXISTS` would skip forever — paying the maintenance cost on every write
+/// with none of the read benefit, and failing the check that lets a current
+/// store skip initialization. Dropping it makes an interrupted concurrent build
+/// self-healing on the next initialization.
 pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
@@ -364,7 +376,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     )"#,
     // File ownership is NOT stored here: a reference to another catalog's file is
     // recorded in
-    // `ducklake_catalog_data_file_reference` instead. See migrate_file_ownership.
+    // `ducklake_catalog_data_file_reference` instead. See copy_legacy_file_ownership.
     r#"CREATE TABLE IF NOT EXISTS ducklake_data_file (
         data_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         table_id BIGINT NOT NULL,
@@ -430,26 +442,20 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // can be compressed but never moved out of line, so a wide pair would exceed
     // the btree tuple limit and fail the INSERT — turning a read optimisation into
     // a write outage.
-    //
-    // The guard runs first because a `CREATE INDEX CONCURRENTLY` that is interrupted
-    // leaves an invalid index behind, and `CREATE INDEX IF NOT EXISTS` then skips it
-    // forever — paying the maintenance cost on every write with none of the read
-    // benefit, and silently. Dropping the invalid one makes an interrupted
-    // concurrent build self-healing on the next initialization.
     r#"DO $$
         BEGIN
-            IF EXISTS (
-                SELECT 1 FROM pg_index i
-                JOIN pg_class c ON c.oid = i.indexrelid
-                WHERE c.relname = 'idx_file_column_stats_table_file_column'
-                  AND NOT i.indisvalid
-            ) THEN
-                DROP INDEX IF EXISTS idx_file_column_stats_table_file_column;
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_file_column_stats_table_file_column')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_file_column_stats_table_file_column;
             END IF;
-        END $$"#,
-    r#"CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_file_column
-        ON ducklake_file_column_stats (table_id, data_file_id, column_id)
-        INCLUDE (column_size_bytes)"#,
+            IF to_regclass('idx_file_column_stats_table_file_column') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_file_column
+                    ON ducklake_file_column_stats (table_id, data_file_id, column_id)
+                    INCLUDE (column_size_bytes);
+            END IF;
+        END
+    $$"#,
     // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
     r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
         table_id BIGINT NOT NULL,
@@ -477,15 +483,35 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         -- and leaves it NULL; readers use it to window cumulative files by row.
         partial_max BIGINT
     )"#,
-    // Idempotent guard: an existing single-catalog Postgres catalog populated by
-    // another tool may not have schema_version on ducklake_snapshot.
-    r#"ALTER TABLE ducklake_snapshot
-        ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 0"#,
-    // Idempotent guard: an existing store may predate the v1.0 partial-file
-    // marker. NULL means "not a partial file", correct for every pre-compaction
-    // file.
-    r#"ALTER TABLE ducklake_data_file
-        ADD COLUMN IF NOT EXISTS partial_max BIGINT"#,
+    // An existing single-catalog Postgres catalog populated by another tool may
+    // not have schema_version on ducklake_snapshot.
+    r#"DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'ducklake_snapshot'::regclass
+                  AND attname = 'schema_version'
+                  AND NOT attisdropped
+            ) THEN
+                ALTER TABLE ducklake_snapshot
+                ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 0;
+            END IF;
+        END
+    $$"#,
+    // An existing store may predate the v1.0 partial-file marker. NULL means
+    // "not a partial file", correct for every pre-compaction file.
+    r#"DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'ducklake_data_file'::regclass
+                  AND attname = 'partial_max'
+                  AND NOT attisdropped
+            ) THEN
+                ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT;
+            END IF;
+        END
+    $$"#,
     // A store from v0.5.0 and earlier has no `ducklake_delete_file.partial_max`.
     // The system catalogs are checked first: a bare `ADD COLUMN IF NOT EXISTS`
     // takes an `ACCESS EXCLUSIVE` lock even when the column exists. The `ALTER`
@@ -503,10 +529,20 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
             END IF;
         END
     $$"#,
-    // Idempotent guard: an existing store may predate partitioning support.
-    // NULL means "not partitioned", correct for every pre-partitioning file.
-    r#"ALTER TABLE ducklake_data_file
-        ADD COLUMN IF NOT EXISTS partition_id BIGINT"#,
+    // An existing store may predate partitioning support. NULL means "not
+    // partitioned", correct for every pre-partitioning file.
+    r#"DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'ducklake_data_file'::regclass
+                  AND attname = 'partition_id'
+                  AND NOT attisdropped
+            ) THEN
+                ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT;
+            END IF;
+        END
+    $$"#,
     // Per-snapshot change ledger (DuckLake spec).
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
         snapshot_id BIGINT PRIMARY KEY,
@@ -515,8 +551,18 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         commit_message VARCHAR,
         commit_extra_info VARCHAR
     )"#,
-    r#"ALTER TABLE ducklake_snapshot_changes
-        ALTER COLUMN changes_made DROP NOT NULL"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'ducklake_snapshot_changes'::regclass
+                  AND attname = 'changes_made'
+                  AND attnotnull
+            ) THEN
+                ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL;
+            END IF;
+        END
+    $$"#,
     // Partition spec generations (DuckLake spec); end_snapshot NULL == active.
     // partition_id is IDENTITY so set_partition_spec allocates it via RETURNING
     // (like the other ids on the multicatalog path). No catalog_id needed —
@@ -554,8 +600,19 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // Both columns are fixed-width, deliberately — `partition_value`
     // is unbounded text, and indexing it would put a value's length between a
     // partitioned INSERT and success.
-    r#"CREATE INDEX IF NOT EXISTS idx_file_partition_value_table_key
-        ON ducklake_file_partition_value (table_id, partition_key_index)"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_file_partition_value_table_key')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_file_partition_value_table_key;
+            END IF;
+            IF to_regclass('idx_file_partition_value_table_key') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_file_partition_value_table_key
+                    ON ducklake_file_partition_value (table_id, partition_key_index);
+            END IF;
+        END
+    $$"#,
     // Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id
     // is IDENTITY so set_sort_spec allocates it via RETURNING (like partition_id).
     r#"CREATE TABLE IF NOT EXISTS ducklake_sort_info (
@@ -666,8 +723,19 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
         schedule_start TIMESTAMPTZ DEFAULT NOW(),
         scheduled_by_owner BOOLEAN
     )"#,
-    r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
-        ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_scheduled_for_deletion_catalog')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_scheduled_for_deletion_catalog;
+            END IF;
+            IF to_regclass('idx_scheduled_for_deletion_catalog') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
+                    ON ducklake_files_scheduled_for_deletion(catalog_id);
+            END IF;
+        END
+    $$"#,
     // File ownership, kept out of the file tables. A row here marks a
     // `ducklake_data_file` / `ducklake_delete_file` row as a *reference* to a file
     // that `owner_catalog_id` owns, which a database fork registers instead of
@@ -689,50 +757,110 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
         data_path VARCHAR PRIMARY KEY,
         dropped_at TIMESTAMPTZ DEFAULT NOW()
     )"#,
-    r#"CREATE INDEX IF NOT EXISTS idx_catalog_snapshot_map_snapshot
-        ON ducklake_catalog_snapshot_map(snapshot_id)"#,
-    r#"CREATE INDEX IF NOT EXISTS idx_catalog_schema_map_schema
-        ON ducklake_catalog_schema_map(schema_id)"#,
-    r#"CREATE INDEX IF NOT EXISTS idx_schema_versions_table
-        ON ducklake_schema_versions(table_id, begin_snapshot)"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_catalog_snapshot_map_snapshot')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_catalog_snapshot_map_snapshot;
+            END IF;
+            IF to_regclass('idx_catalog_snapshot_map_snapshot') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_catalog_snapshot_map_snapshot
+                    ON ducklake_catalog_snapshot_map(snapshot_id);
+            END IF;
+        END
+    $$"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_catalog_schema_map_schema')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_catalog_schema_map_schema;
+            END IF;
+            IF to_regclass('idx_catalog_schema_map_schema') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_catalog_schema_map_schema
+                    ON ducklake_catalog_schema_map(schema_id);
+            END IF;
+        END
+    $$"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_schema_versions_table')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_schema_versions_table;
+            END IF;
+            IF to_regclass('idx_schema_versions_table') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_schema_versions_table
+                    ON ducklake_schema_versions(table_id, begin_snapshot);
+            END IF;
+        END
+    $$"#,
     // Belt-and-suspenders: app-level lock_catalog should already prevent
     // duplicates, but a partial unique index catches anyone bypassing the
     // writer (manual SQL, external migrations).
-    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_active_table_per_schema
-        ON ducklake_table(schema_id, table_name) WHERE end_snapshot IS NULL"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_active_table_per_schema')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_active_table_per_schema;
+            END IF;
+            IF to_regclass('idx_active_table_per_schema') IS NULL THEN
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_active_table_per_schema
+                    ON ducklake_table(schema_id, table_name)
+                    WHERE end_snapshot IS NULL;
+            END IF;
+        END
+    $$"#,
     // At most one *live* version per field-id (design §4.1, reviews #2/#3). The
     // promote's retire-then-insert (end the old row, then insert the new live row,
     // in one txn) keeps this satisfied at every commit boundary.
-    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_ducklake_column_live
-        ON ducklake_column(table_id, column_id) WHERE end_snapshot IS NULL"#,
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_ducklake_column_live')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_ducklake_column_live;
+            END IF;
+            IF to_regclass('idx_ducklake_column_live') IS NULL THEN
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ducklake_column_live
+                    ON ducklake_column(table_id, column_id)
+                    WHERE end_snapshot IS NULL;
+            END IF;
+        END
+    $$"#,
 ];
 
-/// Run a slice of DDL statements against the pool. Each statement executes independently.
-pub(crate) async fn execute_ddl_statements(
-    pool: &PgPool,
-    statements: &[&'static str],
-) -> Result<()> {
-    for stmt in statements {
-        sqlx::query(*stmt).execute(pool).await?;
-    }
-    Ok(())
-}
-
-/// Upgrade an existing multicatalog store's `ducklake_column` from the legacy
-/// single-row `column_id` PRIMARY KEY to the composite
-/// `(table_id, column_id, begin_snapshot)` PK, so a versioned / type-promoted
-/// column can have a second row sharing its `column_id`. `CREATE TABLE IF NOT
-/// EXISTS` only shapes fresh stores; Postgres can `ALTER` a PK in place (unlike
-/// SQLite). Idempotent (only acts when the current PK is the single-column one;
-/// a no-op once composite) and lossless. The `IDENTITY` on `column_id` (the
-/// allocator's sequence) is independent of the PK and survives the swap. The
-/// partial unique index is created idempotently by `SQL_CREATE_STANDARD_TABLES`.
-pub(crate) async fn migrate_ducklake_column_to_composite_pk(pool: &PgPool) -> Result<()> {
-    sqlx::query(
-        r#"DO $$
+/// Brings a store that earlier releases created to the multicatalog layout.
+/// Runs after [`SQL_CREATE_STANDARD_TABLES`] and [`SQL_CREATE_MULTICATALOG_TABLES`].
+const SQL_UPGRADE_MULTICATALOG_TABLES: &[&str] = &[
+    // Default metadata for a catalog created before those DuckLake columns were
+    // supported. The fields are nullable, so existing column versions retain the
+    // specified absence of a default.
+    r#"DO $$
+        BEGIN
+            IF (SELECT count(*) FROM pg_attribute
+                WHERE attrelid = 'ducklake_column'::regclass
+                  AND attname IN ('initial_default', 'default_value',
+                                  'default_value_type', 'default_value_dialect')
+                  AND NOT attisdropped) < 4 THEN
+                ALTER TABLE ducklake_column
+                ADD COLUMN IF NOT EXISTS initial_default VARCHAR,
+                ADD COLUMN IF NOT EXISTS default_value VARCHAR,
+                ADD COLUMN IF NOT EXISTS default_value_type VARCHAR,
+                ADD COLUMN IF NOT EXISTS default_value_dialect VARCHAR;
+            END IF;
+        END
+    $$"#,
+    // Replace the legacy single-row `column_id` PRIMARY KEY of `ducklake_column`
+    // with the composite `(table_id, column_id, begin_snapshot)` PK, so a
+    // versioned / type-promoted column can have a second row sharing its
+    // `column_id`. Lossless; the `IDENTITY` on `column_id` (the allocator's
+    // sequence) is independent of the PK and survives the swap.
+    r#"DO $$
         DECLARE pk_name text;
         BEGIN
-            -- Find the PRIMARY KEY iff it is a single-column PK (the legacy shape).
             SELECT conname INTO pk_name
             FROM pg_constraint
             WHERE conrelid = 'ducklake_column'::regclass
@@ -742,31 +870,247 @@ pub(crate) async fn migrate_ducklake_column_to_composite_pk(pool: &PgPool) -> Re
                 EXECUTE 'ALTER TABLE ducklake_column DROP CONSTRAINT ' || quote_ident(pk_name);
                 EXECUTE 'ALTER TABLE ducklake_column ADD PRIMARY KEY (table_id, column_id, begin_snapshot)';
             END IF;
-        END $$;"#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
+        END $$"#,
+    // `scheduled_by_owner` lives on this layout's own scheduling table, which has
+    // carried layout-specific columns since it gained `catalog_id`.
+    r#"DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'ducklake_files_scheduled_for_deletion'::regclass
+                  AND attname = 'scheduled_by_owner'
+                  AND NOT attisdropped
+            ) THEN
+                ALTER TABLE ducklake_files_scheduled_for_deletion
+                ADD COLUMN IF NOT EXISTS scheduled_by_owner BOOLEAN;
+            END IF;
+        END
+    $$"#,
+    // Indexes from before v0.8.0, when an absolute path was read as a reference.
+    // `DROP INDEX IF EXISTS` takes no lock when the index is absent.
+    "DROP INDEX IF EXISTS idx_data_file_absolute_path",
+    "DROP INDEX IF EXISTS idx_delete_file_absolute_path",
+];
+
+/// What [`SQL_UPGRADE_MULTICATALOG_TABLES`] changes besides columns, as a SQL
+/// boolean over the system catalogs that holds once it has run.
+const SQL_MULTICATALOG_SHAPE_CURRENT: &str = "NOT EXISTS (
+         SELECT 1 FROM pg_constraint
+         WHERE conrelid = to_regclass('ducklake_column') AND contype = 'p'
+           AND array_length(conkey, 1) = 1)
+     AND NOT EXISTS (
+         SELECT 1 FROM pg_attribute
+         WHERE attrelid = to_regclass('ducklake_snapshot_changes')
+           AND attname = 'changes_made' AND attnotnull)
+     AND to_regclass('idx_data_file_absolute_path') IS NULL
+     AND to_regclass('idx_delete_file_absolute_path') IS NULL";
+
+/// The relations and columns a layout's initialization guarantees, read from
+/// its DDL so that a check of a store stays in step with what initialization
+/// would change.
+#[derive(Debug, Default)]
+pub(crate) struct ExpectedSchema {
+    /// Each table and index the DDL creates.
+    relations: Vec<String>,
+    /// Each column the DDL adds to an existing table, as parallel
+    /// `(table, column)` lists. `CREATE TABLE IF NOT EXISTS` adds no column to
+    /// a table that exists, so only an `ADD COLUMN` counts.
+    tables: Vec<String>,
+    columns: Vec<String>,
 }
 
-/// Add default metadata to a catalog created before those DuckLake columns were
-/// supported. The fields are nullable, so existing column versions retain the
-/// specified absence of a default.
-pub(crate) async fn migrate_column_default_metadata(pool: &PgPool) -> Result<()> {
-    sqlx::query(
-        "ALTER TABLE ducklake_column
-         ADD COLUMN IF NOT EXISTS initial_default VARCHAR,
-         ADD COLUMN IF NOT EXISTS default_value VARCHAR,
-         ADD COLUMN IF NOT EXISTS default_value_type VARCHAR,
-         ADD COLUMN IF NOT EXISTS default_value_dialect VARCHAR",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
+impl ExpectedSchema {
+    /// Read the relations each `CREATE ... IF NOT EXISTS` of `ddl` creates and
+    /// the columns each `ALTER TABLE ... ADD [COLUMN]` adds, also inside a `DO`
+    /// block.
+    pub(crate) fn from_ddl<'a>(ddl: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut expected = Self::default();
+        for statement in ddl {
+            let tokens = statement
+                .split_whitespace()
+                .map(|token| token.trim_end_matches([',', ';']))
+                .collect::<Vec<_>>();
+            let mut table = None;
+            for (i, token) in tokens.iter().enumerate() {
+                let rest = &tokens[i + 1..];
+                match *token {
+                    "CREATE" => {
+                        let rest = rest.strip_prefix(&["UNIQUE"]).unwrap_or(rest);
+                        if let ["TABLE" | "INDEX", "IF", "NOT", "EXISTS", name, ..] = rest {
+                            expected.add_relation(name.trim_end_matches('('));
+                        }
+                    },
+                    "ALTER" if rest.first() == Some(&"TABLE") => table = rest.get(1).copied(),
+                    "ADD" => {
+                        let rest = rest.strip_prefix(&["COLUMN"]).unwrap_or(rest);
+                        let rest = rest.strip_prefix(&["IF", "NOT", "EXISTS"]).unwrap_or(rest);
+                        let constraint = matches!(
+                            rest.first(),
+                            Some(
+                                &("PRIMARY"
+                                    | "CONSTRAINT"
+                                    | "UNIQUE"
+                                    | "CHECK"
+                                    | "FOREIGN"
+                                    | "EXCLUDE")
+                            )
+                        );
+                        if let (Some(table), Some(column), false) =
+                            (table, rest.first(), constraint)
+                        {
+                            expected.add_column(table, column);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+        expected
+    }
+
+    pub(crate) fn add_relation(&mut self, name: &str) {
+        self.relations.push(name.to_string());
+    }
+
+    pub(crate) fn add_column(&mut self, table: &str, column: &str) {
+        self.tables.push(table.to_string());
+        self.columns.push(column.to_string());
+    }
+
+    /// A SQL boolean over the system catalogs: every relation exists, every
+    /// index among them is valid, and every column exists on its table where
+    /// the table does. Binds `$1`, `$2` and `$3`, which [`Self::bind`] supplies.
+    pub(crate) const SQL_PRESENT: &str = "NOT EXISTS (
+             SELECT 1 FROM unnest($1::text[]) AS expected(name)
+             WHERE to_regclass(expected.name) IS NULL
+                OR EXISTS (SELECT 1 FROM pg_index
+                           WHERE indexrelid = to_regclass(expected.name) AND NOT indisvalid))
+         AND NOT EXISTS (
+             SELECT 1 FROM unnest($2::text[], $3::text[]) AS expected(tbl, col)
+             WHERE to_regclass(expected.tbl) IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM pg_attribute
+                               WHERE attrelid = to_regclass(expected.tbl)
+                                 AND attname = expected.col
+                                 AND attnum > 0 AND NOT attisdropped))";
+
+    /// Bind the arguments of [`Self::SQL_PRESENT`].
+    pub(crate) fn bind<'q, O>(
+        &self,
+        query: sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments> {
+        query
+            .bind(self.relations.clone())
+            .bind(self.tables.clone())
+            .bind(self.columns.clone())
+    }
 }
 
-/// Bring a store's file-ownership records to the current shape. Idempotent, and
-/// runs on every boot.
+/// Every statement the multicatalog layout's initialization applies, in order.
+fn multicatalog_ddl() -> impl Iterator<Item = &'static str> {
+    SQL_CREATE_STANDARD_TABLES
+        .iter()
+        .chain(SQL_CREATE_MULTICATALOG_TABLES)
+        .chain(SQL_UPGRADE_MULTICATALOG_TABLES)
+        .copied()
+}
+
+static MULTICATALOG_SCHEMA: std::sync::LazyLock<ExpectedSchema> =
+    std::sync::LazyLock::new(|| ExpectedSchema::from_ddl(multicatalog_ddl()));
+
+/// Whether the store has every relation, column and shape of the multicatalog
+/// layout, read from the system catalogs alone.
+fn sql_multicatalog_schema_current() -> String {
+    format!(
+        "({present}) AND ({SQL_MULTICATALOG_SHAPE_CURRENT})",
+        present = ExpectedSchema::SQL_PRESENT
+    )
+}
+
+/// One read of a multicatalog store: whether its schema is current, and which
+/// of the data migrations that do not change it apply.
+#[derive(Debug, Default)]
+struct MulticatalogState {
+    schema_current: bool,
+    legacy: LegacyOwnerColumns,
+    legacy_boolean_settings: bool,
+}
+
+async fn multicatalog_state(pool: &PgPool) -> Result<MulticatalogState> {
+    let sql = format!(
+        "SELECT {schema},
+                EXISTS (SELECT 1 FROM pg_attribute
+                        WHERE attrelid = to_regclass('ducklake_data_file')
+                          AND attname = 'owner_catalog_id' AND NOT attisdropped),
+                EXISTS (SELECT 1 FROM pg_attribute
+                        WHERE attrelid = to_regclass('ducklake_delete_file')
+                          AND attname = 'owner_catalog_id' AND NOT attisdropped),
+                EXISTS (SELECT 1 FROM ducklake_metadata
+                        WHERE key IN ('sort_on_insert', 'hive_file_pattern')
+                          AND LOWER(value) = 'true' AND value <> 'true')",
+        schema = sql_multicatalog_schema_current(),
+    );
+    let read = MULTICATALOG_SCHEMA
+        .bind(sqlx::query_as::<_, (bool, bool, bool, bool)>(
+            AssertSqlSafe(sql),
+        ))
+        .fetch_one(pool)
+        .await;
+    match read {
+        Ok((schema_current, data_file, delete_file, legacy_boolean_settings)) => {
+            Ok(MulticatalogState {
+                schema_current,
+                legacy: LegacyOwnerColumns {
+                    data_file,
+                    delete_file,
+                },
+                legacy_boolean_settings,
+            })
+        },
+        // A store without `ducklake_metadata` is not initialized.
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+            Ok(MulticatalogState::default())
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Bring a store to the multicatalog layout: its tables, columns and indexes,
+/// and the data migrations of earlier releases. Idempotent.
+///
+/// A current store costs one read and runs no DDL, so it waits behind no
+/// writer. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an `ACCESS
+/// EXCLUSIVE` lock and `CREATE INDEX IF NOT EXISTS` a `SHARE` lock before they
+/// find there is nothing to do, so the DDL is sent only when the read finds the
+/// schema behind. It is then sent in one round trip, in one transaction, so a
+/// failed one changes nothing. As in official DuckLake, two initializations
+/// racing to create or upgrade a store may fail one of them; a retry finds the
+/// store current.
+///
+/// Official migrates from the `version` a catalog stores, and only when
+/// attached with `AUTOMATIC_MIGRATION`. This layout is not a DuckLake format
+/// and stores no version (#374), so its schema is checked instead.
+pub(crate) async fn initialize_multicatalog_layout(pool: &PgPool) -> Result<()> {
+    let mut state = multicatalog_state(pool).await?;
+    if !state.schema_current {
+        let batch = multicatalog_ddl().collect::<Vec<_>>().join(";\n");
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(AssertSqlSafe(batch))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        state = multicatalog_state(pool).await?;
+    }
+    if state.legacy_boolean_settings {
+        sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+            .execute(pool)
+            .await?;
+    }
+    copy_legacy_file_ownership(pool, state.legacy).await
+}
+
+/// Copy the references a v0.8.0 store records in its `owner_catalog_id`
+/// columns into the reference tables. Runs on every initialization of such a
+/// store.
 ///
 /// Ownership lives in `ducklake_catalog_data_file_reference` and
 /// `ducklake_catalog_delete_file_reference`, which `SQL_CREATE_MULTICATALOG_TABLES`
@@ -777,36 +1121,15 @@ pub(crate) async fn migrate_column_default_metadata(pool: &PgPool) -> Result<()>
 /// v0.8.0 stays safe:
 ///
 /// - the reference rows in it are copied into the reference tables here, on every
-///   boot, which also picks up a reference a v0.8.0 process registered since;
+///   initialization, which also picks up a reference a v0.8.0 process registered
+///   since;
 /// - [`legacy_owner_columns`] reports it, and every read of ownership also honours
 ///   it while it exists, and registration writes it too.
 ///
 /// A fresh store never gets the column. Nothing here adds it, and nothing here
 /// drops it: dropping it would let a rolled-back v0.8.0 read every reference as
 /// owned and delete a file another catalog reads.
-///
-/// Every schema change checks the system catalogs first, so on a current store
-/// this blocks no reader or writer of the file tables. A bare
-/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` would: it takes an `ACCESS EXCLUSIVE`
-/// lock before it finds that the column exists.
-pub(crate) async fn migrate_file_ownership(pool: &PgPool) -> Result<()> {
-    // `scheduled_by_owner` lives on this layout's own scheduling table, which has
-    // carried layout-specific columns since it gained `catalog_id`.
-    if !column_exists(
-        pool,
-        "ducklake_files_scheduled_for_deletion",
-        "scheduled_by_owner",
-    )
-    .await?
-    {
-        sqlx::query(
-            "ALTER TABLE ducklake_files_scheduled_for_deletion
-             ADD COLUMN IF NOT EXISTS scheduled_by_owner BOOLEAN",
-        )
-        .execute(pool)
-        .await?;
-    }
-    let legacy = legacy_owner_columns(&mut *pool.acquire().await?).await?;
+async fn copy_legacy_file_ownership(pool: &PgPool, legacy: LegacyOwnerColumns) -> Result<()> {
     // The v0.8.0 partial index `idx_*_file_owner_catalog` serves both copies.
     if legacy.data_file {
         sqlx::query(
@@ -827,14 +1150,6 @@ pub(crate) async fn migrate_file_ownership(pool: &PgPool) -> Result<()> {
         )
         .execute(pool)
         .await?;
-    }
-    // Indexes from before v0.8.0, when an absolute path was read as a reference.
-    // `DROP INDEX IF EXISTS` takes no lock when the index is absent.
-    for stmt in [
-        "DROP INDEX IF EXISTS idx_data_file_absolute_path",
-        "DROP INDEX IF EXISTS idx_delete_file_absolute_path",
-    ] {
-        sqlx::query(AssertSqlSafe(stmt)).execute(pool).await?;
     }
     Ok(())
 }
@@ -859,7 +1174,7 @@ where
 }
 
 /// Which file tables still carry the v0.8.0 `owner_catalog_id` column. See
-/// [`migrate_file_ownership`].
+/// [`copy_legacy_file_ownership`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LegacyOwnerColumns {
     pub(crate) data_file: bool,
@@ -988,25 +1303,23 @@ pub(crate) async fn utc_snapshot_time(conn: &mut sqlx::PgConnection) -> Result<(
 /// DuckLake readers expect. Idempotent. Used by the single-catalog writer; the
 /// multicatalog layout keeps its paths as given because its cleanup APIs match
 /// `data_path` strings exactly and DuckDB never reads that layout.
-pub(crate) async fn migrate_directory_paths(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await?;
+pub(crate) async fn migrate_directory_paths(conn: &mut sqlx::PgConnection) -> Result<()> {
     sqlx::query(
         "UPDATE ducklake_metadata SET value = value || '/'
          WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -8954,27 +9267,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        self.block_on(async {
-            execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
-            execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
-            migrate_column_default_metadata(&self.pool).await?;
-            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
-                .execute(&self.pool)
-                .await?;
-            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")
-                .execute(&self.pool)
-                .await?;
-            // Upgrade a pre-existing store's ducklake_column to the composite PK
-            // (legacy single-row column_id PK → versioned-capable). Idempotent.
-            migrate_ducklake_column_to_composite_pk(&self.pool).await?;
-            // Carry a v0.8.0 store's ownership column into the reference tables.
-            // Idempotent.
-            migrate_file_ownership(&self.pool).await?;
-            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
-                .execute(&self.pool)
-                .await?;
-            Ok(())
-        })
+        self.block_on(initialize_multicatalog_layout(&self.pool))
     }
 
     #[tracing::instrument(
@@ -9217,13 +9510,87 @@ async fn enforce_inline_partition_fence(
 
 #[cfg(test)]
 mod tests {
-    use super::{inlined_postgres_type, push_inlined_postgres_value};
+    use super::{
+        ExpectedSchema, inlined_postgres_type, multicatalog_ddl, push_inlined_postgres_value,
+    };
     use crate::metadata_writer::{ColumnDef, columns_differ};
     use arrow::array::types::IntervalMonthDayNano;
     use arrow::array::{Array, FixedSizeBinaryArray, IntervalMonthDayNanoArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, IntervalUnit};
     use sqlx::{Postgres, QueryBuilder};
     use std::sync::Arc;
+
+    /// The parser reads a relation created inside a `DO` block, a column added
+    /// with or without `COLUMN` and `IF NOT EXISTS`, and no constraint.
+    #[test]
+    fn expected_schema_reads_every_form_of_its_ddl() {
+        let expected = ExpectedSchema::from_ddl([
+            "CREATE TABLE IF NOT EXISTS t1 (a BIGINT, b VARCHAR)",
+            "DO $$ BEGIN IF to_regclass('i1') IS NULL THEN \
+             CREATE UNIQUE INDEX IF NOT EXISTS i1 ON t1(a); END IF; END $$",
+            "ALTER TABLE t1 ADD c BIGINT, ADD COLUMN d BIGINT, ADD IF NOT EXISTS e BIGINT",
+            "ALTER TABLE t2 ADD PRIMARY KEY (a), ADD CONSTRAINT k UNIQUE (b), \
+             ALTER COLUMN f DROP NOT NULL, ADD COLUMN IF NOT EXISTS g BIGINT",
+            "DROP INDEX IF EXISTS i2",
+        ]);
+        let columns = expected
+            .tables
+            .iter()
+            .zip(&expected.columns)
+            .map(|(table, column)| format!("{table}.{column}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(expected.relations, ["t1", "i1"]);
+        assert_eq!(columns, ["t1.c", "t1.d", "t1.e", "t2.g"]);
+    }
+
+    /// The check of a multicatalog store names every table and index its DDL
+    /// creates and every column it adds, also inside a `DO` block, and no
+    /// column it adds as a relation.
+    #[test]
+    fn multicatalog_expected_schema_follows_its_ddl() {
+        let expected = ExpectedSchema::from_ddl(multicatalog_ddl());
+        let columns = expected
+            .tables
+            .iter()
+            .zip(&expected.columns)
+            .map(|(table, column)| format!("{table}.{column}"))
+            .collect::<Vec<_>>();
+        let added = multicatalog_ddl()
+            .map(|statement| statement.matches("ADD COLUMN").count())
+            .sum::<usize>();
+
+        for relation in [
+            "ducklake_metadata",
+            "ducklake_catalog",
+            "ducklake_inlined_data_tables",
+            "idx_file_column_stats_table_file_column",
+            "idx_ducklake_column_live",
+        ] {
+            assert!(
+                expected.relations.iter().any(|r| r == relation),
+                "{relation}"
+            );
+        }
+        assert!(
+            expected
+                .relations
+                .iter()
+                .all(|relation| relation.starts_with("ducklake_") || relation.starts_with("idx_")),
+            "{:?}",
+            expected.relations
+        );
+        for column in [
+            "ducklake_metadata.scope_id",
+            "ducklake_catalog.data_path",
+            "ducklake_delete_file.partial_max",
+            "ducklake_column.default_value_dialect",
+            "ducklake_files_scheduled_for_deletion.scheduled_by_owner",
+        ] {
+            assert!(columns.iter().any(|c| c == column), "{column}");
+        }
+        assert_eq!(columns.len(), added, "{columns:?}");
+    }
 
     #[test]
     fn postgres_inlined_types_follow_ducklake_encodings() {
