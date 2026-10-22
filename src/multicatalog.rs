@@ -8,7 +8,7 @@ use crate::inlined_reclaim::dead_table_inlined_storage;
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_writer_postgres::{execute_ddl_statements, quote_ident};
+use crate::metadata_writer_postgres::quote_ident;
 use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
@@ -173,36 +173,12 @@ pub(crate) async fn drop_live_table(
     Ok(true)
 }
 
-/// Bootstrap standard + multicatalog tables. Idempotent.
+/// Bootstrap standard + multicatalog tables, and bring a store an earlier
+/// release created up to them. Idempotent. A store that is already current
+/// costs one read and takes no table lock; concurrent bootstraps of a new store
+/// apply one at a time.
 pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
-    execute_ddl_statements(
-        pool,
-        crate::metadata_writer_postgres::SQL_CREATE_STANDARD_TABLES,
-    )
-    .await?;
-    execute_ddl_statements(
-        pool,
-        crate::metadata_writer_postgres::SQL_CREATE_MULTICATALOG_TABLES,
-    )
-    .await?;
-    crate::metadata_writer_postgres::migrate_column_default_metadata(pool).await?;
-    // Upgrade a pre-existing store's ducklake_column from the legacy single-row
-    // column_id PK to the composite (table_id, column_id, begin_snapshot) PK so
-    // versioned / type-promoted columns work on catalogs created before this
-    // change. Idempotent (no-op once composite). This is the multicatalog
-    // bootstrap path — runtimedb and the multicatalog tests call it — so the
-    // migration MUST run here, not only in PostgresMetadataWriter::initialize_schema.
-    crate::metadata_writer_postgres::migrate_ducklake_column_to_composite_pk(pool).await?;
-    // Carry a v0.8.0 store's `owner_catalog_id` column into the reference tables.
-    // Idempotent; MUST run here for the same reason as the migration above — this
-    // is the bootstrap path callers actually use.
-    crate::metadata_writer_postgres::migrate_file_ownership(pool).await?;
-    // Rewrite a `sort_on_insert` or `hive_file_pattern` an earlier release
-    // stored as a case variant of `true`. Idempotent.
-    sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
-        .execute(pool)
-        .await?;
-    Ok(())
+    crate::metadata_writer_postgres::initialize_multicatalog_layout(pool).await
 }
 
 /// The owning catalog of each file object behind a table's file rows. See
