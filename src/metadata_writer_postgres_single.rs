@@ -44,8 +44,8 @@ use crate::metadata_writer_postgres::{
     apply_row_mutation_at_snapshot, check_staged_conflicts, commit_files_at_snapshot,
     commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
     detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict,
-    detect_row_mutation_conflicts, drop_empty_superseded_inlined_tables_in, lock_initialization,
-    quote_ident, set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
+    detect_row_mutation_conflicts, drop_empty_superseded_inlined_tables_in, quote_ident,
+    set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -805,17 +805,20 @@ async fn catalog_current(pool: &PgPool, scope: Initialization) -> Result<bool> {
 }
 
 /// Bring the catalog up to `scope`. A catalog that is already there costs one
-/// read and takes no table lock. Otherwise one transaction under
-/// [`crate::metadata_writer_postgres::INITIALIZATION_LOCK_KEY`] creates and
-/// alters only what the catalog lacks, so concurrent initializations apply one
-/// at a time, and a role that reads and writes a catalog without owning it runs
-/// no `CREATE`.
+/// read and runs no DDL, so a role that reads and writes it without owning it
+/// can open it. Otherwise one transaction creates and alters only what the
+/// catalog lacks, and a failed one changes nothing. As in official DuckLake,
+/// two initializations racing to create or upgrade a catalog may fail one of
+/// them; a retry finds the catalog current.
+///
+/// Official migrates from the `version` a catalog stores, and only when
+/// attached with `AUTOMATIC_MIGRATION`. This writer's catalogs store no version
+/// (#372), so their schema is checked instead.
 async fn initialize(pool: &PgPool, scope: Initialization) -> Result<()> {
     if catalog_current(pool, scope).await? {
         return Ok(());
     }
     let mut tx = pool.begin().await?;
-    lock_initialization(&mut tx).await?;
     if scope == Initialization::Open && !relation_exists(&mut tx, "ducklake_snapshot").await? {
         return Ok(());
     }

@@ -296,9 +296,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // limit's table and catalog scopes are read from on every table commit.
     // The system catalogs are checked first: a bare `ADD COLUMN IF NOT EXISTS`
     // takes an `ACCESS EXCLUSIVE` lock even when the column exists. The `ALTER`
-    // keeps `IF NOT EXISTS` for a release that initializes without the
-    // advisory lock and adds the column meanwhile: it waits for that one's
-    // lock, then skips.
+    // keeps `IF NOT EXISTS` for an initialization that passed the check while
+    // another added the column: it waits for that one's lock, then skips.
     r#"DO $$
         BEGIN
             IF NOT EXISTS (
@@ -516,9 +515,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // A store from v0.5.0 and earlier has no `ducklake_delete_file.partial_max`.
     // The system catalogs are checked first: a bare `ADD COLUMN IF NOT EXISTS`
     // takes an `ACCESS EXCLUSIVE` lock even when the column exists. The `ALTER`
-    // keeps `IF NOT EXISTS` for a release that initializes without the
-    // advisory lock and adds the column meanwhile: it waits for that one's
-    // lock, then skips.
+    // keeps `IF NOT EXISTS` for an initialization that passed the check while
+    // another added the column: it waits for that one's lock, then skips.
     r#"DO $$
         BEGIN
             IF NOT EXISTS (
@@ -907,21 +905,6 @@ const SQL_MULTICATALOG_SHAPE_CURRENT: &str = "NOT EXISTS (
      AND to_regclass('idx_data_file_absolute_path') IS NULL
      AND to_regclass('idx_delete_file_absolute_path') IS NULL";
 
-/// The key of the transaction-scoped advisory lock that every initialization
-/// changing a store holds, so concurrent initializations apply one at a time.
-pub(crate) const INITIALIZATION_LOCK_KEY: &str = "datafusion-ducklake.initialize";
-
-/// Take [`INITIALIZATION_LOCK_KEY`] until `tx` ends.
-pub(crate) async fn lock_initialization(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(INITIALIZATION_LOCK_KEY)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 /// The relations and columns a layout's initialization guarantees, read from
 /// its DDL so that a check of a store stays in step with what initialization
 /// would change.
@@ -1094,32 +1077,26 @@ async fn multicatalog_state(pool: &PgPool) -> Result<MulticatalogState> {
 /// Bring a store to the multicatalog layout: its tables, columns and indexes,
 /// and the data migrations of earlier releases. Idempotent.
 ///
-/// A current store costs one read and takes no table lock: `ALTER TABLE ...
-/// ADD COLUMN IF NOT EXISTS` takes an `ACCESS EXCLUSIVE` lock and `CREATE
-/// INDEX IF NOT EXISTS` a `SHARE` lock before they find there is nothing to
-/// do, so the DDL is sent only when the read finds the schema behind. It is
-/// then sent in one round trip, in one transaction under
-/// [`INITIALIZATION_LOCK_KEY`], so concurrent initializations of a new store
-/// apply one at a time and a failed one changes nothing.
+/// A current store costs one read and runs no DDL, so it waits behind no
+/// writer. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an `ACCESS
+/// EXCLUSIVE` lock and `CREATE INDEX IF NOT EXISTS` a `SHARE` lock before they
+/// find there is nothing to do, so the DDL is sent only when the read finds the
+/// schema behind. It is then sent in one round trip, in one transaction, so a
+/// failed one changes nothing. As in official DuckLake, two initializations
+/// racing to create or upgrade a store may fail one of them; a retry finds the
+/// store current.
+///
+/// Official migrates from the `version` a catalog stores, and only when
+/// attached with `AUTOMATIC_MIGRATION`. This layout is not a DuckLake format
+/// and stores no version (#374), so its schema is checked instead.
 pub(crate) async fn initialize_multicatalog_layout(pool: &PgPool) -> Result<()> {
     let mut state = multicatalog_state(pool).await?;
     if !state.schema_current {
+        let batch = multicatalog_ddl().collect::<Vec<_>>().join(";\n");
         let mut tx = pool.begin().await?;
-        lock_initialization(&mut tx).await?;
-        let current: bool = MULTICATALOG_SCHEMA
-            .bind(sqlx::query_as::<_, (bool,)>(AssertSqlSafe(format!(
-                "SELECT {}",
-                sql_multicatalog_schema_current()
-            ))))
-            .fetch_one(&mut *tx)
-            .await?
-            .0;
-        if !current {
-            let batch = multicatalog_ddl().collect::<Vec<_>>().join(";\n");
-            sqlx::raw_sql(AssertSqlSafe(batch))
-                .execute(&mut *tx)
-                .await?;
-        }
+        sqlx::raw_sql(AssertSqlSafe(batch))
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         state = multicatalog_state(pool).await?;
     }

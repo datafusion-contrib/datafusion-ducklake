@@ -175,8 +175,9 @@ pub(crate) async fn drop_live_table(
 
 /// Bootstrap standard + multicatalog tables, and bring a store an earlier
 /// release created up to them. Idempotent. A store that is already current
-/// costs one read and takes no table lock; concurrent bootstraps of a new store
-/// apply one at a time.
+/// costs one read and runs no DDL. As in official DuckLake, two bootstraps
+/// racing to create or upgrade a store may fail one of them; a retry finds it
+/// current.
 pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     crate::metadata_writer_postgres::initialize_multicatalog_layout(pool).await
 }

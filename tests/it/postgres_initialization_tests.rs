@@ -1,8 +1,8 @@
 #![cfg(feature = "write-postgres")]
 //! Initialization of both PostgreSQL layouts: a current store costs one
-//! statement and no table lock, a store missing what initialization
-//! guarantees gets it back, and concurrent initializations of a new store all
-//! succeed.
+//! statement and waits behind no writer, a store missing what initialization
+//! guarantees gets it back, and initializations racing on a new store leave
+//! every relation in place.
 
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::{PostgresSingleCatalogMetadataWriter, initialize_multicatalog_schema};
@@ -148,7 +148,7 @@ async fn initialize_single(pool: &PgPool) -> datafusion_ducklake::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn initializing_a_current_multicatalog_store_takes_no_table_lock() {
+async fn initializing_a_current_multicatalog_store_waits_behind_no_writer() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_multicatalog_schema(&pool).await.unwrap();
@@ -162,7 +162,7 @@ async fn initializing_a_current_multicatalog_store_takes_no_table_lock() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn initializing_a_current_single_catalog_takes_no_table_lock() {
+async fn initializing_a_current_single_catalog_waits_behind_no_writer() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_single(&pool).await.unwrap();
@@ -492,36 +492,62 @@ async fn a_role_without_ddl_privileges_initializes_a_current_store() {
     }
 }
 
+/// Initializations racing to create a new multicatalog store may fail some of
+/// them, as in official DuckLake, but at least one succeeds, the store ends
+/// with every relation a clean one has, and one more initialization succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn concurrent_initializations_of_a_new_multicatalog_store_succeed() {
+async fn concurrent_initializations_of_a_new_multicatalog_store_leave_it_whole() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let complete = relations(&pool).await;
     for round in 0..5 {
         reset(&pool).await;
         let results =
             futures::future::join_all((0..12).map(|_| initialize_multicatalog_schema(&pool))).await;
-        for result in results {
-            result.unwrap_or_else(|e| panic!("round {round}: {e}"));
-        }
+        let failed = results.iter().filter(|result| result.is_err()).count();
+        let raced = relations(&pool).await;
+
+        assert!(
+            failed < results.len(),
+            "round {round}: every initialization failed"
+        );
+        assert_eq!(raced, complete, "round {round}: {failed} failed");
+        initialize_multicatalog_schema(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
     }
 }
 
+/// Initializations racing to create a new single catalog may fail some of
+/// them, as in official DuckLake, but at least one succeeds, the catalog ends
+/// with every relation a clean one has, and one more initialization succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn concurrent_initializations_of_a_new_single_catalog_succeed() {
+async fn concurrent_initializations_of_a_new_single_catalog_leave_it_whole() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
+    initialize_single(&pool).await.unwrap();
+    let complete = relations(&pool).await;
     for round in 0..5 {
         reset(&pool).await;
         let tasks = (0..12).map(|_| {
             let pool = pool.clone();
             tokio::spawn(async move { initialize_single(&pool).await })
         });
-        for result in futures::future::join_all(tasks).await {
-            result
-                .unwrap()
-                .unwrap_or_else(|e| panic!("round {round}: {e}"));
-        }
+        let results = futures::future::join_all(tasks).await;
+        let failed = results
+            .into_iter()
+            .map(|result| result.unwrap())
+            .filter(|result| result.is_err())
+            .count();
+        let raced = relations(&pool).await;
+
+        assert!(failed < 12, "round {round}: every initialization failed");
+        assert_eq!(raced, complete, "round {round}: {failed} failed");
+        initialize_single(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
     }
 }
