@@ -24,6 +24,10 @@ async fn setup() -> Env {
     let temp = TempDir::new().unwrap();
     let catalog_path = temp.path().join("metadata.sqlite");
     let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    // This crate creates the catalog; official DuckDB creates its table.
+    let data_path = catalog_path.with_extension("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    crate::common::crate_sqlite_catalog(&conn_str, &data_path).await;
     {
         let conn = attach_sqlite_catalog(&catalog_path);
         conn.execute(
@@ -107,7 +111,7 @@ async fn reads_duckdb_comments_and_exposes_information_schema_tags() {
 
     let provider = Arc::new(SqliteMetadataProvider::new(&env.conn_str).await.unwrap());
     let snapshot = provider.get_current_snapshot().unwrap();
-    assert_eq!(snapshot, 5);
+    assert_eq!(snapshot, 6);
     assert_eq!(
         provider
             .get_tags(
@@ -299,8 +303,8 @@ async fn sql_comments_round_trip_to_duckdb_and_version_tags() {
     assert_eq!(
         versions,
         vec![
-            (2, Some(3), Some("table from Rust".to_string())),
-            (3, None, Some("table replaced".to_string())),
+            (3, Some(4), Some("table from Rust".to_string())),
+            (4, None, Some("table replaced".to_string())),
         ]
     );
 
@@ -309,7 +313,7 @@ async fn sql_comments_round_trip_to_duckdb_and_version_tags() {
     let snapshots: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
         "SELECT s.snapshot_id, s.schema_version, c.changes_made FROM ducklake_snapshot s
          JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
-         WHERE s.snapshot_id >= 1 ORDER BY s.snapshot_id",
+         WHERE s.snapshot_id >= 2 ORDER BY s.snapshot_id",
     )
     .fetch_all(&sqlite)
     .await
@@ -319,13 +323,13 @@ async fn sql_comments_round_trip_to_duckdb_and_version_tags() {
     assert_eq!(
         snapshots[1..].to_vec(),
         vec![
-            (2, base_version + 1, altered.clone()),
-            (3, base_version + 2, altered.clone()),
-            (4, base_version + 3, altered),
+            (3, base_version + 1, altered.clone()),
+            (4, base_version + 2, altered.clone()),
+            (5, base_version + 3, altered),
         ]
     );
     let ledger_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot >= 2",
+        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot >= 3",
     )
     .fetch_one(&sqlite)
     .await
@@ -359,13 +363,13 @@ async fn drop_table_tombstones_table_and_column_tags() {
             Some("internal"),
         )
         .unwrap();
-    assert_eq!(table_tag_snapshot, 2);
-    assert_eq!(column_tag_snapshot, 3);
+    assert_eq!(table_tag_snapshot, 3);
+    assert_eq!(column_tag_snapshot, 4);
     assert!(writer.drop_table("main", "events").unwrap());
 
     let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
     let drop_snapshot = provider.get_current_snapshot().unwrap();
-    assert_eq!(drop_snapshot, 4);
+    assert_eq!(drop_snapshot, 5);
     assert_eq!(
         provider.list_all_object_tags(drop_snapshot).unwrap(),
         vec![]
@@ -540,16 +544,16 @@ async fn expire_snapshots_reclaims_object_tags_and_column_tags_of_dead_tables() 
 
     // Official reclaims an ended object tag no surviving snapshot covers, but keeps an ended
     // column tag of a live table.
-    expire(vec![2, 3, 4]);
-    assert_eq!(object_tags().await, vec![(3, None, Some("t2".to_string()))]);
+    expire(vec![3, 4, 5]);
+    assert_eq!(object_tags().await, vec![(4, None, Some("t2".to_string()))]);
     assert_eq!(
         column_tags().await,
-        vec![(4, Some(5), Some("c1".to_string())), (5, None, Some("c2".to_string())),]
+        vec![(5, Some(6), Some("c1".to_string())), (6, None, Some("c2".to_string())),]
     );
 
     // A dead table takes all of its column tags, ended or live.
     assert!(writer.drop_table("main", "events").unwrap());
-    expire(vec![1, 5]);
+    expire(vec![2, 6]);
     assert_eq!(column_tags().await, vec![]);
 }
 
@@ -630,7 +634,7 @@ async fn crate_created_catalog_keeps_table_comments_and_has_no_schema_comments()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn catalog_predating_tags_opens_with_new_and_takes_comments_and_drops() {
+async fn catalog_predating_tags_migrates_and_takes_comments_and_drops() {
     let temp = TempDir::new().unwrap();
     let conn_str = crate_created_catalog(&temp).await;
     let sqlite = sqlx::SqlitePool::connect(&conn_str).await.unwrap();
@@ -640,7 +644,13 @@ async fn catalog_predating_tags_opens_with_new_and_takes_comments_and_drops() {
             .await
             .unwrap();
     }
+    // A release predating tags recorded no layout version.
+    sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_version'")
+        .execute(&sqlite)
+        .await
+        .unwrap();
 
+    SqliteMetadataWriter::migrate(&conn_str).await.unwrap();
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
     let table_id: i64 = sqlx::query_scalar("SELECT table_id FROM ducklake_table")
         .fetch_one(&sqlite)
@@ -691,7 +701,8 @@ async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
             )
             .unwrap()
     };
-    let base = watermark(1).await;
+    // Snapshot 1 is this crate's first; DuckDB's commit that created the table is 2.
+    let base = watermark(2).await;
     assert!(base.0.is_some() && base.1.is_some());
 
     // A comment after a DuckDB commit keeps its watermark, however many comments follow.

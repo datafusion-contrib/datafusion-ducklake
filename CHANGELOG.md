@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `migrate` on every writer, `migrate_multicatalog_schema`, `DuckLakeError::MigrationRequired`:
+  opt-in migration of catalogs this crate created, by its own layout version (#372, #374).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).
@@ -78,8 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- PostgreSQL initialization of a current store is one read and runs no DDL, so it no longer
-  waits behind writers (#370).
+- **BREAKING**: opening or initializing a writer never migrates; one an earlier release created
+  is refused until its `migrate` (or `migrate_multicatalog_schema`) runs once (#372, #374).
+- **BREAKING**: writers refuse a catalog official DuckDB created; they write only their own.
+- Opening a writer on a current catalog reads its layout version and runs no DDL, so it no
+  longer waits behind writers (#370).
 - In SQLite rollback-journal mode, a commit can fail with "database is locked" once its busy
   timeout runs out while a scan, mutation or change feed reads the catalog; WAL avoids it (#383).
 - A scan, mutation, fork or change feed reads a PostgreSQL or MySQL catalog in a read-only
@@ -112,8 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: the `set_*_setting` methods cast, store and refuse options as official's
   `ducklake_set_option` does. Give sizes a unit (`512MB`) and `hive_file_pattern` an integer.
 - **BREAKING** (behaviour): a stored `sort_on_insert` or `hive_file_pattern` is on only for
-  exactly `true`, as official reads it. Run writer or multicatalog initialization once to
-  rewrite the `TRUE`-like values earlier releases stored to `true`.
+  exactly `true`, as official reads it. Run the writer's `migrate` once to rewrite the
+  `TRUE`-like values earlier releases stored to `true`.
 - **BREAKING** for `MetadataWriter` wrappers: forward the new inlining-limit methods,
   `table_setting`, `set_schema_setting` and `register_existing_data_files_with_tags`.
   Call the inner writer on the calling thread, which carries a table writer's limit.
@@ -209,8 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `InvalidConfig` instead of storing both rows; pass one `ColumnStat` per column per file.
 - A flush that moves inlined deletions of Parquet rows into delete files conflicts with a
   concurrent insert, alter or compaction of the table, as official's flush does.
-- Writer initialization adds the columns this release writes to SQLite catalogs from 0.5 and
-  earlier and multicatalog stores from 0.6 and earlier; run it before writing to one.
+- `migrate` adds the columns this release writes to SQLite catalogs from 0.5 and earlier and
+  multicatalog stores from 0.6 and earlier; run it before writing to one.
 
 ### Deprecated
 

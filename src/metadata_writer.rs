@@ -130,7 +130,7 @@ pub(crate) fn refuse_changed_table_id(
 }
 
 /// The table or index a `CREATE ... IF NOT EXISTS <name>` statement creates.
-#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+#[cfg(feature = "write-postgres")]
 pub(crate) fn created_name(ddl: &str) -> &str {
     ddl.split("IF NOT EXISTS")
         .nth(1)
@@ -4884,7 +4884,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// reopening a catalog leaves the metadata database untouched.
     fn set_data_path(&self, path: &str) -> Result<()>;
 
-    /// Initialize DuckLake schema tables if they don't exist.
+    /// Create the DuckLake catalog tables of a new catalog and record its
+    /// layout version. A current catalog is left as it is; one that needs
+    /// migrating is refused, as when the writer opened it, since this never
+    /// migrates; each writer's `migrate` function does.
     fn initialize_schema(&self) -> Result<()>;
 
     /// Atomically set up catalog metadata for a write operation.

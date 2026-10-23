@@ -337,12 +337,13 @@ async fn crate_context(path: &Path) -> DataFusionResult<SessionContext> {
 /// (official inclusive-both-ends convention): every window `[a, b]` from the
 /// table's creation on, and the full range from snapshot 0.
 fn windows(ids: &[i64]) -> Vec<(i64, i64)> {
-    // Snapshot 0 is the catalog-initialization snapshot; the scenario table
-    // exists from snapshot 1 onward. Official table_changes resolves the table
-    // at `end_snapshot`, so keep end >= 1.
-    let usable: Vec<i64> = ids.iter().copied().filter(|&s| s >= 1).collect();
+    // The first snapshot initializes the catalog (0 when official created it);
+    // the scenario table exists from the next one onward. Official
+    // table_changes resolves the table at `end_snapshot`, so keep end past it.
+    let &first = ids.first().expect("at least one snapshot");
+    let usable: Vec<i64> = ids.iter().copied().filter(|&s| s > first).collect();
     let &max = usable.last().expect("at least one snapshot");
-    let mut out = vec![(0, max)];
+    let mut out = vec![(first, max)];
     for (i, &a) in usable.iter().enumerate() {
         for &b in &usable[i..] {
             out.push((a, b));
@@ -1991,6 +1992,11 @@ const DEFAULT_COLUMN_HISTORY: [&str; 4] = [
 async fn default_column_feeds_unchanged_by_crate_flush() -> DataFusionResult<()> {
     let tmp = TempDir::new().map_err(box_err)?;
     let path = tmp.path().join("inlined.ducklake");
+    // This crate flushes it below, so it creates it; official DuckDB writes it
+    // first, into the data path it uses by default.
+    let data = tmp.path().join("inlined.ducklake.files");
+    std::fs::create_dir_all(&data).map_err(box_err)?;
+    crate::common::crate_duckdb_catalog(&path, &data);
     write_inlined_catalog(&path, &DEFAULT_COLUMN_HISTORY)?;
     let mut official = Vec::new();
     {

@@ -38,7 +38,7 @@ catalogs in one database. It produces the same catalog shape as the SQLite and
 MySQL writers: no `catalog_id` columns, no `ducklake_catalog*` map tables, and
 unscoped relative paths (`{data_path}/{schema}/{table}/…`). The four spec-layout
 writers store `data_path`, schema paths, and table paths with a trailing `/`, as
-DuckDB does, and initialization appends it to legacy rows so DuckDB can resolve
+DuckDB does, and `migrate` appends it to legacy rows so DuckDB can resolve
 crate-written files. The multi-catalog layout keeps its paths as given.
 
 **Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
@@ -70,6 +70,41 @@ does not delete a scheduled object while a reference in any catalog still names 
 Ownership is deliberately not read off the path spelling: an absolute path says only
 where the file is, not whose it is. Official DuckLake has no such rule; its maintenance
 commands schedule and delete every path the expiring catalog holds.
+
+### Catalog layout version and migration
+
+Writers migrate only catalogs this crate created, and only when asked. **This differs from
+official DuckLake**, which records the DuckLake version it wrote in `ducklake_metadata.version`
+and migrates from it when attached with `AUTOMATIC_MIGRATION`.
+
+- A catalog this crate creates records its own layout version in `ducklake_metadata`, under
+  `datafusion_ducklake_version` (single-catalog layouts) or
+  `datafusion_ducklake_multicatalog_version` (PostgreSQL multicatalog). It never writes
+  official's `version`. The crate's layout versions follow its own releases, not official's.
+- Opening a writer reads those rows and official's `version` and runs no DDL. A catalog at the
+  current layout version opens as it is. `initialize_schema` (and `new_with_init`,
+  `initialize_multicatalog_schema`, `MulticatalogManager::connect`) creates a catalog in a
+  database without one; on an existing catalog it migrates nothing either. A creation that
+  stopped before recording the layout version is completed by `migrate`.
+- A catalog an earlier release created, or one at an older layout version, is refused with
+  `DuckLakeError::MigrationRequired` until the writer's `migrate` function runs:
+  `SqliteMetadataWriter::migrate`, `DuckdbMetadataWriter::migrate`,
+  `MySqlMetadataWriter::migrate`, `PostgresSingleCatalogMetadataWriter::migrate` /
+  `migrate_pool`, or `migrate_multicatalog_schema`. A catalog a newer release wrote is refused.
+- Writers write and migrate only catalogs this crate created. A catalog official DuckDB created
+  (it has `version` and no crate layout version) is refused, and nothing changes it. A
+  single-catalog writer also refuses a multicatalog store, and the reverse.
+- Official DuckDB can read and write a catalog this crate created (see *Official DuckDB can
+  write a catalog this crate created* below), but neither engine migrates the other's
+  catalogs: official sees no `version` on one this crate created and applies none of its own
+  migrations to it.
+- Read providers do not check layout versions.
+- `migrate` is idempotent. On SQLite, DuckDB and MySQL it runs its steps in order and records
+  the layout version last, so an interrupted run is completed by running it again; on
+  PostgreSQL it applies in one transaction, for both layouts. Two migrations racing on one
+  catalog may fail one of them; a retry finds the catalog current. Two processes creating the
+  same new catalog at once may see it half-created and be refused once; a retry finds it
+  current, or, if the creator stopped, `migrate` completes it.
 
 ---
 
@@ -144,10 +179,10 @@ on insert. Defaults added to nested children are not materialized yet, and the
 table-change, insertion, and deletion functions do not fill defaults for fields
 missing from older files.
 
-Writer initialization migrates missing default-metadata columns on SQLite,
-MySQL, and PostgreSQL. DuckDB read providers project missing fields as `NULL`.
-For a legacy SQLite, MySQL, or PostgreSQL catalog opened through a read-only
-provider, run writer initialization with a schema-migration role before reading.
+A writer's `migrate` adds missing default-metadata columns on SQLite, MySQL, and
+PostgreSQL. DuckDB read providers project missing fields as `NULL`. For a legacy
+SQLite, MySQL, or PostgreSQL catalog opened through a read-only provider, run the
+writer's `migrate` with a schema-migration role before reading.
 
 ### Inlined physical storage
 
@@ -316,7 +351,7 @@ when not zero (`'2'` is on, `'0.4'` is off, `'true'` is refused). `delete_older_
 `expire_older_than` must be empty or an interval. Every option official knows is accepted at
 catalog, schema and table scope, as official accepts it; an unknown one is refused. Stored
 `UBIGINT` values are read with the same cast, booleans are on only for exactly `true`, and
-setting keys are stored lowercased, as official stores them. Writer initialization rewrites a
+setting keys are stored lowercased, as official stores them. A writer's `migrate` rewrites a
 `sort_on_insert` or `hive_file_pattern` that earlier releases stored as a case variant of
 `true`, which they read as on, to `true`.
 
@@ -839,9 +874,9 @@ Differences from official:
   twenty rows to Parquet, insert `TIMESTAMPTZ '294247-01-10 04:00:54.775806+00'` inlined,
   delete three rows, and rewrite with `delete_threshold => 0.0`.
 
-Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
-registry; standard PostgreSQL staged commits create it on demand. SQLite also
-migrates legacy non-null change ledgers.
+Migrating a SQLite or multicatalog PostgreSQL catalog creates a missing inline
+registry; standard PostgreSQL staged commits create it on demand. Migrating SQLite
+also converts legacy non-null change ledgers.
 
 Snapshot-change readers on all backends preserve NULL changes and snapshots
 without ledger rows. `ducklake_snapshots()` and `information_schema.snapshots`
@@ -899,7 +934,8 @@ Known edges:
   index; on the **DuckDB, SQLite, and MySQL single-catalog** layouts, `ducklake_column` matches
   upstream's bare shape (no PK), and the one-live-version invariant is enforced in the writer
   and tests. Catalogs
-  created by an earlier version are migrated in place on open (idempotent, lossless).
+  created by an earlier version are migrated in place by the writer's `migrate`
+  (idempotent, lossless).
 - **`schema_version` is maintained on every write layout.** DuckDB, SQLite, MySQL, and both
   PostgreSQL layouts carry `schema_version` on `ducklake_snapshot` and a
   `ducklake_schema_versions` ledger table. A schema change bumps it and a pure data write carries
@@ -917,7 +953,7 @@ Known edges:
   - *Ids:* schema, table, partition, and sort ids come from official's `next_catalog_id`
     namespace and file ids from its `next_file_id` one. Each commit raises the watermarks of the
     snapshot it writes past every id in use, and a commit that inlines rows advances
-    `next_file_id` once per table, as official's does. Only initialization raises those of a
+    `next_file_id` once per table, as official's does. Only `migrate` raises those of a
     committed snapshot: a head an earlier writer left without them, so official can attach. A column the
     crate adds to a table takes an id past the table's, as official numbers a table's columns.
   - *Conflicts:* a table id reserved when a write begins is checked at its commit, which
@@ -928,7 +964,7 @@ Known edges:
   - *Paths:* a file the crate writes goes to the directory the table's stored path names, which
     a rename by official keeps; a table's first file goes under its schema's stored path, which
     official may have stored under another name.
-  - *Migration:* initialization only adds what an older catalog lacks, so a release before 0.10
+  - *Migration:* `migrate` only adds what an older catalog lacks, so a release before 0.10
     keeps writing it, and the writers take ids past the counters and sequences older releases
     allocate from. `migrate_to_official_layout` then rebuilds it into official's layout
     (idempotent, lossless, blocking the tables' writers while it runs). On PostgreSQL the rebuilt
@@ -1172,8 +1208,8 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
 
 - **`ducklake_file_partition_value` carries an index this crate creates.**
   `idx_file_partition_value_table_key (table_id, partition_key_index)` is added
-  by every writer's schema bootstrap, and by an existing catalog the next time it
-  is initialized. It is the index the pre-filter above reads through; without it
+  by every writer's schema bootstrap, and to an existing catalog by its
+  migration. It is the index the pre-filter above reads through; without it
   the query scans every table's partition values rather than one table's. The
   table's columns are untouched, so a catalog carrying it stays readable by
   official DuckLake, which creates no indexes of its own on any metadata table.

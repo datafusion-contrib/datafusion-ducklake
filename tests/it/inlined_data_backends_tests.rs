@@ -988,21 +988,21 @@ fn displayed_datafusion_rows(batches: &[RecordBatch]) -> Vec<String> {
 /// Replay [`NESTED_EVOLUTION`] on the attached catalog `catalog` and return,
 /// per snapshot from the table's creation on, what DuckDB reads there.
 fn nested_evolution(conn: &duckdb::Connection, catalog: &str) -> Vec<(i64, Vec<String>)> {
+    let head = || -> i64 {
+        conn.query_row(
+            &format!("SELECT max(snapshot_id) FROM ducklake_snapshots('{catalog}')"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    // The snapshot that creates the table, after however the catalog began.
+    let created = head() + 1;
     for statement in NESTED_EVOLUTION {
         let sql = statement.replace("{c}", catalog);
         conn.execute_batch(&sql)
             .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
     }
-    let created: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT min(snapshot_id) FROM ducklake_snapshots('{catalog}') \
-                 WHERE snapshot_id > 0"
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     let last: i64 = conn
         .query_row(
             &format!("SELECT max(snapshot_id) FROM ducklake_snapshots('{catalog}')"),
@@ -1064,6 +1064,13 @@ async fn inlined_nested_rows_read_across_struct_evolution() {
     conn.execute_batch("LOAD ducklake; LOAD sqlite;").unwrap();
     let duck = temp.path().join("a.ducklake");
     let lite = temp.path().join("b.db");
+    // This crate writes `lite` below, so it creates it; DuckDB writes it first.
+    #[cfg(feature = "write-sqlite")]
+    {
+        let data = temp.path().join("data").join("lite");
+        std::fs::create_dir_all(&data).unwrap();
+        common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", lite.display()), &data).await;
+    }
     let mut expected = Vec::new();
     for (name, uri) in [
         ("duck", format!("ducklake:{}", escaped_path(&duck))),

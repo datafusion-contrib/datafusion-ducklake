@@ -1423,7 +1423,7 @@ async fn mysql_multi_table_write_commits_nested_inlined_rows_atomically() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn mysql_initialize_migrates_directory_paths_once() {
+async fn mysql_migrate_fixes_directory_paths_once() {
     let container = Mysql::default().start().await.unwrap();
     let port = container.get_host_port_ipv4(3306).await.unwrap();
     let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
@@ -1453,9 +1453,14 @@ async fn mysql_initialize_migrates_directory_paths_once() {
         .execute(&pool)
         .await
         .unwrap();
+    // An earlier release recorded no layout version.
+    sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = 'datafusion_ducklake_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     for _ in 0..2 {
-        writer.initialize_schema().unwrap();
+        MySqlMetadataWriter::migrate(&conn_str).await.unwrap();
         let data_path: String = sqlx::query_scalar(
             "SELECT `value` FROM ducklake_metadata WHERE `key` = 'data_path' AND scope IS NULL",
         )
@@ -1474,6 +1479,51 @@ async fn mysql_initialize_migrates_directory_paths_once() {
         assert_eq!(schema_path, "main/");
         assert_eq!(table_path, "users/");
     }
+}
+
+/// A catalog an earlier release created, with no layout version, is refused
+/// until migrated, once; a newer one is refused even then.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_refuses_a_catalog_until_migrated() {
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
+    let writer = MySqlMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    writer.create_snapshot().unwrap();
+    drop(writer);
+    let pool = MySqlPool::connect(&conn_str).await.unwrap();
+    sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = 'datafusion_ducklake_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let refused = MySqlMetadataWriter::new(&conn_str).await;
+    MySqlMetadataWriter::migrate(&conn_str).await.unwrap();
+    let reopened = MySqlMetadataWriter::new(&conn_str).await;
+    sqlx::query(
+        "UPDATE ducklake_metadata SET `value` = '999' WHERE `key` = 'datafusion_ducklake_version'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let newer = MySqlMetadataWriter::new(&conn_str).await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(datafusion_ducklake::DuckLakeError::MigrationRequired(_))
+        ),
+        "{refused:?}"
+    );
+    assert!(reopened.is_ok(), "{reopened:?}");
+    assert!(
+        matches!(
+            newer,
+            Err(datafusion_ducklake::DuckLakeError::Unsupported(_))
+        ),
+        "{newer:?}"
+    );
 }
 
 /// `commit_compaction` stores a `Preserved` output's `row_id_start` (a merge

@@ -50,7 +50,7 @@ async fn writable_context(connection: &str) -> SessionContext {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn writable_open_adds_scope_id_once_and_preserves_global_settings() {
+async fn migrate_adds_scope_id_once_and_preserves_global_settings() {
     let temp = TempDir::new().unwrap();
     let database = temp.path().join("legacy.db");
     let connection = format!("sqlite:{}?mode=rwc", database.display());
@@ -77,6 +77,7 @@ async fn writable_open_adds_scope_id_once_and_preserves_global_settings() {
         Some("/preserved/path")
     );
 
+    SqliteMetadataWriter::migrate(&connection).await.unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&connection)
         .await
         .unwrap();

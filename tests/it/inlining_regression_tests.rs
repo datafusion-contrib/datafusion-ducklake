@@ -211,12 +211,15 @@ fn column_rows(metadata: &Metadata) -> Vec<String> {
     )
 }
 
-/// An official SQLite catalog with `t(id, s STRUCT(a), z)` whose struct got a
-/// field `c` after `z` existed, so `c` is numbered after `z`.
-fn official_struct_table(temp: &Path) -> (Metadata, PathBuf) {
+/// A SQLite catalog official DuckDB wrote `t(id, s STRUCT(a), z)` into, whose
+/// struct got a field `c` after `z` existed, so `c` is numbered after `z`.
+async fn official_struct_table(temp: &Path) -> (Metadata, PathBuf) {
     let path = temp.join("c.db");
     let data = temp.join("data");
     std::fs::create_dir_all(&data).unwrap();
+    // This crate creates the catalog; official DuckDB writes it.
+    crate::common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", path.display()), &data)
+        .await;
     let metadata = Metadata::Sqlite(path);
     official(
         &metadata,
@@ -231,7 +234,8 @@ fn official_struct_table(temp: &Path) -> (Metadata, PathBuf) {
     (metadata, data)
 }
 
-/// A crate writer and catalog over an official SQLite catalog.
+/// A crate writer and catalog over a SQLite catalog this crate created and
+/// official DuckDB wrote.
 async fn crate_side(
     metadata: &Metadata,
     data: &Path,
@@ -273,7 +277,7 @@ async fn crate_sql(
 #[tokio::test(flavor = "multi_thread")]
 async fn data_writes_keep_official_column_metadata() {
     let temp = tempfile::TempDir::new().unwrap();
-    let (metadata, data) = official_struct_table(temp.path());
+    let (metadata, data) = official_struct_table(temp.path()).await;
     let before = column_rows(&metadata);
     let (writer, provider) = crate_side(&metadata, &data).await;
 
@@ -3408,6 +3412,9 @@ async fn delete_rowids_on_an_official_update_file() {
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let metadata = Metadata::Sqlite(path.clone());
+    // This crate creates the catalog; official DuckDB writes it.
+    crate::common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", path.display()), &data)
+        .await;
     official(
         &metadata,
         &data,
@@ -3858,6 +3865,9 @@ async fn change_detection_counts_a_delete_committed_with_a_flush() {
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let metadata = Metadata::Sqlite(path.clone());
+    // This crate creates the catalog; official DuckDB writes it.
+    crate::common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", path.display()), &data)
+        .await;
     official(
         &metadata,
         &data,
@@ -3947,6 +3957,9 @@ async fn change_detection_follows_the_change_feed() {
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let metadata = Metadata::Sqlite(path.clone());
+    // This crate creates the catalog; official DuckDB writes it.
+    crate::common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", path.display()), &data)
+        .await;
     official(
         &metadata,
         &data,
@@ -4046,11 +4059,15 @@ async fn change_detection_follows_the_change_feed() {
 // A NaN rewrite_delete_threshold, as official reads it
 // ---------------------------------------------------------------------------
 
-/// An official SQLite catalog of three Parquet files, the first two with
-/// deletions, its `rewrite_delete_threshold` stored as `nan`.
-fn nan_threshold_catalog(dir: &Path) -> (Metadata, PathBuf) {
+/// A SQLite catalog official DuckDB wrote three Parquet files into, the first
+/// two with deletions, its `rewrite_delete_threshold` stored as `nan`.
+async fn nan_threshold_catalog(dir: &Path) -> (Metadata, PathBuf) {
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
+    let path = dir.join("c.db");
+    // This crate creates the catalog; official DuckDB writes it.
+    crate::common::crate_sqlite_catalog(&format!("sqlite:{}?mode=rwc", path.display()), &data)
+        .await;
     let metadata = Metadata::Sqlite(dir.join("c.db"));
     official(
         &metadata,
@@ -4108,7 +4125,7 @@ async fn crate_content(provider: &Arc<dyn MetadataProvider>) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn nan_rewrite_delete_threshold_rewrites_every_file_with_deletions() {
     let official_dir = tempfile::TempDir::new().unwrap();
-    let (metadata, data) = nan_threshold_catalog(official_dir.path());
+    let (metadata, data) = nan_threshold_catalog(official_dir.path()).await;
     official(
         &metadata,
         &data,
@@ -4119,7 +4136,7 @@ async fn nan_rewrite_delete_threshold_rewrites_every_file_with_deletions() {
     let content = duckdb_query(&metadata, &data, "SELECT count(*), sum(i) FROM lake.t");
 
     let ours_dir = tempfile::TempDir::new().unwrap();
-    let (metadata, data) = nan_threshold_catalog(ours_dir.path());
+    let (metadata, data) = nan_threshold_catalog(ours_dir.path()).await;
     let (writer, provider) = crate_side(&metadata, &data).await;
     let ctx = SessionContext::new();
     let catalog = DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&writer)).unwrap();
@@ -4146,7 +4163,7 @@ async fn nan_rewrite_delete_threshold_rewrites_every_file_with_deletions() {
     assert_eq!(crate_content(&provider).await, content);
 
     let checkpoint_dir = tempfile::TempDir::new().unwrap();
-    let (metadata, data) = nan_threshold_catalog(checkpoint_dir.path());
+    let (metadata, data) = nan_threshold_catalog(checkpoint_dir.path()).await;
     let (writer, provider) = crate_side(&metadata, &data).await;
     let ctx = SessionContext::new();
     let catalog = DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&writer)).unwrap();

@@ -566,19 +566,43 @@ impl Lake {
             metadata,
         };
         std::fs::create_dir_all(lake.data_path())?;
+        lake.populate(inlining_rows, statements)?;
+        Ok(lake)
+    }
+
+    /// [`Self::new`] over a catalog this crate created, for a test whose
+    /// writer writes it: the crate writes only catalogs it created.
+    #[cfg(feature = "write-sqlite")]
+    async fn new_writable(inlining_rows: usize, statements: &[&str]) -> anyhow::Result<Self> {
+        let lake = Self {
+            dir: TempDir::new()?,
+            metadata: Metadata::Sqlite,
+        };
+        std::fs::create_dir_all(lake.data_path())?;
+        crate::common::crate_sqlite_catalog(
+            &format!("sqlite:{}?mode=rwc", lake.catalog_path().display()),
+            &lake.data_path(),
+        )
+        .await;
+        lake.populate(inlining_rows, statements)?;
+        Ok(lake)
+    }
+
+    /// Run `statements` on the catalog with official DuckDB.
+    fn populate(&self, inlining_rows: usize, statements: &[&str]) -> anyhow::Result<()> {
         // In this process: no connection of a provider is open yet.
-        let (extension, attach) = lake.attach();
+        let (extension, attach) = self.attach();
         run_duckdb(
             extension,
             &attach,
-            &lake.data_path(),
+            &self.data_path(),
             inlining_rows,
             statements,
         )?;
-        if let Metadata::Sqlite = lake.metadata {
-            use_write_ahead_log(&lake.catalog_path())?;
+        if let Metadata::Sqlite = self.metadata {
+            use_write_ahead_log(&self.catalog_path())?;
         }
-        Ok(lake)
+        Ok(())
     }
 
     fn catalog_path(&self) -> PathBuf {
@@ -1912,14 +1936,15 @@ async fn a_flush_between_a_rowid_lookups_reads_finds_each_row_once() -> anyhow::
 async fn a_flush_between_a_deletes_reads_leaves_no_row_undeleted() -> anyhow::Result<()> {
     let matching = "SELECT id FROM t WHERE id < 15 OR id >= 100 ORDER BY id";
     for &before in ROW_READS {
-        let lake = Lake::new(
+        let lake = Lake::new_writable(
             10,
             &[
                 "CREATE TABLE lake.t (id INT)",
                 "INSERT INTO lake.t SELECT i FROM range(20) r(i)",
                 "INSERT INTO lake.t VALUES (100), (101)",
             ],
-        )?;
+        )
+        .await?;
         let counting = lake.provider().await?;
         let url = format!("sqlite:{}", lake.catalog_path().display());
         let writer = datafusion_ducklake::SqliteMetadataWriter::new(&url).await?;
@@ -1979,7 +2004,7 @@ async fn writable(lake: &Lake, counting: &CountingProvider) -> anyhow::Result<Du
 #[cfg(feature = "write-sqlite")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flush_between_a_positional_deletes_reads_deletes_no_row_twice() -> anyhow::Result<()> {
-    let lake = Lake::new(10, INLINED_DELETIONS)?;
+    let lake = Lake::new_writable(10, INLINED_DELETIONS).await?;
     let counting = lake.provider().await?;
     let table = writable(&lake, &counting).await?;
     let (table_id, head) = table_at_head(&counting)?;
@@ -2018,7 +2043,7 @@ async fn a_flush_between_a_positional_deletes_reads_deletes_no_row_twice() -> an
 #[cfg(feature = "write-sqlite")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flush_between_a_merges_reads_merges_no_deleted_row_back() -> anyhow::Result<()> {
-    let lake = Lake::new(
+    let lake = Lake::new_writable(
         10,
         &[
             "CREATE TABLE lake.t (id INT)",
@@ -2026,7 +2051,8 @@ async fn a_flush_between_a_merges_reads_merges_no_deleted_row_back() -> anyhow::
             "DELETE FROM lake.t WHERE id IN (3, 7)",
             "INSERT INTO lake.t SELECT i FROM range(20, 40) r(i)",
         ],
-    )?;
+    )
+    .await?;
     let counting = lake.provider().await?;
     let table = writable(&lake, &counting).await?;
     let state = SessionContext::new().state();

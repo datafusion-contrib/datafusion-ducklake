@@ -388,9 +388,13 @@ A few highlights worth knowing up front:
 
 - Reads and writes work on DuckDB, SQLite, PostgreSQL, and MySQL. PostgreSQL supports the standard
   single-catalog layout, recommended by default, and an experimental multi-catalog layout.
+- Writers never migrate a catalog when they open it, and write only catalogs this crate
+  created. One an earlier release created is refused until the writer's `migrate` (or
+  `migrate_multicatalog_schema`) runs once; one official DuckDB created is refused. See
+  [COMPATIBILITY.md](COMPATIBILITY.md#catalog-layout-version-and-migration).
 - Official DuckDB can attach and write a catalog the DuckDB, SQLite, MySQL, or single-catalog
-  PostgreSQL writer creates. A catalog an earlier release created needs
-  `migrate_to_official_layout` first, after which only 0.10 or later should write it, so
+  PostgreSQL writer creates. A catalog an earlier release created needs `migrate`, then
+  `migrate_to_official_layout`, after which only 0.10 or later should write it, so
   upgrade every writer of the catalog before migrating. On PostgreSQL, drop any view on the
   catalog tables first; the migration refuses a table a view depends on.
 - Object stores: local filesystem, S3-compatible (S3, MinIO), and any other `object_store`

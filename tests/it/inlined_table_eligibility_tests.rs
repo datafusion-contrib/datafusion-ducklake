@@ -261,8 +261,10 @@ async fn sqlite_never_inlines_geometry() {
     let (temp, data) = scratch();
     let path = temp.path().join("lake.db");
     let metadata = Metadata::Sqlite(path.clone());
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    // This crate creates the catalog; official DuckDB creates the tables.
+    crate::common::crate_sqlite_catalog(&url, &data).await;
     official(&metadata, &data, &official_tables());
-    let url = format!("sqlite:{}", path.display());
     let side = Side {
         writer: Arc::new(SqliteMetadataWriter::new_with_init(&url).await.unwrap()),
         provider: Arc::new(SqliteMetadataProvider::new(&url).await.unwrap()),
@@ -272,8 +274,7 @@ async fn sqlite_never_inlines_geometry() {
 
 /// Single-catalog PostgreSQL inlines no write; a partitioning change still
 /// creates the inlined data table official creates, and none for a table
-/// with a GEOMETRY column. (Writing rows to an official-created catalog there
-/// is a known gap.)
+/// with a GEOMETRY column.
 #[cfg(feature = "write-postgres")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 #[tokio::test(flavor = "multi_thread")]
@@ -288,8 +289,10 @@ async fn postgres_single_catalog_creates_no_inlined_table_for_geometry() {
     let metadata = Metadata::Postgres(format!(
         "host=127.0.0.1 port={port} user=postgres password=postgres dbname=postgres"
     ));
-    official(&metadata, &data, &official_tables());
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    // This crate creates the catalog; official DuckDB creates the tables.
+    crate::common::crate_postgres_catalog(&url, &data).await;
+    official(&metadata, &data, &official_tables());
     let side = Side {
         writer: Arc::new(
             PostgresSingleCatalogMetadataWriter::new_with_init(&url)

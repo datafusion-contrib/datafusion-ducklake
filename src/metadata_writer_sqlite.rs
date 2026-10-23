@@ -10,6 +10,10 @@ use std::{
 };
 
 use crate::Result;
+use crate::catalog_version::{
+    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
+    require_writable,
+};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
@@ -858,44 +862,19 @@ impl SqliteMetadataWriter {
         Self::with_max_connections(connection_string, DEFAULT_MAX_CONNECTIONS).await
     }
 
+    /// Open a writer with a bounded connection pool. Reads the catalog's
+    /// layout version and runs no DDL; a catalog that needs migrating is
+    /// refused with [`crate::DuckLakeError::MigrationRequired`] until
+    /// [`Self::migrate`] runs.
     pub async fn with_max_connections(
         connection_string: &str,
         max_connections: u32,
     ) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str(connection_string)?;
-        let filename = options.get_filename();
-        let lock_path = (!filename.as_os_str().is_empty()
-            && filename != std::path::Path::new(":memory:"))
-        .then(|| {
-            let mut path = filename.as_os_str().to_os_string();
-            path.push(".commit.lock");
-            PathBuf::from(path)
-        });
-        let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
-            SqlitePoolOptions::new()
-                .max_connections(max_connections)
-                .connect(&url)
-                .await
-        })
-        .await?;
-
-        // Existing catalogs must migrate even when callers skip `initialize_schema`
-        migrate_snapshot_changes_nullable(&pool).await?;
-        let initialized: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master
-                            WHERE type = 'table' AND name = 'ducklake_snapshot')",
-        )
-        .fetch_one(&pool)
-        .await?;
-        if initialized {
-            migrate_add_snapshot_watermarks(&pool).await?;
-            add_missing_positional_columns(&pool).await?;
-        }
-        sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
-            .execute(&pool)
-            .await?;
-        sqlx::query(SQL_CREATE_TAG_TABLES).execute(&pool).await?;
+        let (pool, lock_path) = connect(connection_string, max_connections).await?;
+        require_writable(
+            &catalog_state(&pool).await?,
+            "SqliteMetadataWriter::migrate",
+        )?;
         Ok(Self {
             pool,
             lock_path,
@@ -905,6 +884,139 @@ impl SqliteMetadataWriter {
         })
     }
 
+    /// Bring the catalog at `connection_string`, which an earlier release of
+    /// this crate created, to the layout this release writes, and record its
+    /// layout version. A catalog official DuckDB created is refused. Opening a
+    /// writer never migrates.
+    pub async fn migrate(connection_string: &str) -> Result<()> {
+        let (pool, _) = connect(connection_string, DEFAULT_MAX_CONNECTIONS).await?;
+        let state = catalog_state(&pool).await?;
+        match state {
+            CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
+                "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
+            )),
+            CatalogState::Current => Ok(()),
+            _ => {
+                require_migratable(&state)?;
+                upgrade_and_stamp(&pool).await
+            },
+        }
+    }
+}
+
+async fn connect(
+    connection_string: &str,
+    max_connections: u32,
+) -> Result<(SqlitePool, Option<PathBuf>)> {
+    let options = SqliteConnectOptions::from_str(connection_string)?;
+    let filename = options.get_filename();
+    let lock_path = (!filename.as_os_str().is_empty()
+        && filename != std::path::Path::new(":memory:"))
+    .then(|| {
+        let mut path = filename.as_os_str().to_os_string();
+        path.push(".commit.lock");
+        PathBuf::from(path)
+    });
+    let url = connection_string.to_string();
+    let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+        SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&url)
+            .await
+    })
+    .await?;
+    Ok((pool, lock_path))
+}
+
+/// The catalog's state from its version rows; [`CatalogState::Absent`] when
+/// it has no `ducklake_metadata` table.
+async fn catalog_state(pool: &SqlitePool) -> Result<CatalogState> {
+    let read = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
+        SINGLE_CATALOG.sql_keys()
+    )))
+    .fetch_all(pool)
+    .await;
+    let rows: Vec<(String, String)> = match read {
+        Ok(rows) => rows,
+        Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => {
+            return Ok(CatalogState::Absent);
+        },
+        Err(error) => return Err(error.into()),
+    };
+    classify(&rows, &SINGLE_CATALOG)
+}
+
+/// Create or upgrade every table, column and counter this writer uses, then
+/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
+/// recorded last, so an interrupted run is completed by running it again.
+async fn upgrade_and_stamp(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(SQL_CREATE_SCHEMA).execute(pool).await?;
+    for (table, columns) in POSITIONAL_TABLES {
+        sqlx::query(AssertSqlSafe(positional_table_ddl(table, columns)))
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+        .execute(pool)
+        .await?;
+    sqlx::query(SQL_CREATE_TAG_TABLES).execute(pool).await?;
+    // Upgrade a pre-existing catalog's `ducklake_column` from the legacy
+    // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
+    // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
+    migrate_ducklake_column_drop_pk(pool).await?;
+    migrate_add_metadata_scope_columns(pool).await?;
+    // Upgrade a pre-existing catalog to track schema_version (add the
+    // ducklake_snapshot.schema_version column; idempotent, lossless).
+    migrate_add_schema_version(pool).await?;
+    // Upgrade a pre-existing catalog to the v1.0 partial-file marker (add
+    // partial_max to ducklake_data_file and ducklake_delete_file;
+    // idempotent, lossless — NULL means "not a partial file").
+    migrate_add_partial_max(pool).await?;
+    // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
+    // (idempotent, lossless — NULL means "not partitioned").
+    migrate_add_partition_id(pool).await?;
+    migrate_snapshot_changes_nullable(pool).await?;
+    // Seed the monotonic id allocators. snapshot_id and column_id are
+    // reserved in begin_write_transaction and inserted at the commit, so
+    // they can't use rowid autoincrement (inserting the ducklake_snapshot
+    // row would advance the head before the data is committed). The
+    // counters give collision-free allocation across concurrent writers.
+    // Idempotent on re-open, and seeded from the current MAX so a
+    // pre-existing catalog continues without reusing ids.
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope)
+         SELECT 'next_column_id',
+                CAST(COALESCE((SELECT MAX(column_id) FROM ducklake_column), 0) AS TEXT),
+                NULL
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    migrate_add_snapshot_watermarks(pool).await?;
+    add_missing_positional_columns(pool).await?;
+    migrate_directory_paths(pool).await?;
+    sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+        .execute(pool)
+        .await?;
+    raise_head_watermarks_past_ids_in_use(pool).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
+        .bind(LAYOUT_VERSION_KEY)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)")
+        .bind(LAYOUT_VERSION_KEY)
+        .bind(LAYOUT_VERSION.to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+impl SqliteMetadataWriter {
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
         let writer = Self::new(connection_string).await?;
         writer.initialize_schema()?;
@@ -1864,7 +1976,7 @@ async fn max_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
 /// so this migration is what lets existing users' catalogs support type promotion.
 ///
 /// **Idempotent:** a no-op once `column_id` is no longer a PK and all current
-/// metadata columns exist (re-runs on every `initialize_schema`). **Crash-safe:**
+/// metadata columns exist (re-runs on every `migrate`). **Crash-safe:**
 /// SQLite runs the rebuild in one transaction, so a crash leaves either the old or
 /// the new table whole, never a half-state. **Lossless:** every row and every
 /// `column_id` value is preserved (field-ids baked in Parquet stay valid), and it
@@ -3007,9 +3119,8 @@ async fn insert_partition_metadata(
 /// Writes one `ducklake_file_column_stats` row per [`ColumnStat`] (the zone maps
 /// that drive file pruning), within the caller's commit transaction so the
 /// stats land atomically with the `ducklake_data_file` row. `data_file_id` is
-/// the id the row was inserted under (never SQLite's `last_insert_rowid()`: a
-/// catalog official DuckDB created declares `data_file_id BIGINT PRIMARY KEY`,
-/// which is not SQLite's row id). A `None`
+/// the id the row was inserted under (never SQLite's `last_insert_rowid()`,
+/// which is the file id only while `data_file_id` is the table's row id). A `None`
 /// bound/count is written as SQL `NULL` — spec-safe: a file with NULL stats is
 /// never pruned.
 async fn insert_file_column_stats(
@@ -7857,60 +7968,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     fn initialize_schema(&self) -> Result<()> {
         self.block_on(async {
-            sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
-            for (table, columns) in POSITIONAL_TABLES {
-                sqlx::query(AssertSqlSafe(positional_table_ddl(table, columns)))
-                    .execute(&self.pool)
-                    .await?;
+            match catalog_state(&self.pool).await? {
+                CatalogState::Absent => upgrade_and_stamp(&self.pool).await,
+                state => require_writable(&state, "SqliteMetadataWriter::migrate"),
             }
-            sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
-                .execute(&self.pool)
-                .await?;
-            sqlx::query(SQL_CREATE_TAG_TABLES)
-                .execute(&self.pool)
-                .await?;
-            // Upgrade a pre-existing catalog's `ducklake_column` from the legacy
-            // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
-            // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
-            migrate_ducklake_column_drop_pk(&self.pool).await?;
-            migrate_add_metadata_scope_columns(&self.pool).await?;
-            // Upgrade a pre-existing catalog to track schema_version (add the
-            // ducklake_snapshot.schema_version column; idempotent, lossless).
-            migrate_add_schema_version(&self.pool).await?;
-            // Upgrade a pre-existing catalog to the v1.0 partial-file marker (add
-            // partial_max to ducklake_data_file and ducklake_delete_file;
-            // idempotent, lossless — NULL means "not a partial file").
-            migrate_add_partial_max(&self.pool).await?;
-            // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
-            // (idempotent, lossless — NULL means "not partitioned").
-            migrate_add_partition_id(&self.pool).await?;
-            migrate_snapshot_changes_nullable(&self.pool).await?;
-            // Seed the monotonic id allocators. snapshot_id and column_id are
-            // reserved in begin_write_transaction and inserted at the commit, so
-            // they can't use rowid autoincrement (inserting the ducklake_snapshot
-            // row would advance the head before the data is committed). The
-            // counters give collision-free allocation across concurrent writers.
-            // Idempotent on re-open, and seeded from the current MAX so a
-            // pre-existing catalog continues without reusing ids.
-            sqlx::query(
-                "INSERT INTO ducklake_metadata (key, value, scope)
-                 SELECT 'next_column_id',
-                        CAST(COALESCE((SELECT MAX(column_id) FROM ducklake_column), 0) AS TEXT),
-                        NULL
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
-                 )",
-            )
-            .execute(&self.pool)
-            .await?;
-            migrate_add_snapshot_watermarks(&self.pool).await?;
-            add_missing_positional_columns(&self.pool).await?;
-            migrate_directory_paths(&self.pool).await?;
-            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
-                .execute(&self.pool)
-                .await?;
-            raise_head_watermarks_past_ids_in_use(&self.pool).await?;
-            Ok(())
         })
     }
 
@@ -8139,6 +8200,17 @@ mod tests {
             )),
             "VARCHAR"
         );
+    }
+
+    /// Make the test catalog in `temp` look as an earlier release left it, with
+    /// no layout version, and return its URL for [`SqliteMetadataWriter::migrate`].
+    async fn forget_layout_version(pool: &SqlitePool, temp: &TempDir) -> String {
+        sqlx::query("DELETE FROM ducklake_metadata WHERE key = ?")
+            .bind(LAYOUT_VERSION_KEY)
+            .execute(pool)
+            .await
+            .unwrap();
+        format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display())
     }
 
     async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
@@ -8613,13 +8685,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn open_legacy_snapshot_changes_with_plain_new() {
+    async fn migrate_converts_legacy_snapshot_changes() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("legacy.db");
         let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
         let writer = SqliteMetadataWriter::new_with_init(&conn_str)
             .await
             .unwrap();
+        // An earlier release's catalog has written a snapshot.
+        writer.create_snapshot().unwrap();
 
         sqlx::query("DROP TABLE ducklake_snapshot_changes")
             .execute(&writer.pool)
@@ -8634,8 +8708,19 @@ mod tests {
         .execute(&writer.pool)
         .await
         .unwrap();
+        sqlx::query("DELETE FROM ducklake_metadata WHERE key = ?")
+            .bind(LAYOUT_VERSION_KEY)
+            .execute(&writer.pool)
+            .await
+            .unwrap();
         drop(writer);
 
+        let refused = SqliteMetadataWriter::new(&conn_str).await;
+        assert!(
+            matches!(refused, Err(crate::DuckLakeError::MigrationRequired(_))),
+            "{refused:?}"
+        );
+        SqliteMetadataWriter::migrate(&conn_str).await.unwrap();
         let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
         let snapshot_id = writer.create_snapshot().unwrap();
         let changes_made: Option<String> = sqlx::query_scalar(
@@ -9076,10 +9161,11 @@ mod tests {
 
     /// Phase D (old-version data → latest): a catalog whose `ducklake_column` is in
     /// the LEGACY single-row-PK shape (as a previous datafusion-ducklake version
-    /// wrote it), holding real data files, must upgrade in place on re-open and read
-    /// its values back intact — then support a promote. We simulate the old version
-    /// by writing with the current writer, then rebuilding `ducklake_column` to the
-    /// legacy shape; re-opening runs the forward migration.
+    /// wrote it), holding real data files, must upgrade in place when migrated and
+    /// read its values back intact — then support a promote. We simulate the old
+    /// version by writing with the current writer, then rebuilding `ducklake_column`
+    /// to the legacy shape and dropping the layout version; `migrate` runs the
+    /// forward migration.
     #[tokio::test(flavor = "multi_thread")]
     async fn phase_d_legacy_catalog_with_data_upgrades_and_reads() {
         use crate::{DuckLakeCatalog, DuckLakeTableWriter, SqliteMetadataProvider};
@@ -9168,21 +9254,26 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(is_pk, 1, "downgrade produced the legacy single-row PK");
+            // An older version recorded no layout version.
+            sqlx::query("DELETE FROM ducklake_metadata WHERE key = ?")
+                .bind(LAYOUT_VERSION_KEY)
+                .execute(&pool)
+                .await
+                .unwrap();
             pool.close().await;
         }
 
-        // 3. Re-open with the current version → initialize_schema runs the forward
-        //    migration (legacy PK -> bare shape).
-        let writer = SqliteMetadataWriter::new_with_init(&conn_str)
-            .await
-            .unwrap();
+        // 3. Migrate with the current version → the forward migration runs
+        //    (legacy PK -> bare shape).
+        SqliteMetadataWriter::migrate(&conn_str).await.unwrap();
+        let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
         let is_pk: i64 = sqlx::query_scalar(
             "SELECT pk FROM pragma_table_info('ducklake_column') WHERE name = 'column_id'",
         )
         .fetch_one(&writer.pool)
         .await
         .unwrap();
-        assert_eq!(is_pk, 0, "re-open migrated the legacy PK away");
+        assert_eq!(is_pk, 0, "migration removed the legacy PK");
 
         // 4. The old data reads back intact through the full provider.
         let read_conn = format!("sqlite:{}", db_path.display());
@@ -9883,7 +9974,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn initialize_schema_migrates_directory_paths_once() {
+    async fn migrate_fixes_directory_paths_once() {
         let (writer, _temp) = create_test_writer().await;
         writer.set_data_path("/tmp/ducklake-data").unwrap();
         let snapshot_id = writer.create_snapshot().unwrap();
@@ -9933,8 +10024,9 @@ mod tests {
             .execute(&writer.pool)
             .await
             .unwrap();
+        let url = forget_layout_version(&writer.pool, &_temp).await;
         for _ in 0..2 {
-            writer.initialize_schema().unwrap();
+            SqliteMetadataWriter::migrate(&url).await.unwrap();
             assert_eq!(
                 paths(&writer.pool).await,
                 (

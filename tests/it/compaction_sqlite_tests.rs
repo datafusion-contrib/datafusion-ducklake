@@ -383,71 +383,12 @@ async fn read_mapped_rows(temp: &TempDir) -> anyhow::Result<Vec<(i32, i32)>> {
 }
 
 #[cfg(feature = "metadata-duckdb")]
-async fn normalize_official_data_file_ids(temp: &TempDir) -> anyhow::Result<()> {
-    let pool = pool(temp).await;
-    SqliteMetadataWriter::new_with_init(&db_url(temp)).await?;
-    let data_file_columns = sqlx::query("PRAGMA table_info(ducklake_data_file)")
-        .fetch_all(&pool)
-        .await?;
-    let data_file_id_type = data_file_columns
-        .iter()
-        .find(|row| row.get::<String, _>(1) == "data_file_id")
-        .map(|row| row.get::<String, _>(2))
-        .unwrap();
-    if data_file_id_type != "INTEGER" {
-        // SQLite auto-allocates only an exact INTEGER PRIMARY KEY; normalize the
-        // official BIGINT declaration to the crate writer's documented
-        // precondition. Required until the writer allocates the id explicitly
-        // instead of relying on the rowid alias (see issue #291).
-        sqlx::query("ALTER TABLE ducklake_data_file RENAME TO ducklake_data_file__official")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "CREATE TABLE ducklake_data_file (
-                data_file_id INTEGER PRIMARY KEY,
-                table_id INTEGER NOT NULL,
-                path VARCHAR NOT NULL,
-                path_is_relative BOOLEAN NOT NULL DEFAULT 1,
-                file_size_bytes INTEGER NOT NULL,
-                footer_size INTEGER,
-                encryption_key VARCHAR,
-                record_count INTEGER,
-                row_id_start INTEGER,
-                mapping_id INTEGER,
-                begin_snapshot INTEGER NOT NULL,
-                end_snapshot INTEGER,
-                partial_max INTEGER,
-                partition_id INTEGER
-            )",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO ducklake_data_file (
-                data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                footer_size, encryption_key, record_count, row_id_start, mapping_id,
-                begin_snapshot, end_snapshot, partial_max, partition_id
-             )
-             SELECT data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                    footer_size, encryption_key, record_count, row_id_start, mapping_id,
-                    begin_snapshot, end_snapshot, partial_max, partition_id
-             FROM ducklake_data_file__official",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query("DROP TABLE ducklake_data_file__official")
-            .execute(&pool)
-            .await?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "metadata-duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mapped_hive_values_survive_merge_adjacent_files() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
+    // This crate creates the catalog; official DuckDB writes the fixture into it.
+    crate::common::crate_sqlite_catalog(&db_url(&temp), &temp.path().join("data")).await;
     create_official_mapped_compaction_fixture(&temp)?;
-    normalize_official_data_file_ids(&temp).await?;
     assert_eq!(read_mapped_rows(&temp).await?, vec![(1, 7), (2, 8)]);
 
     let result = run_merge(&temp, MergeOptions::default()).await;
@@ -3378,6 +3319,10 @@ mod official_parity {
         let official = TempDir::new().unwrap();
         let ours = TempDir::new().unwrap();
         for temp in [&official, &ours] {
+            // This crate creates both catalogs; official DuckDB writes them.
+            let data = temp.path().join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            crate::common::crate_sqlite_catalog(&db_url(temp), &data).await;
             let conn = open_official(temp, inlining_limit);
             for statement in statements {
                 conn.execute_batch(statement).unwrap();
@@ -3401,7 +3346,6 @@ mod official_parity {
             rowids: official_rowids,
         };
 
-        normalize_official_data_file_ids(&ours).await.unwrap();
         let result = run_merge(&ours, MergeOptions::default()).await;
         assert!(result.did_work());
         let mut our_rowids = Vec::new();

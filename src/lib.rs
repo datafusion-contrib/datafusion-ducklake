@@ -118,6 +118,13 @@ pub mod metadata_provider_postgres;
 pub mod metadata_provider_sqlite;
 
 // Write support (feature-gated)
+#[cfg(any(
+    feature = "write-sqlite",
+    feature = "write-duckdb",
+    feature = "write-mysql",
+    feature = "write-postgres"
+))]
+pub mod catalog_version;
 #[cfg(feature = "write")]
 pub mod compaction;
 #[cfg(feature = "write")]
@@ -237,7 +244,9 @@ pub use metadata_writer_postgres_single::PostgresSingleCatalogMetadataWriter;
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]
-pub use multicatalog::{FileOwners, MulticatalogManager, initialize_multicatalog_schema};
+pub use multicatalog::{
+    FileOwners, MulticatalogManager, initialize_multicatalog_schema, migrate_multicatalog_schema,
+};
 #[cfg(feature = "multicatalog-postgres")]
 pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
 #[cfg(feature = "restore")]

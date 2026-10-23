@@ -1,11 +1,14 @@
 #![cfg(feature = "write-postgres")]
-//! Initialization of both PostgreSQL layouts: a current store costs one
-//! statement and waits behind no writer, a store missing what initialization
-//! guarantees gets it back, and initializations racing on a new store leave
-//! every relation in place.
+//! Opening, initializing and migrating both PostgreSQL layouts: a current
+//! store costs one statement and waits behind no writer, migrating a store
+//! missing what this release creates brings it back, and initializations
+//! racing on a new store leave every relation in place.
 
 use datafusion_ducklake::metadata_writer::MetadataWriter;
-use datafusion_ducklake::{PostgresSingleCatalogMetadataWriter, initialize_multicatalog_schema};
+use datafusion_ducklake::{
+    DuckLakeError, PostgresSingleCatalogMetadataWriter, initialize_multicatalog_schema,
+    migrate_multicatalog_schema,
+};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor, Postgres, Transaction};
 use testcontainers::runners::AsyncRunner;
@@ -140,6 +143,35 @@ async fn reset(pool: &PgPool) {
         .unwrap();
 }
 
+/// Forget the layout version under `key`, as an earlier release left none. The
+/// test may have dropped `ducklake_metadata` itself.
+async fn forget_layout_version(pool: &PgPool, key: &str) {
+    let _ = sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1")
+        .bind(key)
+        .execute(pool)
+        .await;
+}
+
+/// Migrate the multicatalog store as one an earlier release left, creating it
+/// when a test dropped `ducklake_metadata`.
+async fn migrate_multicatalog(pool: &PgPool) {
+    forget_layout_version(pool, "datafusion_ducklake_multicatalog_version").await;
+    match migrate_multicatalog_schema(pool).await {
+        Err(DuckLakeError::InvalidConfig(_)) => initialize_multicatalog_schema(pool).await.unwrap(),
+        result => result.unwrap(),
+    }
+}
+
+/// Migrate the single catalog as one an earlier release left, creating it
+/// when a test dropped `ducklake_metadata`.
+async fn migrate_single(pool: &PgPool) {
+    forget_layout_version(pool, "datafusion_ducklake_version").await;
+    match PostgresSingleCatalogMetadataWriter::migrate_pool(pool).await {
+        Err(DuckLakeError::InvalidConfig(_)) => initialize_single(pool).await.unwrap(),
+        result => result.unwrap(),
+    }
+}
+
 async fn initialize_single(pool: &PgPool) -> datafusion_ducklake::Result<()> {
     PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
         .await?
@@ -174,8 +206,8 @@ async fn initializing_a_current_single_catalog_waits_behind_no_writer() {
     result.unwrap();
 }
 
-/// Initializing a store that lacks one index locks only that index's table,
-/// so it proceeds while writers hold every other table.
+/// Migrating a store that lacks one index locks only that index's table, so it
+/// proceeds while writers hold every other table.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn upgrading_a_multicatalog_store_locks_only_what_it_changes() {
@@ -186,9 +218,10 @@ async fn upgrading_a_multicatalog_store_locks_only_what_it_changes() {
         .execute(&pool)
         .await
         .unwrap();
+    forget_layout_version(&pool, "datafusion_ducklake_multicatalog_version").await;
     let held = hold_writer_locks_except(&pool, "ducklake_catalog_schema_map").await;
 
-    let result = initialize_multicatalog_schema(&impatient_pool(&url).await).await;
+    let result = migrate_multicatalog_schema(&impatient_pool(&url).await).await;
     held.rollback().await.unwrap();
     let restored: bool =
         sqlx::query_scalar("SELECT to_regclass('idx_catalog_schema_map_schema') IS NOT NULL")
@@ -241,18 +274,23 @@ async fn initializing_a_current_single_catalog_sends_one_statement() {
     assert_eq!((opened, initialized), (1, 1));
 }
 
-/// Each table and index a new multicatalog store has comes back when it is
-/// dropped, so the check that skips initialization covers every one.
+/// Each table and index a new multicatalog store has, but `ducklake_catalog`,
+/// comes back when it is dropped and the store migrated.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn multicatalog_initialization_restores_every_relation() {
+async fn multicatalog_migration_restores_every_relation() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_multicatalog_schema(&pool).await.unwrap();
     let created = relations(&pool).await;
 
     let mut missing = Vec::new();
-    for (name, index) in &created {
+    // `ducklake_catalog` is how a store with no layout version is told to be a
+    // multicatalog one, so a store without either is refused, not migrated.
+    for (name, index) in created
+        .iter()
+        .filter(|(name, _)| name != "ducklake_catalog")
+    {
         let kind = if *index {
             "INDEX"
         } else {
@@ -262,7 +300,7 @@ async fn multicatalog_initialization_restores_every_relation() {
             .execute(&pool)
             .await
             .unwrap();
-        initialize_multicatalog_schema(&pool).await.unwrap();
+        migrate_multicatalog(&pool).await;
         if !relations(&pool).await.contains(&(name.clone(), *index)) {
             missing.push(name.clone());
         }
@@ -274,10 +312,10 @@ async fn multicatalog_initialization_restores_every_relation() {
 }
 
 /// Each table and index a new single catalog has comes back when it is
-/// dropped, so the check that skips initialization covers every one.
+/// dropped and the catalog migrated.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn single_catalog_initialization_restores_every_relation() {
+async fn single_catalog_migration_restores_every_relation() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_single(&pool).await.unwrap();
@@ -294,7 +332,7 @@ async fn single_catalog_initialization_restores_every_relation() {
             .execute(&pool)
             .await
             .unwrap();
-        initialize_single(&pool).await.unwrap();
+        migrate_single(&pool).await;
         if !relations(&pool).await.contains(&(name.clone(), *index)) {
             missing.push(name.clone());
         }
@@ -311,7 +349,7 @@ async fn single_catalog_initialization_restores_every_relation() {
 /// current shape.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn multicatalog_initialization_restores_the_current_shape() {
+async fn multicatalog_migration_restores_the_current_shape() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_multicatalog_schema(&pool).await.unwrap();
@@ -328,7 +366,7 @@ async fn multicatalog_initialization_restores_the_current_shape() {
     .await
     .unwrap();
 
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    migrate_multicatalog(&pool).await;
     let (key_columns, changes_not_null, absolute, valid): (i32, bool, bool, bool) = sqlx::query_as(
         "SELECT (SELECT array_length(conkey, 1) FROM pg_constraint
                      WHERE conrelid = 'ducklake_column'::regclass AND contype = 'p'),
@@ -352,10 +390,10 @@ async fn multicatalog_initialization_restores_the_current_shape() {
 
 /// A single catalog missing a counter, with an unslashed `data_path`, a case
 /// variant of `true`, a `NOT NULL` `changes_made` and an invalid index is
-/// migrated by `initialize_schema`.
+/// brought up to date by `migrate`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn single_catalog_initialization_migrates_earlier_data() {
+async fn single_catalog_migration_fixes_earlier_data() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_single(&pool).await.unwrap();
@@ -371,7 +409,7 @@ async fn single_catalog_initialization_migrates_earlier_data() {
     .await
     .unwrap();
 
-    initialize_single(&pool).await.unwrap();
+    migrate_single(&pool).await;
     let (counter, data_path, sort_on_insert, changes_not_null, valid): (
         bool,
         String,
@@ -399,10 +437,11 @@ async fn single_catalog_initialization_migrates_earlier_data() {
     assert!(valid);
 }
 
-/// Columns an earlier release lacked, dropped from a current store, come back.
+/// Columns an earlier release lacked, dropped from a store, come back when it
+/// is migrated.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn multicatalog_initialization_restores_added_columns() {
+async fn multicatalog_migration_restores_added_columns() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_multicatalog_schema(&pool).await.unwrap();
@@ -424,16 +463,16 @@ async fn multicatalog_initialization_restores_added_columns() {
         .unwrap();
     }
 
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    migrate_multicatalog(&pool).await;
 
     assert_eq!(columns_present(&pool, &added).await, added.len() as i64);
 }
 
-/// Columns an earlier release lacked, dropped from a current catalog, come
-/// back when a writer opens it.
+/// Columns an earlier release lacked, dropped from a catalog, come back when
+/// it is migrated.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn single_catalog_open_restores_added_columns() {
+async fn single_catalog_migration_restores_added_columns() {
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_single(&pool).await.unwrap();
@@ -451,11 +490,135 @@ async fn single_catalog_open_restores_added_columns() {
         .unwrap();
     }
 
-    PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
-        .await
-        .unwrap();
+    migrate_single(&pool).await;
 
     assert_eq!(columns_present(&pool, &added).await, added.len() as i64);
+}
+
+/// A store an earlier release left, with no layout version, is refused by
+/// every writer of either layout until it is migrated, once.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_earlier_release_store_is_refused_until_migrated() {
+    let (_container, url) = start().await;
+    let pool = pool(&url).await;
+    initialize_single(&pool).await.unwrap();
+    // An earlier release's catalog has written a snapshot.
+    {
+        use datafusion_ducklake::metadata_writer::MetadataWriter;
+        PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+            .await
+            .unwrap()
+            .create_snapshot()
+            .unwrap();
+    }
+    forget_layout_version(&pool, "datafusion_ducklake_version").await;
+    let single = PostgresSingleCatalogMetadataWriter::from_pool(pool.clone()).await;
+    PostgresSingleCatalogMetadataWriter::migrate_pool(&pool)
+        .await
+        .unwrap();
+    let single_after = PostgresSingleCatalogMetadataWriter::from_pool(pool.clone()).await;
+    reset(&pool).await;
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let catalog = datafusion_ducklake::MulticatalogManager::new(pool.clone())
+        .create_catalog("c")
+        .await
+        .unwrap();
+    {
+        use datafusion_ducklake::metadata_writer::MetadataWriter;
+        datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog)
+            .await
+            .unwrap()
+            .create_snapshot()
+            .unwrap();
+    }
+    forget_layout_version(&pool, "datafusion_ducklake_multicatalog_version").await;
+    let multi = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog).await;
+    let initialized = initialize_multicatalog_schema(&pool).await;
+    migrate_multicatalog_schema(&pool).await.unwrap();
+    let multi_after =
+        datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog).await;
+
+    assert!(
+        matches!(single, Err(DuckLakeError::MigrationRequired(_))),
+        "{single:?}"
+    );
+    assert!(single_after.is_ok(), "{single_after:?}");
+    assert!(
+        matches!(multi, Err(DuckLakeError::MigrationRequired(_))),
+        "{multi:?}"
+    );
+    assert!(
+        matches!(initialized, Err(DuckLakeError::MigrationRequired(_))),
+        "{initialized:?}"
+    );
+    assert!(multi_after.is_ok(), "{multi_after:?}");
+}
+
+/// A store an earlier release created, with no layout version, is refused by
+/// the other layout's writers and migration alike: an unversioned store is
+/// told apart by whether it has `ducklake_catalog`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_unversioned_store_of_one_layout_is_refused_by_the_other() {
+    use datafusion_ducklake::metadata_writer::MetadataWriter;
+    let (_container, url) = start().await;
+    let pool = pool(&url).await;
+    initialize_single(&pool).await.unwrap();
+    PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+        .await
+        .unwrap()
+        .create_snapshot()
+        .unwrap();
+    forget_layout_version(&pool, "datafusion_ducklake_version").await;
+    let multi_on_single = (
+        initialize_multicatalog_schema(&pool).await,
+        migrate_multicatalog_schema(&pool).await,
+    );
+    reset(&pool).await;
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    forget_layout_version(&pool, "datafusion_ducklake_multicatalog_version").await;
+    let single_on_multi = (
+        PostgresSingleCatalogMetadataWriter::from_pool(pool.clone())
+            .await
+            .map(drop),
+        PostgresSingleCatalogMetadataWriter::migrate_pool(&pool).await,
+    );
+
+    for (what, result) in [
+        ("multicatalog init on single", multi_on_single.0),
+        ("multicatalog migrate on single", multi_on_single.1),
+        ("single open on multicatalog", single_on_multi.0),
+        ("single migrate on multicatalog", single_on_multi.1),
+    ] {
+        assert!(
+            matches!(result, Err(DuckLakeError::Unsupported(_))),
+            "{what}: {result:?}"
+        );
+    }
+}
+
+/// The multicatalog layout does not adopt a catalog official DuckDB created.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_multicatalog_layout_does_not_adopt_an_official_catalog() {
+    let (_container, url) = start().await;
+    let pool = pool(&url).await;
+    sqlx::raw_sql(
+        "CREATE TABLE ducklake_metadata (key VARCHAR NOT NULL, value VARCHAR NOT NULL,
+                                         scope VARCHAR, scope_id BIGINT);
+         INSERT INTO ducklake_metadata (key, value) VALUES ('version', '1.0');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let migrated = migrate_multicatalog_schema(&pool).await;
+
+    assert!(
+        matches!(migrated, Err(DuckLakeError::Unsupported(_))),
+        "{migrated:?}"
+    );
 }
 
 /// A role that reads and writes the catalog tables of a current store, without

@@ -173,13 +173,22 @@ pub(crate) async fn drop_live_table(
     Ok(true)
 }
 
-/// Bootstrap standard + multicatalog tables, and bring a store an earlier
-/// release created up to them. Idempotent. A store that is already current
-/// costs one read and runs no DDL. As in official DuckLake, two bootstraps
-/// racing to create or upgrade a store may fail one of them; a retry finds it
-/// current.
+/// Create the standard and multicatalog tables in a database without a
+/// catalog, and record the store's layout version, in one transaction. On an existing store it
+/// only reads that version: a current store is left as it is, and one an
+/// earlier release created is refused with
+/// [`crate::DuckLakeError::MigrationRequired`] until
+/// [`migrate_multicatalog_schema`] runs. Migration is never automatic.
 pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     crate::metadata_writer_postgres::initialize_multicatalog_layout(pool).await
+}
+
+/// Bring a store an earlier release created to the multicatalog layout this
+/// release writes, and record its layout version. Adds the tables, columns and
+/// indexes it lacks in one transaction, and runs the data migrations of
+/// earlier releases. Idempotent; a current store is left as it is.
+pub async fn migrate_multicatalog_schema(pool: &PgPool) -> Result<()> {
+    crate::metadata_writer_postgres::migrate_multicatalog_layout(pool).await
 }
 
 /// The owning catalog of each file object behind a table's file rows. See
@@ -209,7 +218,7 @@ impl MulticatalogManager {
     /// Whether the store has the `ducklake_inlined_data_tables` registry, probed
     /// on `connection` — the caller's open transaction — so the probe takes no
     /// second pooled connection. A store bootstrapped before staged commits lacks
-    /// it until a writer first binds to it.
+    /// it until it is migrated.
     async fn has_inlined_data_registry(&self, connection: &mut PgConnection) -> Result<bool> {
         if self.has_inlined_registry.get().is_some() {
             return Ok(true);
@@ -224,7 +233,8 @@ impl MulticatalogManager {
         Ok(exists)
     }
 
-    /// Connect to PostgreSQL and initialize the multicatalog schema.
+    /// Connect to PostgreSQL and create the multicatalog schema if the database
+    /// has none; see [`initialize_multicatalog_schema`].
     pub async fn connect(connection_string: &str, max_connections: u32) -> Result<Self> {
         let url = connection_string.to_string();
         let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
@@ -238,7 +248,10 @@ impl MulticatalogManager {
         Ok(Self::new(pool))
     }
 
-    /// Construct a manager bound to a Postgres pool.
+    /// Construct a manager bound to a Postgres pool. It reads no layout
+    /// version: use [`Self::connect`], or run [`initialize_multicatalog_schema`]
+    /// first, so a store that needs migrating, or one a newer release wrote, is
+    /// refused before the manager changes it.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
