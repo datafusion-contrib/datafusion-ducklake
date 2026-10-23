@@ -138,6 +138,13 @@ pub enum DuckLakeError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    /// The catalog was created by an earlier release of this crate, or at an
+    /// older layout version than this release writes. The message names the
+    /// `migrate` function that brings it up to date; opening never migrates on
+    /// its own.
+    #[error("Migration required: {0}")]
+    MigrationRequired(String),
+
     /// A concurrent write conflict detected at commit time: another writer
     /// published a newer generation of the table since this write began. The
     /// loser aborts (DuckLake-style optimistic concurrency) rather than silently

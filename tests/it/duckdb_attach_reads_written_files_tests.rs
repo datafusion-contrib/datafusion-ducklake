@@ -166,6 +166,7 @@ impl Lake {
             Kind::Mysql => include_str!("fixtures/release_0_9_0/mysql.sql"),
         })
         .await;
+        lake.migrate_layout().await;
         lake.uninitialized_writer()
             .await
             .set_data_path(&lake.data_path())
@@ -259,7 +260,7 @@ impl Lake {
         }
     }
 
-    /// The crate's writer, as a caller that skips initialization opens it.
+    /// The crate's writer, opened without initialization.
     async fn uninitialized_writer(&self) -> Arc<dyn MetadataWriter> {
         let url = self.url();
         match self.backend {
@@ -278,6 +279,27 @@ impl Lake {
             Backend::Mysql {
                 ..
             } => Arc::new(MySqlMetadataWriter::new(&url).await.unwrap()),
+        }
+    }
+
+    /// Run the crate's opt-in migration, which an earlier release's catalog
+    /// needs before a writer opens it.
+    async fn migrate_layout(&self) {
+        let url = self.url();
+        match self.backend {
+            Backend::DuckDb => DuckdbMetadataWriter::migrate(url).unwrap(),
+            #[cfg(feature = "write-sqlite")]
+            Backend::Sqlite => SqliteMetadataWriter::migrate(&url).await.unwrap(),
+            #[cfg(feature = "write-postgres")]
+            Backend::Postgres {
+                ..
+            } => PostgresSingleCatalogMetadataWriter::migrate(&url)
+                .await
+                .unwrap(),
+            #[cfg(feature = "write-mysql")]
+            Backend::Mysql {
+                ..
+            } => MySqlMetadataWriter::migrate(&url).await.unwrap(),
         }
     }
 

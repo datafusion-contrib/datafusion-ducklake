@@ -10,6 +10,10 @@
 //! with unchanged columns).
 
 use crate::Result;
+use crate::catalog_version::{
+    CatalogState, Layout, MULTICATALOG, MULTICATALOG_LAYOUT_VERSION,
+    MULTICATALOG_LAYOUT_VERSION_KEY, classify, require_migratable, require_writable,
+};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::SUPERSEDED_INLINED_TABLES_SQL;
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget, block_on};
@@ -271,20 +275,18 @@ async fn ensure_postgres_physical_indexes(
     Ok(())
 }
 
-/// The standard DuckLake tables, one statement each, so that
-/// [`ExpectedSchema::from_ddl`] reads what each creates. A statement that would
+/// The standard DuckLake tables, one statement each. A statement that would
 /// change an existing table checks the system catalogs first: `ALTER TABLE`
 /// takes an `ACCESS EXCLUSIVE` lock and `CREATE INDEX` a `SHARE` lock before
-/// finding there is nothing to do, and initialization applies every statement
-/// in one transaction, which holds each lock it takes until it commits.
-/// `CREATE TABLE IF NOT EXISTS` takes no lock on a table that exists.
+/// finding there is nothing to do, and a migration applies every statement in
+/// one transaction, which holds each lock it takes until it commits. `CREATE
+/// TABLE IF NOT EXISTS` takes no lock on a table that exists.
 ///
 /// Each index guard first drops an invalid index of its name: a `CREATE INDEX
 /// CONCURRENTLY` that is interrupted leaves one behind, which `CREATE INDEX IF
 /// NOT EXISTS` would skip forever — paying the maintenance cost on every write
-/// with none of the read benefit, and failing the check that lets a current
-/// store skip initialization. Dropping it makes an interrupted concurrent build
-/// self-healing on the next initialization.
+/// with none of the read benefit. Dropping it makes an interrupted concurrent
+/// build self-healing on the next migration.
 pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
@@ -892,119 +894,6 @@ const SQL_UPGRADE_MULTICATALOG_TABLES: &[&str] = &[
     "DROP INDEX IF EXISTS idx_delete_file_absolute_path",
 ];
 
-/// What [`SQL_UPGRADE_MULTICATALOG_TABLES`] changes besides columns, as a SQL
-/// boolean over the system catalogs that holds once it has run.
-const SQL_MULTICATALOG_SHAPE_CURRENT: &str = "NOT EXISTS (
-         SELECT 1 FROM pg_constraint
-         WHERE conrelid = to_regclass('ducklake_column') AND contype = 'p'
-           AND array_length(conkey, 1) = 1)
-     AND NOT EXISTS (
-         SELECT 1 FROM pg_attribute
-         WHERE attrelid = to_regclass('ducklake_snapshot_changes')
-           AND attname = 'changes_made' AND attnotnull)
-     AND to_regclass('idx_data_file_absolute_path') IS NULL
-     AND to_regclass('idx_delete_file_absolute_path') IS NULL";
-
-/// The relations and columns a layout's initialization guarantees, read from
-/// its DDL so that a check of a store stays in step with what initialization
-/// would change.
-#[derive(Debug, Default)]
-pub(crate) struct ExpectedSchema {
-    /// Each table and index the DDL creates.
-    relations: Vec<String>,
-    /// Each column the DDL adds to an existing table, as parallel
-    /// `(table, column)` lists. `CREATE TABLE IF NOT EXISTS` adds no column to
-    /// a table that exists, so only an `ADD COLUMN` counts.
-    tables: Vec<String>,
-    columns: Vec<String>,
-}
-
-impl ExpectedSchema {
-    /// Read the relations each `CREATE ... IF NOT EXISTS` of `ddl` creates and
-    /// the columns each `ALTER TABLE ... ADD [COLUMN]` adds, also inside a `DO`
-    /// block.
-    pub(crate) fn from_ddl<'a>(ddl: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut expected = Self::default();
-        for statement in ddl {
-            let tokens = statement
-                .split_whitespace()
-                .map(|token| token.trim_end_matches([',', ';']))
-                .collect::<Vec<_>>();
-            let mut table = None;
-            for (i, token) in tokens.iter().enumerate() {
-                let rest = &tokens[i + 1..];
-                match *token {
-                    "CREATE" => {
-                        let rest = rest.strip_prefix(&["UNIQUE"]).unwrap_or(rest);
-                        if let ["TABLE" | "INDEX", "IF", "NOT", "EXISTS", name, ..] = rest {
-                            expected.add_relation(name.trim_end_matches('('));
-                        }
-                    },
-                    "ALTER" if rest.first() == Some(&"TABLE") => table = rest.get(1).copied(),
-                    "ADD" => {
-                        let rest = rest.strip_prefix(&["COLUMN"]).unwrap_or(rest);
-                        let rest = rest.strip_prefix(&["IF", "NOT", "EXISTS"]).unwrap_or(rest);
-                        let constraint = matches!(
-                            rest.first(),
-                            Some(
-                                &("PRIMARY"
-                                    | "CONSTRAINT"
-                                    | "UNIQUE"
-                                    | "CHECK"
-                                    | "FOREIGN"
-                                    | "EXCLUDE")
-                            )
-                        );
-                        if let (Some(table), Some(column), false) =
-                            (table, rest.first(), constraint)
-                        {
-                            expected.add_column(table, column);
-                        }
-                    },
-                    _ => {},
-                }
-            }
-        }
-        expected
-    }
-
-    pub(crate) fn add_relation(&mut self, name: &str) {
-        self.relations.push(name.to_string());
-    }
-
-    pub(crate) fn add_column(&mut self, table: &str, column: &str) {
-        self.tables.push(table.to_string());
-        self.columns.push(column.to_string());
-    }
-
-    /// A SQL boolean over the system catalogs: every relation exists, every
-    /// index among them is valid, and every column exists on its table where
-    /// the table does. Binds `$1`, `$2` and `$3`, which [`Self::bind`] supplies.
-    pub(crate) const SQL_PRESENT: &str = "NOT EXISTS (
-             SELECT 1 FROM unnest($1::text[]) AS expected(name)
-             WHERE to_regclass(expected.name) IS NULL
-                OR EXISTS (SELECT 1 FROM pg_index
-                           WHERE indexrelid = to_regclass(expected.name) AND NOT indisvalid))
-         AND NOT EXISTS (
-             SELECT 1 FROM unnest($2::text[], $3::text[]) AS expected(tbl, col)
-             WHERE to_regclass(expected.tbl) IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM pg_attribute
-                               WHERE attrelid = to_regclass(expected.tbl)
-                                 AND attname = expected.col
-                                 AND attnum > 0 AND NOT attisdropped))";
-
-    /// Bind the arguments of [`Self::SQL_PRESENT`].
-    pub(crate) fn bind<'q, O>(
-        &self,
-        query: sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>,
-    ) -> sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments> {
-        query
-            .bind(self.relations.clone())
-            .bind(self.tables.clone())
-            .bind(self.columns.clone())
-    }
-}
-
 /// Every statement the multicatalog layout's initialization applies, in order.
 fn multicatalog_ddl() -> impl Iterator<Item = &'static str> {
     SQL_CREATE_STANDARD_TABLES
@@ -1014,103 +903,115 @@ fn multicatalog_ddl() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-static MULTICATALOG_SCHEMA: std::sync::LazyLock<ExpectedSchema> =
-    std::sync::LazyLock::new(|| ExpectedSchema::from_ddl(multicatalog_ddl()));
-
-/// Whether the store has every relation, column and shape of the multicatalog
-/// layout, read from the system catalogs alone.
-fn sql_multicatalog_schema_current() -> String {
-    format!(
-        "({present}) AND ({SQL_MULTICATALOG_SHAPE_CURRENT})",
-        present = ExpectedSchema::SQL_PRESENT
-    )
-}
-
-/// One read of a multicatalog store: whether its schema is current, and which
-/// of the data migrations that do not change it apply.
-#[derive(Debug, Default)]
-struct MulticatalogState {
-    schema_current: bool,
-    legacy: LegacyOwnerColumns,
-    legacy_boolean_settings: bool,
-}
-
-async fn multicatalog_state(pool: &PgPool) -> Result<MulticatalogState> {
-    let sql = format!(
-        "SELECT {schema},
-                EXISTS (SELECT 1 FROM pg_attribute
-                        WHERE attrelid = to_regclass('ducklake_data_file')
-                          AND attname = 'owner_catalog_id' AND NOT attisdropped),
-                EXISTS (SELECT 1 FROM pg_attribute
-                        WHERE attrelid = to_regclass('ducklake_delete_file')
-                          AND attname = 'owner_catalog_id' AND NOT attisdropped),
-                EXISTS (SELECT 1 FROM ducklake_metadata
-                        WHERE key IN ('sort_on_insert', 'hive_file_pattern')
-                          AND LOWER(value) = 'true' AND value <> 'true')",
-        schema = sql_multicatalog_schema_current(),
-    );
-    let read = MULTICATALOG_SCHEMA
-        .bind(sqlx::query_as::<_, (bool, bool, bool, bool)>(
-            AssertSqlSafe(sql),
-        ))
-        .fetch_one(pool)
-        .await;
-    match read {
-        Ok((schema_current, data_file, delete_file, legacy_boolean_settings)) => {
-            Ok(MulticatalogState {
-                schema_current,
-                legacy: LegacyOwnerColumns {
-                    data_file,
-                    delete_file,
-                },
-                legacy_boolean_settings,
-            })
-        },
-        // A store without `ducklake_metadata` is not initialized.
+/// The state of the catalog or store behind `pool` from its version rows, for
+/// `layout`; [`CatalogState::Absent`] when it has no `ducklake_metadata` table.
+/// Both layouts are PostgreSQL databases, so an unversioned one, which an
+/// earlier release created, is told apart by `ducklake_catalog`, which only
+/// the multicatalog layout has.
+pub(crate) async fn catalog_state(pool: &PgPool, layout: &Layout) -> Result<CatalogState> {
+    let read = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
+        layout.sql_keys()
+    )))
+    .fetch_all(pool)
+    .await;
+    let rows: Vec<(String, String)> = match read {
+        Ok(rows) => rows,
+        // undefined_table
         Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
-            Ok(MulticatalogState::default())
+            return Ok(CatalogState::Absent);
         },
-        Err(error) => Err(error.into()),
+        Err(error) => return Err(error.into()),
+    };
+    match classify(&rows, layout)? {
+        CatalogState::NeedsMigration(None) => {
+            let multicatalog: bool =
+                sqlx::query_scalar("SELECT to_regclass('ducklake_catalog') IS NOT NULL")
+                    .fetch_one(pool)
+                    .await?;
+            if multicatalog == (layout.key == MULTICATALOG_LAYOUT_VERSION_KEY) {
+                Ok(CatalogState::NeedsMigration(None))
+            } else {
+                Ok(CatalogState::OtherLayout(layout.other_name))
+            }
+        },
+        state => Ok(state),
     }
 }
 
-/// Bring a store to the multicatalog layout: its tables, columns and indexes,
-/// and the data migrations of earlier releases. Idempotent.
-///
-/// A current store costs one read and runs no DDL, so it waits behind no
-/// writer. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an `ACCESS
-/// EXCLUSIVE` lock and `CREATE INDEX IF NOT EXISTS` a `SHARE` lock before they
-/// find there is nothing to do, so the DDL is sent only when the read finds the
-/// schema behind. It is then sent in one round trip, in one transaction, so a
-/// failed one changes nothing. As in official DuckLake, two initializations
-/// racing to create or upgrade a store may fail one of them; a retry finds the
-/// store current.
-///
-/// Official migrates from the `version` a catalog stores, and only when
-/// attached with `AUTOMATIC_MIGRATION`. This layout is not a DuckLake format
-/// and stores no version (#374), so its schema is checked instead.
+async fn multicatalog_state(pool: &PgPool) -> Result<CatalogState> {
+    catalog_state(pool, &MULTICATALOG).await
+}
+
+/// The function that migrates a multicatalog store, named in refusals.
+const MIGRATE_MULTICATALOG: &str = "migrate_multicatalog_schema";
+
+/// Refuse a store a multicatalog writer cannot write as it is.
+pub(crate) async fn require_writable_multicatalog(pool: &PgPool) -> Result<()> {
+    require_writable(&multicatalog_state(pool).await?, MIGRATE_MULTICATALOG)
+}
+
+/// Create the multicatalog layout in a database without a catalog, and record
+/// its layout version. A current store is left as it is, reading only its
+/// version; one that needs migrating is refused until
+/// [`migrate_multicatalog_layout`] runs.
 pub(crate) async fn initialize_multicatalog_layout(pool: &PgPool) -> Result<()> {
-    let mut state = multicatalog_state(pool).await?;
-    if !state.schema_current {
-        let batch = multicatalog_ddl().collect::<Vec<_>>().join(";\n");
-        let mut tx = pool.begin().await?;
-        sqlx::raw_sql(AssertSqlSafe(batch))
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        state = multicatalog_state(pool).await?;
+    match multicatalog_state(pool).await? {
+        CatalogState::Absent => upgrade_multicatalog_and_stamp(pool).await,
+        state => require_writable(&state, MIGRATE_MULTICATALOG),
     }
-    if state.legacy_boolean_settings {
-        sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
-            .execute(pool)
-            .await?;
+}
+
+/// Bring a store an earlier release created to the multicatalog layout this
+/// release writes, and record its layout version. A catalog official DuckDB
+/// created, a single-catalog layout and a newer store are refused.
+pub(crate) async fn migrate_multicatalog_layout(pool: &PgPool) -> Result<()> {
+    let state = multicatalog_state(pool).await?;
+    match state {
+        CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
+            "no multicatalog store to migrate; create one with initialize_multicatalog_schema"
+                .to_string(),
+        )),
+        CatalogState::Current => Ok(()),
+        _ => {
+            require_migratable(&state)?;
+            upgrade_multicatalog_and_stamp(pool).await
+        },
     }
-    copy_legacy_file_ownership(pool, state.legacy).await
+}
+
+/// Apply the multicatalog DDL in one round trip, run the data migrations of
+/// earlier releases and record [`MULTICATALOG_LAYOUT_VERSION`], all in one
+/// transaction, so a failed run changes nothing and another process sees the
+/// store either as it was or current. Each statement that could lock an
+/// existing table checks the system catalogs first, so the transaction locks
+/// only what it changes.
+async fn upgrade_multicatalog_and_stamp(pool: &PgPool) -> Result<()> {
+    let batch = multicatalog_ddl().collect::<Vec<_>>().join(";\n");
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(AssertSqlSafe(batch))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+        .execute(&mut *tx)
+        .await?;
+    let legacy = legacy_owner_columns(&mut tx).await?;
+    copy_legacy_file_ownership(&mut tx, legacy).await?;
+    sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
+        .bind(MULTICATALOG_LAYOUT_VERSION_KEY)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES ($1, $2, NULL)")
+        .bind(MULTICATALOG_LAYOUT_VERSION_KEY)
+        .bind(MULTICATALOG_LAYOUT_VERSION.to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Copy the references a v0.8.0 store records in its `owner_catalog_id`
-/// columns into the reference tables. Runs on every initialization of such a
-/// store.
+/// columns into the reference tables. Runs when such a store is migrated.
 ///
 /// Ownership lives in `ducklake_catalog_data_file_reference` and
 /// `ducklake_catalog_delete_file_reference`, which `SQL_CREATE_MULTICATALOG_TABLES`
@@ -1120,16 +1021,18 @@ pub(crate) async fn initialize_multicatalog_layout(pool: &PgPool) -> Result<()> 
 /// release so that a rollback to
 /// v0.8.0 stays safe:
 ///
-/// - the reference rows in it are copied into the reference tables here, on every
-///   initialization, which also picks up a reference a v0.8.0 process registered
-///   since;
+/// - the reference rows in it are copied into the reference tables here, when the
+///   store is migrated;
 /// - [`legacy_owner_columns`] reports it, and every read of ownership also honours
 ///   it while it exists, and registration writes it too.
 ///
 /// A fresh store never gets the column. Nothing here adds it, and nothing here
 /// drops it: dropping it would let a rolled-back v0.8.0 read every reference as
 /// owned and delete a file another catalog reads.
-async fn copy_legacy_file_ownership(pool: &PgPool, legacy: LegacyOwnerColumns) -> Result<()> {
+async fn copy_legacy_file_ownership(
+    conn: &mut sqlx::PgConnection,
+    legacy: LegacyOwnerColumns,
+) -> Result<()> {
     // The v0.8.0 partial index `idx_*_file_owner_catalog` serves both copies.
     if legacy.data_file {
         sqlx::query(
@@ -1138,7 +1041,7 @@ async fn copy_legacy_file_ownership(pool: &PgPool, legacy: LegacyOwnerColumns) -
              WHERE owner_catalog_id IS NOT NULL
              ON CONFLICT (data_file_id) DO NOTHING",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     if legacy.delete_file {
@@ -1148,7 +1051,7 @@ async fn copy_legacy_file_ownership(pool: &PgPool, legacy: LegacyOwnerColumns) -
              WHERE owner_catalog_id IS NOT NULL
              ON CONFLICT (delete_file_id) DO NOTHING",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     Ok(())
@@ -1458,9 +1361,10 @@ pub type CommitGuardError = Box<dyn std::error::Error + Send + Sync>;
 /// The guard runs once per metadata transaction the writer commits, including
 /// the ones that write nothing: the id reservation at the start of a write, and
 /// a lookup that finds its schema or table already exists. Unguarded are
-/// [`MetadataWriter::initialize_schema`], which creates and upgrades the catalog
-/// tables, and the idempotent `CREATE TABLE IF NOT EXISTS` of
-/// `ducklake_inlined_data_tables` the writers run outside any transaction.
+/// [`MetadataWriter::initialize_schema`] and the writers' `migrate` functions,
+/// which create and upgrade the catalog tables, and the idempotent `CREATE TABLE
+/// IF NOT EXISTS` of `ducklake_inlined_data_tables` a staged commit runs before
+/// its transaction.
 #[async_trait::async_trait]
 pub trait PostgresCommitGuard: Send + Sync + std::fmt::Debug {
     /// Approve or refuse the commit of the transaction `conn` is running.
@@ -2213,14 +2117,15 @@ impl PostgresMetadataWriter {
         Ok((manager, name))
     }
 
-    /// Bind a writer to the given pool and catalog id.
+    /// Bind a writer to `catalog_id` of the store behind `pool`. Reads the
+    /// store's layout version and runs no DDL; a store that needs migrating is
+    /// refused with [`crate::DuckLakeError::MigrationRequired`] until
+    /// [`crate::migrate_multicatalog_schema`] runs.
     ///
     /// Use [`crate::multicatalog::MulticatalogManager::create_catalog`] to obtain
     /// or create a catalog id by name.
     pub async fn with_pool(pool: PgPool, catalog_id: i64) -> Result<Self> {
-        sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
-            .execute(&pool)
-            .await?;
+        require_writable_multicatalog(&pool).await?;
         Ok(Self {
             pool,
             catalog_id,
@@ -9510,87 +9415,13 @@ async fn enforce_inline_partition_fence(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ExpectedSchema, inlined_postgres_type, multicatalog_ddl, push_inlined_postgres_value,
-    };
+    use super::{inlined_postgres_type, push_inlined_postgres_value};
     use crate::metadata_writer::{ColumnDef, columns_differ};
     use arrow::array::types::IntervalMonthDayNano;
     use arrow::array::{Array, FixedSizeBinaryArray, IntervalMonthDayNanoArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, IntervalUnit};
     use sqlx::{Postgres, QueryBuilder};
     use std::sync::Arc;
-
-    /// The parser reads a relation created inside a `DO` block, a column added
-    /// with or without `COLUMN` and `IF NOT EXISTS`, and no constraint.
-    #[test]
-    fn expected_schema_reads_every_form_of_its_ddl() {
-        let expected = ExpectedSchema::from_ddl([
-            "CREATE TABLE IF NOT EXISTS t1 (a BIGINT, b VARCHAR)",
-            "DO $$ BEGIN IF to_regclass('i1') IS NULL THEN \
-             CREATE UNIQUE INDEX IF NOT EXISTS i1 ON t1(a); END IF; END $$",
-            "ALTER TABLE t1 ADD c BIGINT, ADD COLUMN d BIGINT, ADD IF NOT EXISTS e BIGINT",
-            "ALTER TABLE t2 ADD PRIMARY KEY (a), ADD CONSTRAINT k UNIQUE (b), \
-             ALTER COLUMN f DROP NOT NULL, ADD COLUMN IF NOT EXISTS g BIGINT",
-            "DROP INDEX IF EXISTS i2",
-        ]);
-        let columns = expected
-            .tables
-            .iter()
-            .zip(&expected.columns)
-            .map(|(table, column)| format!("{table}.{column}"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(expected.relations, ["t1", "i1"]);
-        assert_eq!(columns, ["t1.c", "t1.d", "t1.e", "t2.g"]);
-    }
-
-    /// The check of a multicatalog store names every table and index its DDL
-    /// creates and every column it adds, also inside a `DO` block, and no
-    /// column it adds as a relation.
-    #[test]
-    fn multicatalog_expected_schema_follows_its_ddl() {
-        let expected = ExpectedSchema::from_ddl(multicatalog_ddl());
-        let columns = expected
-            .tables
-            .iter()
-            .zip(&expected.columns)
-            .map(|(table, column)| format!("{table}.{column}"))
-            .collect::<Vec<_>>();
-        let added = multicatalog_ddl()
-            .map(|statement| statement.matches("ADD COLUMN").count())
-            .sum::<usize>();
-
-        for relation in [
-            "ducklake_metadata",
-            "ducklake_catalog",
-            "ducklake_inlined_data_tables",
-            "idx_file_column_stats_table_file_column",
-            "idx_ducklake_column_live",
-        ] {
-            assert!(
-                expected.relations.iter().any(|r| r == relation),
-                "{relation}"
-            );
-        }
-        assert!(
-            expected
-                .relations
-                .iter()
-                .all(|relation| relation.starts_with("ducklake_") || relation.starts_with("idx_")),
-            "{:?}",
-            expected.relations
-        );
-        for column in [
-            "ducklake_metadata.scope_id",
-            "ducklake_catalog.data_path",
-            "ducklake_delete_file.partial_max",
-            "ducklake_column.default_value_dialect",
-            "ducklake_files_scheduled_for_deletion.scheduled_by_owner",
-        ] {
-            assert!(columns.iter().any(|c| c == column), "{column}");
-        }
-        assert_eq!(columns.len(), added, "{columns:?}");
-    }
 
     #[test]
     fn postgres_inlined_types_follow_ducklake_encodings() {

@@ -631,6 +631,8 @@ async fn postgres_inlined_timetz_table_is_native() {
             .execute_batch(&format!("USE lake; {statement}"))
             .unwrap_or_else(|e| panic!("`{statement}`: {e}"));
     };
+    // This crate creates the catalog; official DuckDB creates the table.
+    crate::common::crate_postgres_catalog(&url, &data).await;
     official("CREATE TABLE z (id INTEGER, t TIMETZ)");
 
     let writer = PostgresSingleCatalogMetadataWriter::new_with_init(&url)

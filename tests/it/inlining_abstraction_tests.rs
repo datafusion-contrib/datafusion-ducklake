@@ -2559,12 +2559,12 @@ async fn flush_policy_over_a_provider_without_flush_reads() {
 
 /// A `sort_on_insert` or `hive_file_pattern` that releases before this one
 /// stored as a case variant of `true` (`TRUE`), which they read as on, is
-/// rewritten to `true` when a writer initialises the catalog's schema, so it
-/// stays on now that both this crate and official read only exactly `true` as
-/// on; any other value is left as stored, as it already reads as official
-/// reads it. `quote` quotes the `key` and `value` columns; `exec` runs a
-/// statement on the catalog database, `reinit` initialises a writer's schema
-/// over it and `read` returns the `(key, value, scope)` rows a query selects.
+/// rewritten to `true` when the catalog is migrated, so it stays on now that
+/// both this crate and official read only exactly `true` as on; any other
+/// value is left as stored, as it already reads as official reads it. `quote`
+/// quotes the `key` and `value` columns; `exec` runs a statement on the
+/// catalog database, `reinit` migrates it and `read` returns the
+/// `(key, value, scope)` rows a query selects.
 pub(crate) async fn legacy_true_settings_are_canonicalized(
     quote: char,
     exec: impl AsyncFn(String),
@@ -2585,6 +2585,12 @@ pub(crate) async fn legacy_true_settings_are_canonicalized(
          ('sort_on_insert', 'FALSE', 'schema', 0), \
          ('sort_on_insert', 'trúe', 'table', 1), \
          ('auto_compact', 'TRUE', NULL, NULL)"
+    ))
+    .await;
+    // Those releases recorded no layout version.
+    exec(format!(
+        "DELETE FROM ducklake_metadata WHERE {key} IN \
+         ('datafusion_ducklake_version', 'datafusion_ducklake_multicatalog_version')"
     ))
     .await;
     reinit().await;
@@ -2626,7 +2632,11 @@ async fn legacy_true_settings_are_canonicalized_sqlite() {
                 .await
                 .unwrap();
         },
-        async || lake.writer.initialize_schema().unwrap(),
+        async || {
+            datafusion_ducklake::SqliteMetadataWriter::migrate(&url)
+                .await
+                .unwrap();
+        },
         async |query| {
             sqlx::query_as(sqlx::AssertSqlSafe(query))
                 .fetch_all(&pool)
@@ -2652,9 +2662,7 @@ async fn legacy_true_settings_are_canonicalized_duckdb() {
                 .execute_batch(&statement)
                 .unwrap();
         },
-        async || {
-            drop(datafusion_ducklake::DuckdbMetadataWriter::new_with_init(path.clone()).unwrap());
-        },
+        async || datafusion_ducklake::DuckdbMetadataWriter::migrate(path.clone()).unwrap(),
         async |query| {
             let connection = duckdb::Connection::open(&path).unwrap();
             let mut statement = connection.prepare(&query).unwrap();
@@ -2766,9 +2774,11 @@ async fn mysql_scenarios() {
         .await
         .unwrap();
     let url = format!("mysql://root@127.0.0.1:{port}/legacy_settings");
-    let writer = datafusion_ducklake::MySqlMetadataWriter::new_with_init(&url)
-        .await
-        .unwrap();
+    drop(
+        datafusion_ducklake::MySqlMetadataWriter::new_with_init(&url)
+            .await
+            .unwrap(),
+    );
     let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
     legacy_true_settings_are_canonicalized(
         '`',
@@ -2778,7 +2788,11 @@ async fn mysql_scenarios() {
                 .await
                 .unwrap();
         },
-        async || writer.initialize_schema().unwrap(),
+        async || {
+            datafusion_ducklake::MySqlMetadataWriter::migrate(&url)
+                .await
+                .unwrap();
+        },
         async |query| {
             sqlx::query_as(sqlx::AssertSqlSafe(query))
                 .fetch_all(&pool)
@@ -2836,7 +2850,7 @@ async fn multicatalog_scenarios() {
     all_scenarios(multicatalog(pool.clone())).await;
     // Through the bootstrap multi-catalog stores run, and a writer's own.
     legacy_true_settings_are_canonicalized_on_postgres(&pool, async || {
-        datafusion_ducklake::initialize_multicatalog_schema(&pool)
+        datafusion_ducklake::migrate_multicatalog_schema(&pool)
             .await
             .unwrap();
     })
@@ -2845,11 +2859,15 @@ async fn multicatalog_scenarios() {
         .create_catalog("legacy_settings")
         .await
         .unwrap();
-    let writer = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
-        .await
-        .unwrap();
+    drop(
+        datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
     legacy_true_settings_are_canonicalized_on_postgres(&pool, async || {
-        writer.initialize_schema().unwrap();
+        datafusion_ducklake::migrate_multicatalog_schema(&pool)
+            .await
+            .unwrap();
     })
     .await;
 }
@@ -2879,12 +2897,16 @@ async fn postgres_single_catalog_scenarios() {
         .await
         .unwrap();
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/legacy_settings");
-    let writer = datafusion_ducklake::PostgresSingleCatalogMetadataWriter::new_with_init(&url)
-        .await
-        .unwrap();
+    drop(
+        datafusion_ducklake::PostgresSingleCatalogMetadataWriter::new_with_init(&url)
+            .await
+            .unwrap(),
+    );
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     legacy_true_settings_are_canonicalized_on_postgres(&pool, async || {
-        writer.initialize_schema().unwrap();
+        datafusion_ducklake::PostgresSingleCatalogMetadataWriter::migrate_pool(&pool)
+            .await
+            .unwrap();
     })
     .await;
     let make = postgres_single(port);

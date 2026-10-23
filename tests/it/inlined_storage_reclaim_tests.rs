@@ -1101,16 +1101,19 @@ mod duckdb_catalog {
         WHERE database_name = 'meta' AND table_name LIKE 'ducklake_inlined_%'
           AND table_name <> 'ducklake_inlined_data_tables'";
 
-    /// Every scenario on a catalog official DuckDB wrote: its inlined tables per schema
+    /// Every scenario on a catalog official DuckDB wrote (this crate created it):
+    /// its inlined tables per schema
     /// version (created at ALTER time), its inlined delete table, a dropped table and an
     /// inline-deleted row. This crate expires it and drops its empty superseded tables,
     /// and official reads and writes it afterwards. The inline-deleted row stays, as it
     /// does under official 1.5.5's expire.
     #[tokio::test(flavor = "multi_thread")]
-    async fn duckdb_official_catalog_inline_storage_is_reclaimed() {
+    async fn duckdb_inline_storage_official_wrote_is_reclaimed() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("meta.ducklake");
         let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        crate::common::crate_duckdb_catalog(&path, &data);
         {
             let connection = official(&path, &data);
             connection

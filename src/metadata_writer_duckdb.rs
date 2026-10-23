@@ -37,6 +37,10 @@
 //!    `begin_snapshot`/`end_snapshot` newer than the base observed at begin.
 
 use crate::Result;
+use crate::catalog_version::{
+    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
+    require_writable,
+};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
@@ -1093,22 +1097,14 @@ impl DuckdbMetadataWriter {
         })
     }
 
-    /// Open (creating if absent) a DuckDB catalog file for writing.
+    /// Open (creating if absent) a DuckDB catalog file for writing. Reads the
+    /// catalog's layout version and runs no DDL; a catalog that needs
+    /// migrating is refused with [`crate::DuckLakeError::MigrationRequired`]
+    /// until [`Self::migrate`] runs.
     pub fn new(path: impl Into<String>) -> Result<Self> {
         let catalog_path = path.into();
         let conn = Connection::open(&catalog_path)?;
-        // A catalog an earlier release created lacks columns this writer
-        // inserts, even when the caller skips `initialize_schema`.
-        let initialized: bool = conn.query_row(
-            "SELECT COUNT(*) = 5 FROM duckdb_tables()
-             WHERE table_name IN ('ducklake_snapshot', 'ducklake_schema', 'ducklake_table',
-                                  'ducklake_data_file', 'ducklake_delete_file')",
-            [],
-            |row| row.get(0),
-        )?;
-        if initialized {
-            conn.execute_batch(SQL_ADD_OFFICIAL_COLUMNS)?;
-        }
+        require_writable(&catalog_state(&conn)?, "DuckdbMetadataWriter::migrate")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             catalog_path,
@@ -1123,6 +1119,25 @@ impl DuckdbMetadataWriter {
         let writer = Self::new(path)?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+
+    /// Bring the catalog at `path`, which an earlier release of this crate
+    /// created, to the layout this release writes, and record its layout
+    /// version. A catalog official DuckDB created is refused. Opening a writer
+    /// never migrates.
+    pub fn migrate(path: impl Into<String>) -> Result<()> {
+        let mut conn = Connection::open(path.into())?;
+        let state = catalog_state(&conn)?;
+        match state {
+            CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
+                "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
+            )),
+            CatalogState::Current => Ok(()),
+            _ => {
+                require_migratable(&state)?;
+                upgrade_and_stamp(&mut conn)
+            },
+        }
     }
 
     /// Rebuild the catalog tables official DuckDB inserts into by position
@@ -1523,8 +1538,7 @@ fn restart_legacy_sequences(tx: &Transaction<'_>, allocator: IdAllocator, last: 
 }
 
 /// Create the counter of `allocator` at the largest id in use, if it does not
-/// exist yet, as on a catalog this writer created before it kept the counter or
-/// one official DuckDB created.
+/// exist yet, as on a catalog this writer created before it kept the counter.
 fn seed_id_allocator(tx: &Transaction<'_>, allocator: IdAllocator) -> Result<()> {
     let key = allocator.key();
     tx.execute(
@@ -6078,67 +6092,10 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
     fn initialize_schema(&self) -> Result<()> {
         let mut conn = self.connection();
-        conn.execute_batch(SQL_CREATE_SCHEMA)?;
-        for (table, columns) in POSITIONAL_TABLES {
-            conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({columns})"))?;
+        match catalog_state(&conn)? {
+            CatalogState::Absent => upgrade_and_stamp(&mut conn),
+            state => require_writable(&state, "DuckdbMetadataWriter::migrate"),
         }
-        conn.execute_batch("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")?;
-        conn.execute_batch(
-            "ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT",
-        )?;
-        conn.execute_batch(SQL_ADD_OFFICIAL_COLUMNS)?;
-        // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
-        // (CREATE TABLE IF NOT EXISTS never alters an existing table). DuckDB supports
-        // ADD COLUMN IF NOT EXISTS, so this is idempotent and lossless (NULL means
-        // "not partitioned").
-        conn.execute_batch(
-            "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
-        )?;
-        conn.execute_batch(
-            "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL;
-             ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT;
-             ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
-        )?;
-        // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, so it
-        // needs no counter). Idempotent on re-open, and seeded from the current
-        // MAX so a pre-existing catalog continues without reusing ids.
-        conn.execute_batch(
-            "INSERT INTO ducklake_metadata (key, value, scope)
-             SELECT 'next_column_id',
-                    CAST(COALESCE((SELECT MAX(column_id) FROM ducklake_column), 0) AS VARCHAR),
-                    NULL
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
-             )",
-        )?;
-        // Give legacy directory paths the trailing `/` DuckLake readers expect.
-        conn.execute_batch(
-            "UPDATE ducklake_metadata SET value = value || '/'
-             WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/';
-             UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';
-             UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';",
-        )?;
-        conn.execute_batch(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)?;
-        // A catalog this writer created before it kept the id watermarks has
-        // them at their defaults; raise the head's past every id in use.
-        let tx = conn.transaction()?;
-        for allocator in [IdAllocator::Catalog, IdAllocator::File] {
-            seed_id_allocator(&tx, allocator)?;
-            let key = allocator.key();
-            tx.execute(
-                &format!(
-                    "UPDATE ducklake_snapshot
-                     SET {key} = (SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
-                                  WHERE key = '{key}' AND scope IS NULL)
-                     WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
-                       AND {key} <= (SELECT CAST(value AS BIGINT) FROM ducklake_metadata
-                                     WHERE key = '{key}' AND scope IS NULL)"
-                ),
-                [],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     fn begin_write_transaction(
@@ -6318,6 +6275,104 @@ fn enforce_inline_partition_fence(
     Ok(())
 }
 
+/// Create or upgrade every table, column and counter this writer uses, then
+/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
+/// recorded last, so an interrupted run is completed by running it again.
+fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(SQL_CREATE_SCHEMA)?;
+    for (table, columns) in POSITIONAL_TABLES {
+        conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {table} ({columns})"))?;
+    }
+    conn.execute_batch("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")?;
+    conn.execute_batch("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")?;
+    conn.execute_batch(SQL_ADD_OFFICIAL_COLUMNS)?;
+    // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
+    // (CREATE TABLE IF NOT EXISTS never alters an existing table). DuckDB supports
+    // ADD COLUMN IF NOT EXISTS, so this is idempotent and lossless (NULL means
+    // "not partitioned").
+    conn.execute_batch(
+        "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
+    )?;
+    conn.execute_batch(
+        "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL;
+         ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT;
+         ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+    )?;
+    // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, so it
+    // needs no counter). Idempotent on re-open, and seeded from the current
+    // MAX so a pre-existing catalog continues without reusing ids.
+    conn.execute_batch(
+        "INSERT INTO ducklake_metadata (key, value, scope)
+         SELECT 'next_column_id',
+                CAST(COALESCE((SELECT MAX(column_id) FROM ducklake_column), 0) AS VARCHAR),
+                NULL
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
+         )",
+    )?;
+    // Give legacy directory paths the trailing `/` DuckLake readers expect.
+    conn.execute_batch(
+        "UPDATE ducklake_metadata SET value = value || '/'
+         WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/';
+         UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';
+         UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';",
+    )?;
+    conn.execute_batch(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)?;
+    // A catalog this writer created before it kept the id watermarks has
+    // them at their defaults; raise the head's past every id in use.
+    let tx = conn.transaction()?;
+    for allocator in [IdAllocator::Catalog, IdAllocator::File] {
+        seed_id_allocator(&tx, allocator)?;
+        let key = allocator.key();
+        tx.execute(
+            &format!(
+                "UPDATE ducklake_snapshot
+                 SET {key} = (SELECT CAST(value AS BIGINT) + 1 FROM ducklake_metadata
+                              WHERE key = '{key}' AND scope IS NULL)
+                 WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+                   AND {key} <= (SELECT CAST(value AS BIGINT) FROM ducklake_metadata
+                                 WHERE key = '{key}' AND scope IS NULL)"
+            ),
+            [],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
+        [LAYOUT_VERSION_KEY],
+    )?;
+    tx.execute(
+        "INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)",
+        [LAYOUT_VERSION_KEY, &LAYOUT_VERSION.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The catalog's state from its version rows; [`CatalogState::Absent`] when
+/// it has no `ducklake_metadata` table.
+fn catalog_state(conn: &Connection) -> Result<CatalogState> {
+    let exists = |table: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = ?",
+            [table],
+            |row| row.get(0),
+        )?)
+    };
+    if !exists("ducklake_metadata")? {
+        return Ok(CatalogState::Absent);
+    }
+    let mut statement = conn.prepare(&format!(
+        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
+        SINGLE_CATALOG.sql_keys()
+    ))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    classify(&rows, &SINGLE_CATALOG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6328,7 +6383,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn initialize_schema_migrates_directory_paths_once() {
+    fn migrate_fixes_directory_paths_once() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("catalog.ducklake");
         let writer = DuckdbMetadataWriter::new_with_init(db_path.to_str().unwrap()).unwrap();
@@ -6372,8 +6427,18 @@ mod tests {
                  UPDATE ducklake_table SET path = 'users';",
             )
             .unwrap();
+        // An earlier release recorded no layout version.
+        writer
+            .connection()
+            .execute(
+                "DELETE FROM ducklake_metadata WHERE key = ?",
+                [LAYOUT_VERSION_KEY],
+            )
+            .unwrap();
+        drop(writer);
         for _ in 0..2 {
-            writer.initialize_schema().unwrap();
+            DuckdbMetadataWriter::migrate(db_path.to_str().unwrap()).unwrap();
+            let writer = DuckdbMetadataWriter::new(db_path.to_str().unwrap()).unwrap();
             assert_eq!(paths(&writer), expected);
         }
     }

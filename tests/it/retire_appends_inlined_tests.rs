@@ -280,7 +280,13 @@ mod sqlite {
             .execute(&pool)
             .await
             .unwrap();
+        // That release recorded no layout version; migrating restores the column.
+        sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_version'")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
+        SqliteMetadataWriter::migrate(&url).await.unwrap();
         writes_to_a_catalog_without_delete_file_partial_max(&backend(&dir).await).await;
     }
 }
@@ -457,10 +463,11 @@ mod multicatalog_backend {
         for statement in [
             "ALTER TABLE ducklake_delete_file DROP COLUMN partial_max",
             "ALTER TABLE ducklake_metadata DROP COLUMN scope_id",
+            "DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_multicatalog_version'",
         ] {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
-        datafusion_ducklake::initialize_multicatalog_schema(&pool)
+        datafusion_ducklake::migrate_multicatalog_schema(&pool)
             .await
             .unwrap();
         let catalog = MulticatalogManager::new(pool.clone())

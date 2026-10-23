@@ -172,8 +172,8 @@ enum Step {
 
 /// Apply `history` to an official lake and a crate lake under `dir`, then
 /// require equal table-wide statistics and equal DuckDB answers to `queries`.
-/// The crate's lake is created by this crate, or by DuckDB when the history
-/// starts with [`Step::Duck`].
+/// The crate's lake is created by this crate, which writes only catalogs it
+/// created.
 async fn differential(dir: &Path, history: &[Step], queries: &[&str]) {
     differential_with(dir, history, queries, None).await;
 }
@@ -189,12 +189,11 @@ async fn differential_with(
 ) {
     let official = Lake::new(dir, "official");
     let ours = Lake::new(dir, "crate");
-    if !matches!(history.first(), Some(Step::Duck(_))) {
-        // Official creates `main` with the catalog.
-        let (_, writer) = ours.crate_side();
-        let snapshot = writer.create_snapshot().unwrap();
-        writer.get_or_create_schema("main", None, snapshot).unwrap();
-    }
+    // Official creates `main` with the catalog.
+    let (_, writer) = ours.crate_side();
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    drop(writer);
     for step in history {
         match step {
             Step::Duck(sql) => {

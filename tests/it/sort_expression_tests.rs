@@ -333,6 +333,9 @@ async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
         let catalog = temp.path().join("c.db");
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
+        let url = format!("sqlite:{}?mode=rwc", catalog.display());
+        // This crate creates the catalog; the DuckDB CLI writes it first.
+        crate::common::crate_sqlite_catalog(&url, &data).await;
         cli(&format!(
             "{} CALL lake.set_option('data_inlining_row_limit', 0); \
              CREATE TABLE lake.o({COLUMNS}); ALTER TABLE lake.o SET SORTED BY ({keys}); \
@@ -347,7 +350,6 @@ async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
         ))
         .unwrap();
 
-        let url = format!("sqlite:{}?mode=rwc", catalog.display());
         let writer: Arc<dyn MetadataWriter> =
             Arc::new(SqliteMetadataWriter::new_with_init(&url).await.unwrap());
         let provider: Arc<dyn MetadataProvider> =

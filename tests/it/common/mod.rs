@@ -420,3 +420,50 @@ pub fn create_catalog_multiple_snapshots(catalog_path: &Path) -> Result<()> {
 
     Ok(())
 }
+
+/// Create an empty catalog with this crate's SQLite writer at `url`, its data
+/// under `data_path`, for official DuckDB to attach (with the same
+/// `DATA_PATH`) and write. The crate writes only catalogs it created. Like a
+/// catalog official creates, it starts with a snapshot holding schema `main`,
+/// which official needs to attach it.
+#[cfg(feature = "write-sqlite")]
+pub async fn crate_sqlite_catalog(url: &str, data_path: &Path) {
+    use datafusion_ducklake::MetadataWriter;
+    let writer = datafusion_ducklake::SqliteMetadataWriter::new_with_init(url)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    start_with_main(&writer);
+}
+
+/// [`crate_sqlite_catalog`] for this crate's DuckDB writer, with the catalog
+/// file at `path`. The writer is closed on return, so official DuckDB can open
+/// the file.
+#[cfg(feature = "write-duckdb")]
+pub fn crate_duckdb_catalog(path: &Path, data_path: &Path) {
+    use datafusion_ducklake::MetadataWriter;
+    let writer =
+        datafusion_ducklake::DuckdbMetadataWriter::new_with_init(path.display().to_string())
+            .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    start_with_main(&writer);
+}
+
+/// [`crate_sqlite_catalog`] for this crate's single-catalog PostgreSQL writer.
+#[cfg(feature = "write-postgres")]
+pub async fn crate_postgres_catalog(url: &str, data_path: &Path) {
+    use datafusion_ducklake::MetadataWriter;
+    let writer = datafusion_ducklake::PostgresSingleCatalogMetadataWriter::new_with_init(url)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    start_with_main(&writer);
+}
+
+/// Commit the first snapshot, holding schema `main`, as official's own
+/// initialization does.
+#[cfg(any(feature = "write-sqlite", feature = "write-duckdb", feature = "write-postgres"))]
+fn start_with_main(writer: &dyn datafusion_ducklake::MetadataWriter) {
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+}

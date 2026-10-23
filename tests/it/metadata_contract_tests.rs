@@ -537,8 +537,16 @@ async fn postgres_metadata_contract() {
     let manager = MulticatalogManager::connect(&url, 5).await.unwrap();
     let catalog_id = manager.create_catalog("metadata_contract").await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
-    sqlx::query("DROP TABLE ducklake_inlined_data_tables")
-        .execute(&pool)
+    // A store an earlier release created lacks the inline registry and a
+    // layout version; migrating creates the registry.
+    sqlx::raw_sql(
+        "DROP TABLE ducklake_inlined_data_tables;
+         DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_multicatalog_version'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    datafusion_ducklake::migrate_multicatalog_schema(&pool)
         .await
         .unwrap();
     let writer = manager.writer(catalog_id).await.unwrap();
@@ -712,7 +720,7 @@ async fn sqlite_snapshot_changes_preserve_null_and_missing_ledger_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sqlite_reopens_legacy_catalog_without_schema_initialization() {
+async fn sqlite_migrates_a_legacy_catalog() {
     let temp = TempDir::new().unwrap();
     let url = format!(
         "sqlite:{}?mode=rwc",
@@ -737,6 +745,12 @@ async fn sqlite_reopens_legacy_catalog_without_schema_initialization() {
         .execute(&pool)
         .await
         .unwrap();
+    // The legacy release recorded no layout version.
+    sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    SqliteMetadataWriter::migrate(&url).await.unwrap();
     let writer = SqliteMetadataWriter::new(&url).await.unwrap();
     let (replaced_table_id, replaced_snapshot) = write_contract_data(&writer, "replacement");
     let removed = writer

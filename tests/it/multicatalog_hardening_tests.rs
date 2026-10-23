@@ -37,6 +37,20 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
     Ok((pool, container))
 }
 
+/// Migrate the store as one an earlier release left, which recorded no layout
+/// version.
+async fn migrate_as_an_earlier_release(pool: &PgPool) {
+    sqlx::query(
+        "DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_multicatalog_version'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    datafusion_ducklake::migrate_multicatalog_schema(pool)
+        .await
+        .unwrap();
+}
+
 fn users_cols() -> Vec<ColumnDef> {
     vec![
         ColumnDef::new("id", "int64", false).unwrap(),
@@ -453,7 +467,7 @@ async fn legacy_data_path_is_backfilled_and_rejects_overwrite() {
     .await
     .unwrap();
 
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    migrate_as_an_earlier_release(&pool).await;
     let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
         .await
         .unwrap();
@@ -1092,23 +1106,26 @@ async fn multicatalog_provider_lists_and_resolves_views() {
     assert_eq!(all_views[0].view, views[0]);
 }
 
-/// Initializations racing on a store from v0.6.0 and earlier, which lacks
+/// Migrations racing on a store from v0.6.0 and earlier, which lacks
 /// `ducklake_delete_file.partial_max` and `ducklake_metadata.scope` /
 /// `scope_id`, all succeed: one that finds a column missing while another adds
 /// it waits for that one and leaves the column as it is.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn concurrent_initializations_upgrade_an_old_store() {
+async fn concurrent_migrations_upgrade_an_old_store() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     for round in 0..5 {
         for statement in [
+            "DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_multicatalog_version'",
             "ALTER TABLE ducklake_delete_file DROP COLUMN partial_max",
             "ALTER TABLE ducklake_metadata DROP COLUMN scope_id, DROP COLUMN scope",
         ] {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
-        let results =
-            futures::future::join_all((0..12).map(|_| initialize_multicatalog_schema(&pool))).await;
+        let results = futures::future::join_all(
+            (0..12).map(|_| datafusion_ducklake::migrate_multicatalog_schema(&pool)),
+        )
+        .await;
         for result in results {
             result.unwrap_or_else(|e| panic!("round {round}: {e}"));
         }

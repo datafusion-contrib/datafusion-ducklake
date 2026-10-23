@@ -40,6 +40,19 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
     Ok((pool, container))
 }
 
+/// Migrate the store as one an earlier release left, which recorded no layout
+/// version.
+async fn migrate_as_an_earlier_release(pool: &PgPool) {
+    sqlx::query(
+        "DELETE FROM ducklake_metadata WHERE key = 'datafusion_ducklake_multicatalog_version'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    datafusion_ducklake::migrate_multicatalog_schema(pool)
+        .await
+        .unwrap();
+}
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn multicatalog_provider_reads_inlined_rows() {
@@ -4862,9 +4875,9 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
     .await
     .unwrap();
 
-    // Re-run the multicatalog bootstrap: the migrations convert the PK and add
+    // Migrate the store: the migrations convert the PK and add
     // the nullable default metadata without changing existing rows.
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    migrate_as_an_earlier_release(&pool).await;
     let pk_len_after: i32 = sqlx::query_scalar(
         "SELECT array_length(conkey, 1) FROM pg_constraint
          WHERE conrelid = 'ducklake_column'::regclass AND contype = 'p'",
@@ -7250,7 +7263,7 @@ async fn file_column_stats_index_has_the_documented_shape() {
 /// state deterministically; it is what an interrupted concurrent build leaves behind.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn an_invalid_file_column_stats_index_is_rebuilt_on_initialize() {
+async fn an_invalid_file_column_stats_index_is_rebuilt_on_migrate() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
 
     sqlx::query(
@@ -7272,7 +7285,7 @@ async fn an_invalid_file_column_stats_index_is_rebuilt_on_initialize() {
     .unwrap();
     assert!(invalid_now, "setup failed to mark the index invalid");
 
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    migrate_as_an_earlier_release(&pool).await;
 
     let valid: Vec<bool> = sqlx::query_scalar(
         "SELECT i.indisvalid FROM pg_index i
@@ -7286,7 +7299,7 @@ async fn an_invalid_file_column_stats_index_is_rebuilt_on_initialize() {
     assert_eq!(
         valid,
         vec![true],
-        "initialization must leave exactly one valid stats index; an invalid one \
+        "migration must leave exactly one valid stats index; an invalid one \
          left in place is skipped by CREATE INDEX IF NOT EXISTS forever"
     );
 }
@@ -8173,8 +8186,8 @@ async fn a_v0_8_store_keeps_its_references_and_its_ownership_column() {
         "a reference held only in the v0.8.0 column must still defer the owner: {deleted:?}"
     );
 
-    // The next boot copies it into the reference table and leaves the column.
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    // Migrating copies it into the reference table and leaves the column.
+    migrate_as_an_earlier_release(&pool).await;
     let copied: Option<i64> = sqlx::query_scalar(
         "SELECT r.owner_catalog_id FROM ducklake_catalog_data_file_reference r
          JOIN ducklake_data_file df ON df.data_file_id = r.data_file_id
@@ -9208,9 +9221,9 @@ async fn bootstrapping_a_pre_ownership_store_leaves_every_file_owned() {
             .unwrap();
     }
 
-    // The upgrade, twice: it runs on every boot, so it has to be idempotent.
-    initialize_multicatalog_schema(&pool).await.unwrap();
-    initialize_multicatalog_schema(&pool).await.unwrap();
+    // The migration, twice: it has to be idempotent.
+    migrate_as_an_earlier_release(&pool).await;
+    migrate_as_an_earlier_release(&pool).await;
 
     let unowned: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM ducklake_catalog_data_file_reference)

@@ -1585,6 +1585,14 @@ async fn a_stale_session_delete_keeps_deletions_made_after_its_snapshot() -> any
 
     for session_opened_after in [false, true] {
         let temp = TempDir::new()?;
+        // This crate deletes from it below, so it creates it; DuckDB writes it first.
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data)?;
+        crate::common::crate_sqlite_catalog(
+            &format!("sqlite:{}?mode=rwc", catalog_path(&temp).display()),
+            &data,
+        )
+        .await;
         let conn = duckdb_lake(&temp)?;
         // This crate's DELETE writes a delete file rather than an inlined
         // deletion.

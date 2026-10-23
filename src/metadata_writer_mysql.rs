@@ -31,6 +31,10 @@
 //!    monotonic counter row rather than `SELECT MAX(snapshot_id)+1`.
 
 use crate::Result;
+use crate::catalog_version::{
+    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
+    require_writable,
+};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
@@ -54,7 +58,7 @@ use crate::metadata_writer::{
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, LEGACY_CATALOG_ID_COUNTERS,
-    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, created_name, enables_inlining,
+    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, enables_inlining,
     inlined_deletion_conflict, inlined_inserts, positional_columns,
     reject_reserved_inlining_columns, rewritten_delete_conflict, rewritten_deletes_snapshot,
     row_mutation_source_files, source_file_id_list, staged_conflict, table_conflict,
@@ -672,34 +676,16 @@ impl MySqlMetadataWriter {
         Self::with_max_connections(connection_string, DEFAULT_MAX_CONNECTIONS).await
     }
 
-    /// Open a writer with a bounded connection pool.
+    /// Open a writer with a bounded connection pool. Reads the catalog's
+    /// layout version and runs no DDL; a catalog that needs migrating is
+    /// refused with [`crate::DuckLakeError::MigrationRequired`] until
+    /// [`Self::migrate`] runs.
     pub async fn with_max_connections(
         connection_string: &str,
         max_connections: u32,
     ) -> Result<Self> {
-        let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
-            MySqlPoolOptions::new()
-                .max_connections(max_connections)
-                .connect(&url)
-                .await
-        })
-        .await?;
-        // A catalog an earlier release created lacks tables, columns and
-        // counters this writer uses, even when the caller skips
-        // `initialize_schema`.
-        let initialized: i64 = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables
-                            WHERE table_schema = DATABASE() AND table_name = 'ducklake_snapshot')",
-        )
-        .fetch_one(&pool)
-        .await?;
-        if initialized == 1 {
-            create_missing_tables(&pool).await?;
-            add_official_columns(&pool).await?;
-            seed_counter(&pool, "next_file_id", SQL_MAX_FILE_ID).await?;
-            seed_counter(&pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-        }
+        let pool = connect(connection_string, max_connections).await?;
+        require_writable(&catalog_state(&pool).await?, "MySqlMetadataWriter::migrate")?;
         Ok(Self {
             pool,
             data_inlining_row_limit: None,
@@ -707,11 +693,32 @@ impl MySqlMetadataWriter {
         })
     }
 
-    /// Open a writer and create/upgrade the DuckLake catalog tables.
+    /// Open a writer and create the DuckLake catalog tables of a new catalog.
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
         let writer = Self::new(connection_string).await?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+
+    /// Bring the catalog at `connection_string`, which an earlier release of
+    /// this crate created, to the layout this release writes, and record its
+    /// layout version. A catalog official DuckDB created is refused. Opening a
+    /// writer never migrates.
+    /// MySQL commits each DDL statement on its own, so an interrupted
+    /// migration is completed by running it again.
+    pub async fn migrate(connection_string: &str) -> Result<()> {
+        let pool = connect(connection_string, DEFAULT_MAX_CONNECTIONS).await?;
+        let state = catalog_state(&pool).await?;
+        match state {
+            CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
+                "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
+            )),
+            CatalogState::Current => Ok(()),
+            _ => {
+                require_migratable(&state)?;
+                upgrade_and_stamp(&pool).await
+            },
+        }
     }
 
     /// Bring the catalog tables official DuckDB inserts into by position to
@@ -1441,25 +1448,6 @@ fn retryable_conflict(e: crate::DuckLakeError) -> crate::DuckLakeError {
         },
         _ => e,
     }
-}
-
-/// Run each of [`SQL_CREATE_TABLES`] whose table the catalog lacks. A role
-/// that reads and writes the catalog without owning it may not run a `CREATE`,
-/// even one `IF NOT EXISTS` skips, so a current catalog runs none.
-async fn create_missing_tables(pool: &MySqlPool) -> Result<()> {
-    for ddl in SQL_CREATE_TABLES {
-        let present: i64 = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables
-                            WHERE table_schema = DATABASE() AND table_name = ?)",
-        )
-        .bind(created_name(ddl))
-        .fetch_one(pool)
-        .await?;
-        if present == 0 {
-            sqlx::query(*ddl).execute(pool).await?;
-        }
-    }
-    Ok(())
 }
 
 /// Add the snapshot id watermarks and the [`POSITIONAL_TABLES`] columns a
@@ -6777,213 +6765,10 @@ impl MetadataWriter for MySqlMetadataWriter {
 
     fn initialize_schema(&self) -> Result<()> {
         self.block_on(async {
-            // sqlx runs each query() as a single prepared statement on MySQL, so
-            // create each table separately (see SQL_CREATE_TABLES).
-            for ddl in SQL_CREATE_TABLES {
-                sqlx::query(*ddl).execute(&self.pool).await?;
+            match catalog_state(&self.pool).await? {
+                CatalogState::Absent => upgrade_and_stamp(&self.pool).await,
+                state => require_writable(&state, "MySqlMetadataWriter::migrate"),
             }
-            for (table, columns) in POSITIONAL_TABLES {
-                sqlx::query(AssertSqlSafe(format!(
-                    "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = InnoDB"
-                )))
-                .execute(&self.pool)
-                .await?;
-            }
-            let default_columns: Vec<String> = sqlx::query_scalar(
-                "SELECT column_name FROM information_schema.columns
-                 WHERE table_schema = DATABASE()
-                   AND table_name = 'ducklake_column'
-                   AND column_name IN ('initial_default', 'default_value',
-                                       'default_value_type', 'default_value_dialect')",
-            )
-            .fetch_all(&self.pool)
-            .await?;
-            for (name, ddl) in [
-                (
-                    "initial_default",
-                    "ALTER TABLE ducklake_column ADD COLUMN initial_default VARCHAR(1024)",
-                ),
-                (
-                    "default_value",
-                    "ALTER TABLE ducklake_column ADD COLUMN default_value VARCHAR(1024)",
-                ),
-                (
-                    "default_value_type",
-                    "ALTER TABLE ducklake_column ADD COLUMN default_value_type VARCHAR(1024)",
-                ),
-                (
-                    "default_value_dialect",
-                    "ALTER TABLE ducklake_column ADD COLUMN default_value_dialect VARCHAR(1024)",
-                ),
-            ] {
-                if !default_columns.iter().any(|column| column == name) {
-                    sqlx::query(ddl).execute(&self.pool).await?;
-                }
-            }
-            let has_scope_id: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_schema = DATABASE() \
-                   AND table_name = 'ducklake_metadata' \
-                   AND column_name = 'scope_id'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_scope: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_schema = DATABASE() \
-                   AND table_name = 'ducklake_metadata' \
-                   AND column_name = 'scope'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if has_scope == 0 {
-                add_column(
-                    &self.pool,
-                    "ducklake_metadata",
-                    "scope",
-                    "ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR(255)",
-                )
-                .await?;
-            }
-            if has_scope_id == 0 {
-                add_column(
-                    &self.pool,
-                    "ducklake_metadata",
-                    "scope_id",
-                    "ALTER TABLE ducklake_metadata ADD COLUMN scope_id BIGINT",
-                )
-                .await?;
-            }
-            // The partition pre-filter (`crate::stats_filter`) reads
-            // ducklake_file_partition_value once per listing, restricted to one
-            // table's rows for one partition key; unindexed that is a scan of
-            // every table's partition values. MySQL has no
-            // `CREATE INDEX IF NOT EXISTS`, so probe information_schema first,
-            // exactly as the column upgrades above do. Both columns are
-            // fixed-width deliberately — `partition_value` is TEXT, which MySQL
-            // cannot index without a prefix length at all.
-            let has_partition_value_index: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.statistics \
-                 WHERE table_schema = DATABASE() \
-                   AND table_name = 'ducklake_file_partition_value' \
-                   AND index_name = 'idx_file_partition_value_table_key'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if has_partition_value_index == 0 {
-                // Check-then-create races another process running the same
-                // bootstrap, and the loser gets ER_DUP_KEYNAME. Re-probe on
-                // failure and accept an index that is now there, exactly as
-                // `create_mysql_physical_indexes` does; a real failure still
-                // surfaces.
-                let created = sqlx::query(
-                    "CREATE INDEX idx_file_partition_value_table_key \
-                     ON ducklake_file_partition_value (table_id, partition_key_index)",
-                )
-                .execute(&self.pool)
-                .await;
-                if let Err(error) = created {
-                    let now_exists: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM information_schema.statistics \
-                         WHERE table_schema = DATABASE() \
-                           AND table_name = 'ducklake_file_partition_value' \
-                           AND index_name = 'idx_file_partition_value_table_key'",
-                    )
-                    .fetch_one(&self.pool)
-                    .await?;
-                    if now_exists == 0 {
-                        return Err(error.into());
-                    }
-                }
-            }
-            // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
-            // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first
-            // (idempotent, lossless — NULL means "not partitioned").
-            let has_partition_id: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_schema = DATABASE() \
-                   AND table_name = 'ducklake_data_file' \
-                   AND column_name = 'partition_id'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if has_partition_id == 0 {
-                sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id BIGINT")
-                    .execute(&self.pool)
-                    .await?;
-            }
-            let changes_nullable: String = sqlx::query_scalar(
-                "SELECT is_nullable FROM information_schema.columns
-                 WHERE table_schema = DATABASE()
-                   AND table_name = 'ducklake_snapshot_changes'
-                   AND column_name = 'changes_made'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if changes_nullable == "NO" {
-                sqlx::query("ALTER TABLE ducklake_snapshot_changes MODIFY changes_made TEXT NULL")
-                    .execute(&self.pool)
-                    .await?;
-            }
-            for table in ["ducklake_data_file", "ducklake_delete_file"] {
-                let has_partial_max: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM information_schema.columns
-                     WHERE table_schema = DATABASE() AND table_name = ?
-                       AND column_name = 'partial_max'",
-                )
-                .bind(table)
-                .fetch_one(&self.pool)
-                .await?;
-                if has_partial_max == 0 {
-                    add_column(
-                        &self.pool,
-                        table,
-                        "partial_max",
-                        &format!("ALTER TABLE {table} ADD COLUMN partial_max BIGINT"),
-                    )
-                    .await?;
-                }
-            }
-            // Seed the monotonic id allocators. snapshot_id and column_id are
-            // reserved inside a transaction and read back (no RETURNING and no
-            // auto-increment for these), so they live in ducklake_metadata. Seeded
-            // from the current MAX so a pre-existing catalog continues without
-            // reusing ids; idempotent on re-open.
-            seed_counter(
-                &self.pool,
-                "next_column_id",
-                "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column",
-            )
-            .await?;
-            seed_counter(
-                &self.pool,
-                "next_snapshot_id",
-                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
-            )
-            .await?;
-            add_official_columns(&self.pool).await?;
-            seed_counter(&self.pool, "next_file_id", SQL_MAX_FILE_ID).await?;
-            seed_counter(&self.pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
-            migrate_directory_paths(&self.pool).await?;
-            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS_MYSQL)
-                .execute(&self.pool)
-                .await?;
-            // A catalog this writer created before it kept the id watermarks has
-            // none; raise the head's past the counters, which seeding put past
-            // every id in use.
-            sqlx::query(
-                "UPDATE ducklake_snapshot
-                 SET next_catalog_id = GREATEST(COALESCE(next_catalog_id, 0),
-                         (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
-                          WHERE `key` = 'next_catalog_id' AND scope IS NULL)),
-                     next_file_id = GREATEST(COALESCE(next_file_id, 0),
-                         (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
-                          WHERE `key` = 'next_file_id' AND scope IS NULL))
-                 ORDER BY snapshot_id DESC LIMIT 1",
-            )
-            .execute(&self.pool)
-            .await?;
-            Ok(())
         })
     }
 
@@ -7171,6 +6956,263 @@ async fn enforce_inline_partition_fence(
         )));
     }
     Ok(())
+}
+
+/// Create or upgrade every table, column and counter this writer uses, then
+/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
+/// recorded last, so an interrupted run is completed by running it again.
+async fn upgrade_and_stamp(pool: &MySqlPool) -> Result<()> {
+    // sqlx runs each query() as a single prepared statement on MySQL, so
+    // create each table separately (see SQL_CREATE_TABLES).
+    for ddl in SQL_CREATE_TABLES {
+        sqlx::query(*ddl).execute(pool).await?;
+    }
+    for (table, columns) in POSITIONAL_TABLES {
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = InnoDB"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    let default_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = DATABASE()
+           AND table_name = 'ducklake_column'
+           AND column_name IN ('initial_default', 'default_value',
+                               'default_value_type', 'default_value_dialect')",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (name, ddl) in [
+        (
+            "initial_default",
+            "ALTER TABLE ducklake_column ADD COLUMN initial_default VARCHAR(1024)",
+        ),
+        (
+            "default_value",
+            "ALTER TABLE ducklake_column ADD COLUMN default_value VARCHAR(1024)",
+        ),
+        (
+            "default_value_type",
+            "ALTER TABLE ducklake_column ADD COLUMN default_value_type VARCHAR(1024)",
+        ),
+        (
+            "default_value_dialect",
+            "ALTER TABLE ducklake_column ADD COLUMN default_value_dialect VARCHAR(1024)",
+        ),
+    ] {
+        if !default_columns.iter().any(|column| column == name) {
+            sqlx::query(ddl).execute(pool).await?;
+        }
+    }
+    let has_scope_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() \
+           AND table_name = 'ducklake_metadata' \
+           AND column_name = 'scope_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let has_scope: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() \
+           AND table_name = 'ducklake_metadata' \
+           AND column_name = 'scope'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_scope == 0 {
+        add_column(
+            pool,
+            "ducklake_metadata",
+            "scope",
+            "ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR(255)",
+        )
+        .await?;
+    }
+    if has_scope_id == 0 {
+        add_column(
+            pool,
+            "ducklake_metadata",
+            "scope_id",
+            "ALTER TABLE ducklake_metadata ADD COLUMN scope_id BIGINT",
+        )
+        .await?;
+    }
+    // The partition pre-filter (`crate::stats_filter`) reads
+    // ducklake_file_partition_value once per listing, restricted to one
+    // table's rows for one partition key; unindexed that is a scan of
+    // every table's partition values. MySQL has no
+    // `CREATE INDEX IF NOT EXISTS`, so probe information_schema first,
+    // exactly as the column upgrades above do. Both columns are
+    // fixed-width deliberately — `partition_value` is TEXT, which MySQL
+    // cannot index without a prefix length at all.
+    let has_partition_value_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = DATABASE() \
+           AND table_name = 'ducklake_file_partition_value' \
+           AND index_name = 'idx_file_partition_value_table_key'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_partition_value_index == 0 {
+        // Check-then-create races another process running the same
+        // bootstrap, and the loser gets ER_DUP_KEYNAME. Re-probe on
+        // failure and accept an index that is now there, exactly as
+        // `create_mysql_physical_indexes` does; a real failure still
+        // surfaces.
+        let created = sqlx::query(
+            "CREATE INDEX idx_file_partition_value_table_key \
+             ON ducklake_file_partition_value (table_id, partition_key_index)",
+        )
+        .execute(pool)
+        .await;
+        if let Err(error) = created {
+            let now_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'ducklake_file_partition_value' \
+                   AND index_name = 'idx_file_partition_value_table_key'",
+            )
+            .fetch_one(pool)
+            .await?;
+            if now_exists == 0 {
+                return Err(error.into());
+            }
+        }
+    }
+    // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
+    // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first
+    // (idempotent, lossless — NULL means "not partitioned").
+    let has_partition_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() \
+           AND table_name = 'ducklake_data_file' \
+           AND column_name = 'partition_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_partition_id == 0 {
+        sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id BIGINT")
+            .execute(pool)
+            .await?;
+    }
+    let changes_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = DATABASE()
+           AND table_name = 'ducklake_snapshot_changes'
+           AND column_name = 'changes_made'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if changes_nullable == "NO" {
+        sqlx::query("ALTER TABLE ducklake_snapshot_changes MODIFY changes_made TEXT NULL")
+            .execute(pool)
+            .await?;
+    }
+    for table in ["ducklake_data_file", "ducklake_delete_file"] {
+        let has_partial_max: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = ?
+               AND column_name = 'partial_max'",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+        if has_partial_max == 0 {
+            add_column(
+                pool,
+                table,
+                "partial_max",
+                &format!("ALTER TABLE {table} ADD COLUMN partial_max BIGINT"),
+            )
+            .await?;
+        }
+    }
+    // Seed the monotonic id allocators. snapshot_id and column_id are
+    // reserved inside a transaction and read back (no RETURNING and no
+    // auto-increment for these), so they live in ducklake_metadata. Seeded
+    // from the current MAX so a pre-existing catalog continues without
+    // reusing ids; idempotent on re-open.
+    seed_counter(
+        pool,
+        "next_column_id",
+        "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column",
+    )
+    .await?;
+    seed_counter(
+        pool,
+        "next_snapshot_id",
+        "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+    )
+    .await?;
+    add_official_columns(pool).await?;
+    seed_counter(pool, "next_file_id", SQL_MAX_FILE_ID).await?;
+    seed_counter(pool, "next_catalog_id", SQL_MAX_CATALOG_ID).await?;
+    migrate_directory_paths(pool).await?;
+    sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS_MYSQL)
+        .execute(pool)
+        .await?;
+    // A catalog this writer created before it kept the id watermarks has
+    // none; raise the head's past the counters, which seeding put past
+    // every id in use.
+    sqlx::query(
+        "UPDATE ducklake_snapshot
+         SET next_catalog_id = GREATEST(COALESCE(next_catalog_id, 0),
+                 (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                  WHERE `key` = 'next_catalog_id' AND scope IS NULL)),
+             next_file_id = GREATEST(COALESCE(next_file_id, 0),
+                 (SELECT CAST(`value` AS SIGNED) + 1 FROM ducklake_metadata
+                  WHERE `key` = 'next_file_id' AND scope IS NULL))
+         ORDER BY snapshot_id DESC LIMIT 1",
+    )
+    .execute(pool)
+    .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL")
+        .bind(LAYOUT_VERSION_KEY)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO ducklake_metadata (`key`, `value`, scope) VALUES (?, ?, NULL)")
+        .bind(LAYOUT_VERSION_KEY)
+        .bind(LAYOUT_VERSION.to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn connect(connection_string: &str, max_connections: u32) -> Result<MySqlPool> {
+    let url = connection_string.to_string();
+    Ok(
+        crate::metadata_provider::connect_on_catalog_runtime(async move {
+            MySqlPoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&url)
+                .await
+        })
+        .await?,
+    )
+}
+
+/// The catalog's state from its version rows; [`CatalogState::Absent`] when
+/// it has no `ducklake_metadata` table.
+async fn catalog_state(pool: &MySqlPool) -> Result<CatalogState> {
+    let read = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT `key`, `value` FROM ducklake_metadata WHERE `key` IN {}",
+        SINGLE_CATALOG.sql_keys()
+    )))
+    .fetch_all(pool)
+    .await;
+    let rows: Vec<(String, String)> = match read {
+        Ok(rows) => rows,
+        // ER_NO_SUCH_TABLE
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42S02") => {
+            return Ok(CatalogState::Absent);
+        },
+        Err(error) => return Err(error.into()),
+    };
+    classify(&rows, &SINGLE_CATALOG)
 }
 
 #[cfg(test)]
