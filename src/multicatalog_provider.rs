@@ -34,7 +34,8 @@ use crate::metadata_provider_postgres::{
     PostgresStatsDialect, StatsFilterSql, delete_file_begin_snapshot_on, fetch_data_file_page,
     first_inlined_snapshot_on, inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on,
     inlined_table_for_flush_on, inlined_version_snapshot_on, missing_table_as_none,
-    read_inlined_rows_on, registered_inlined_tables_on, scan_inlined_data_on, stats_filter_sql,
+    partition_count_facts_on, read_inlined_rows_on, registered_inlined_tables_on,
+    scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -2505,6 +2506,27 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
         block_on(self.on_connection(async |connection| {
             delete_file_begin_snapshot_on(connection, delete_file_id).await
+        }))
+    }
+
+    fn get_partition_count_facts(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        partition_id: i64,
+        partition_key_index: i32,
+        values: &[String],
+    ) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+        block_on(self.on_connection(async |connection| {
+            partition_count_facts_on(
+                connection,
+                table_id,
+                snapshot_id,
+                partition_id,
+                partition_key_index,
+                values,
+            )
+            .await
         }))
     }
 

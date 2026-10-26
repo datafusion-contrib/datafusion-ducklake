@@ -84,6 +84,7 @@ mod object_store_integration_test;
 mod object_store_scheme_tests;
 mod official_pushdown_parity_tests;
 mod open_time_field_id_tests;
+mod partition_live_counts_tests;
 mod partition_tests;
 mod partition_write_duckdb_tests;
 mod partition_write_tests;

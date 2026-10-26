@@ -1111,6 +1111,26 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   added since that is `NOT NULL` with no initial default, refuses it (`Unsupported`). Official
   DuckLake reads the result and its change feed as an `UPDATE`'s; its closest equivalent,
   inserting the rows read `AT (VERSION => ...)`, gives them new row ids.
+- **Partition live row counts** (`DuckLakeTable::partition_live_row_counts`; a library
+  extension with no official equivalent): the live rows of each requested value of a column
+  that is the one identity key of the table's live partition spec (not a floating-point one,
+  whose `0.0` and `-0.0` are separate partitions), at the table's snapshot,
+  read from the catalog's per-file `record_count` and visible delete file `delete_count` and
+  the table's inlined deletions, opening no file. A count is exact or unknown, never
+  estimated. Every value is unknown when the snapshot no longer exists, the table has any
+  visible inlined row (stricter than official, whose nearest mechanism, the table-wide
+  `count(*)` fold over `GetNetDataFileRowCountSql`, adds inlined rows in), or a visible file
+  was written under another partition spec, has no value for the key, or has a value not
+  spelled as this crate's writer spells it. A value is unknown when it is itself spelled
+  otherwise (`02` for an integer 2), or a file of it records no row count, is a merged partial
+  file read below its `partial_max`, has several visible delete files, a delete file without a
+  valid count, or both a delete file and inlined deletions. Below the catalog head a delete
+  file counts only with a `partial_max` at or below the snapshot: one that rewrites an earlier
+  delete file records its latest deletion there, but one written by the inlined-data flush
+  (here and in official) begins at its earliest deletion and records none. It reads SQLite
+  and PostgreSQL catalogs (single- and multi-catalog); other providers, and catalogs without
+  `ducklake_delete_file.partial_max`, answer unknown (`Unsupported`). It reads no table
+  official does not define and adds no index.
 - **Maintenance flush** (`InlinedFlushPolicy`, carried by `DuckLakeWriteOptions`; an opt-in
   addition of this crate): by default `merge_adjacent_files` and `rewrite_data_files` flush
   nothing, as official's `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`; its

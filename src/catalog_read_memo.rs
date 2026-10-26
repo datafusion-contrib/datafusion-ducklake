@@ -1075,6 +1075,23 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.reader()?.get_table_row_count(table_id, snapshot_id)
     }
 
+    fn get_partition_count_facts(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        partition_id: i64,
+        partition_key_index: i32,
+        values: &[String],
+    ) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+        self.reader()?.get_partition_count_facts(
+            table_id,
+            snapshot_id,
+            partition_id,
+            partition_key_index,
+            values,
+        )
+    }
+
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
         self.reader()?.get_schema_by_name(name, snapshot_id)
     }

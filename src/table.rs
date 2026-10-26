@@ -1691,6 +1691,107 @@ impl DuckLakeTable {
         Ok(files)
     }
 
+    /// The live row count of each of `values` of partition column `column`,
+    /// at the snapshot this table was opened at, from catalog metadata alone.
+    ///
+    /// `values` are partition values as the catalog records them: the
+    /// DuckDB-canonical text of the partition key, which for an identity key
+    /// is the column value itself (`"-1"`, `"42"`, `"us"`). Duplicates are
+    /// answered once. Every requested value has an entry.
+    ///
+    /// A count is [`PartitionRowCount::Exact`] only when the catalog's
+    /// per-file counters account for every row a scan at this snapshot would
+    /// return for that value, and [`PartitionRowCount::Unknown`] (with the
+    /// reason) whenever they might not; unknown is never reported as zero, so
+    /// a caller needing the number scans that partition instead. A value no
+    /// visible file holds is exact at zero. The module documentation of
+    /// [`crate::partition_counts`] lists the rules. Every value is unknown
+    /// unless `column` is exactly one key of the table's partition spec at
+    /// this snapshot, with the identity transform, and the metadata provider
+    /// reads partition counts (the trait default does not). Any visible
+    /// inlined row makes every value unknown, and so does a delete file on a
+    /// file that also has inlined deletions for that file's value.
+    ///
+    /// The provider's catalog reads run in one consistent read. No data or
+    /// delete file is listed to the caller or opened.
+    ///
+    /// [`PartitionRowCount::Exact`]: crate::PartitionRowCount::Exact
+    /// [`PartitionRowCount::Unknown`]: crate::PartitionRowCount::Unknown
+    pub fn partition_live_row_counts(
+        &self,
+        column: &str,
+        values: &[String],
+    ) -> Result<std::collections::BTreeMap<String, crate::PartitionRowCount>> {
+        use crate::partition_counts::{CountRead, PartitionCountUnknown, resolve_partition_counts};
+
+        let all = |reason| {
+            values
+                .iter()
+                .map(|value| (value.clone(), crate::PartitionRowCount::Unknown(reason)))
+                .collect()
+        };
+        let Some(spec) = self.partition_spec.as_ref() else {
+            return Ok(all(PartitionCountUnknown::NotAPartitionKey));
+        };
+        let Some(key_column) = self
+            .columns
+            .iter()
+            .find(|candidate| candidate.column_name == column)
+        else {
+            return Ok(all(PartitionCountUnknown::NotAPartitionKey));
+        };
+        let keys: Vec<_> = spec
+            .columns
+            .iter()
+            .filter(|key| key.column_id == key_column.column_id)
+            .collect();
+        let key = match keys.as_slice() {
+            [] => return Ok(all(PartitionCountUnknown::NotAPartitionKey)),
+            [key] => *key,
+            _ => return Ok(all(PartitionCountUnknown::AmbiguousKey)),
+        };
+        if key.transform != crate::PartitionTransform::Identity {
+            return Ok(all(PartitionCountUnknown::NotIdentityKey));
+        }
+        let key_type = key_column.data_type()?;
+        if matches!(
+            key_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        ) {
+            return Ok(all(PartitionCountUnknown::FloatKey));
+        }
+        let (facts, inlined_deletes, head) =
+            crate::metadata_provider::read_consistently(&self.provider, |provider| {
+                let facts = provider.get_partition_count_facts(
+                    self.table_id,
+                    self.snapshot_id,
+                    spec.partition_id,
+                    key.partition_key_index,
+                    values,
+                )?;
+                let (inlined_deletes, head) = match facts {
+                    Some(_) => (
+                        provider.get_inlined_deletes(self.table_id, self.snapshot_id)?,
+                        Some(provider.get_current_snapshot()?),
+                    ),
+                    None => (Vec::new(), None),
+                };
+                Ok::<_, crate::DuckLakeError>((facts, inlined_deletes, head))
+            })?;
+        let read = CountRead {
+            snapshot_id: self.snapshot_id,
+            at_head: head == Some(self.snapshot_id),
+            partition_id: spec.partition_id,
+            key_type: &key_type,
+        };
+        Ok(resolve_partition_counts(
+            values,
+            &read,
+            facts.as_ref(),
+            &inlined_deletes,
+        ))
+    }
+
     /// The subset of [`Self::files`] whose own catalog statistics permit a match
     /// for `predicate` — every file that could hold a matching row, and none that
     /// is provably empty of them.
