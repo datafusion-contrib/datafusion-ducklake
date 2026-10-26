@@ -3218,6 +3218,33 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(net.max(0) as u64 + inlined_rows)
     }
 
+    /// Read the catalog facts that
+    /// [`DuckLakeTable::partition_live_row_counts`](crate::DuckLakeTable::partition_live_row_counts)
+    /// counts from, at `snapshot_id`, for key `partition_key_index` of
+    /// partition spec `partition_id` of `table_id` and the requested `values`.
+    /// See
+    /// [`PartitionCountFacts`](crate::partition_counts::PartitionCountFacts)
+    /// for which files to return. Opens no data file.
+    ///
+    /// The facts and [`Self::get_inlined_deletes`] describe one state of the
+    /// catalog only when read together inside one
+    /// [`Self::begin_consistent_read`], as the table reads them; read apart, a
+    /// flush committed between the two can move deletions from one to the other.
+    ///
+    /// The default returns `None`, which makes every value unknown, so an
+    /// external provider stays source-compatible and never reports a count it
+    /// did not read. A provider wrapping another delegates to it.
+    fn get_partition_count_facts(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _partition_id: i64,
+        _partition_key_index: i32,
+        _values: &[String],
+    ) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+        Ok(None)
+    }
+
     // Dynamic lookup methods for on-demand metadata retrieval
 
     /// Get schema by name for a specific snapshot

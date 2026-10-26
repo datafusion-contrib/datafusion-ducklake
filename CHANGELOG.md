@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTable::partition_live_row_counts` and `MetadataProvider::get_partition_count_facts`:
+  the live row count of each requested value of a non-float identity partition key from catalog
+  metadata, exact or unknown with the reason (any visible inlined row, and below the head an
+  undated delete file, make it unknown), on SQLite and PostgreSQL catalogs. A library
+  extension; official has none.
 - `migrate` on every writer, `migrate_multicatalog_schema`, `DuckLakeError::MigrationRequired`:
   opt-in migration of catalogs this crate created, by its own layout version (#372, #374).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.

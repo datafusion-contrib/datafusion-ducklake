@@ -826,6 +826,157 @@ pub(crate) async fn first_inlined_snapshot_on(
         .await?)
 }
 
+/// Whether `table`, an inlined-data table, holds a row visible at
+/// `snapshot_id`, read on `connection`.
+async fn inlined_rows_visible_on(
+    connection: &mut PgConnection,
+    table: &str,
+    snapshot_id: i64,
+) -> Result<bool> {
+    let system = inlined_table_layout(&mut *connection, table).await?.system;
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {} WHERE {begin} <= $1 \
+         AND ({end} IS NULL OR {end} > $1))",
+        quote_ident(table),
+        begin = system.begin_snapshot,
+        end = system.end_snapshot,
+    );
+    Ok(sqlx::query_scalar(AssertSqlSafe(sql))
+        .bind(snapshot_id)
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
+/// The visible data files of `table_id` at `$2` whose value for key `$3` is
+/// one of `$5`, and those not attributable to a value under spec `$4`, each
+/// with the visible delete files of it rolled up
+/// ([`PartitionCountFile`](crate::partition_counts::PartitionCountFile)).
+///
+/// `ducklake_file_partition_value` is read through its
+/// `(table_id, partition_key_index)` index, so the statement reads one row
+/// per file of the table in the catalog, not one per requested file. It is
+/// not narrowed by value: `partition_value` is unbounded text, which the
+/// crate keeps out of its indexes (see `idx_file_partition_value_table_key`).
+const SQL_PARTITION_COUNT_FILES: &str = "WITH pv AS (
+        SELECT data_file_id, COUNT(*) AS value_rows, MIN(partition_value) AS partition_value
+        FROM ducklake_file_partition_value
+        WHERE table_id = $1 AND partition_key_index = $3
+        GROUP BY data_file_id),
+    live AS (
+        SELECT d.data_file_id, d.partition_id::bigint AS partition_id,
+               COALESCE(pv.value_rows, 0)::bigint AS value_rows,
+               CASE WHEN pv.value_rows = 1 THEN pv.partition_value END AS partition_value,
+               d.record_count::bigint AS record_count, d.partial_max::bigint AS partial_max
+        FROM ducklake_data_file AS d
+        LEFT JOIN pv ON pv.data_file_id = d.data_file_id
+        WHERE d.table_id = $1 AND d.begin_snapshot <= $2
+          AND (d.end_snapshot IS NULL OR d.end_snapshot > $2))
+    SELECT l.data_file_id, l.partition_id, l.value_rows, l.partition_value::text,
+           l.record_count, l.partial_max,
+           COUNT(f.delete_file_id)::bigint,
+           CASE WHEN COUNT(f.delete_file_id) = 1 THEN MAX(f.delete_count) END::bigint,
+           CASE WHEN COUNT(f.delete_file_id) = 1 THEN MAX(f.partial_max) END::bigint
+    FROM live AS l
+    LEFT JOIN ducklake_delete_file AS f
+      ON f.data_file_id = l.data_file_id AND f.table_id = $1
+     AND f.begin_snapshot <= $2 AND (f.end_snapshot IS NULL OR f.end_snapshot > $2)
+    WHERE l.partition_value = ANY($5::text[]) OR l.value_rows <> 1
+       OR l.partition_id IS DISTINCT FROM $4
+    GROUP BY l.data_file_id, l.partition_id, l.value_rows, l.partition_value,
+             l.record_count, l.partial_max";
+
+/// The distinct non-NULL values the data files of `table_id` visible at `$2`
+/// have for key `$3`
+/// ([`PartitionCountFacts::stored_values`](crate::partition_counts::PartitionCountFacts::stored_values)).
+const SQL_PARTITION_STORED_VALUES: &str = "SELECT DISTINCT v.partition_value::text
+    FROM ducklake_file_partition_value AS v
+    JOIN ducklake_data_file AS d
+      ON d.data_file_id = v.data_file_id AND d.table_id = v.table_id
+    WHERE v.table_id = $1 AND v.partition_key_index = $3
+      AND v.partition_value IS NOT NULL
+      AND d.begin_snapshot <= $2 AND (d.end_snapshot IS NULL OR d.end_snapshot > $2)";
+
+/// [`MetadataProvider::get_partition_count_facts`], read on `connection`.
+/// `None` when the catalog lacks a table or column the count needs.
+pub(crate) async fn partition_count_facts_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    snapshot_id: i64,
+    partition_id: i64,
+    partition_key_index: i32,
+    values: &[String],
+) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+    let (complete, registry, snapshot_exists): (bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('ducklake_file_partition_value') IS NOT NULL
+                AND (SELECT COUNT(*) FROM pg_attribute
+                     WHERE NOT attisdropped
+                       AND ((attrelid = to_regclass('ducklake_data_file')
+                             AND attname IN ('partial_max', 'partition_id'))
+                         OR (attrelid = to_regclass('ducklake_delete_file')
+                             AND attname = 'partial_max'))) = 3,
+                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
+                EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = $1)",
+    )
+    .bind(snapshot_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !complete {
+        return Ok(None);
+    }
+    use crate::partition_counts::{PartitionCountFacts, PartitionCountFile};
+    if !snapshot_exists {
+        return Ok(Some(PartitionCountFacts::new(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )));
+    }
+    let mut inlined_rows_visible = false;
+    if registry {
+        for table in registered_inlined_tables_on(connection, table_id).await? {
+            if inlined_rows_visible_on(connection, &table, snapshot_id).await? {
+                inlined_rows_visible = true;
+                break;
+            }
+        }
+    }
+    let stored_values: Vec<String> = sqlx::query_scalar(SQL_PARTITION_STORED_VALUES)
+        .bind(table_id)
+        .bind(snapshot_id)
+        .bind(i64::from(partition_key_index))
+        .fetch_all(&mut *connection)
+        .await?;
+    let rows = sqlx::query(SQL_PARTITION_COUNT_FILES)
+        .bind(table_id)
+        .bind(snapshot_id)
+        .bind(i64::from(partition_key_index))
+        .bind(partition_id)
+        .bind(values)
+        .fetch_all(&mut *connection)
+        .await?;
+    let files = rows
+        .iter()
+        .map(|row| {
+            Ok(PartitionCountFile::new(
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
+            )
+            .with_delete_files(row.try_get(6)?, row.try_get(7)?, row.try_get(8)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(PartitionCountFacts::new(
+        true,
+        inlined_rows_visible,
+        stored_values,
+        files,
+    )))
+}
+
 /// The snapshot whose columns the inlined data table `table` holds, read on
 /// `connection` ([`inlined_version_snapshot_sql`]). A flush reads the table
 /// under the columns of that snapshot.
@@ -2950,6 +3101,28 @@ impl MetadataProvider for PostgresMetadataProvider {
         block_on(async {
             let mut connection = self.connection().await?;
             delete_file_begin_snapshot_on(&mut connection, delete_file_id).await
+        })
+    }
+
+    fn get_partition_count_facts(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        partition_id: i64,
+        partition_key_index: i32,
+        values: &[String],
+    ) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+        block_on(async {
+            let mut connection = self.connection().await?;
+            partition_count_facts_on(
+                &mut connection,
+                table_id,
+                snapshot_id,
+                partition_id,
+                partition_key_index,
+                values,
+            )
+            .await
         })
     }
 

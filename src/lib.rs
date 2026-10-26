@@ -91,6 +91,7 @@ pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
 pub mod partition;
+pub mod partition_counts;
 pub mod path_resolver;
 pub mod row_id;
 pub(crate) mod row_lineage;
@@ -193,6 +194,7 @@ pub use metadata_provider::{
     SnapshotChangeMetadata, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+pub use partition_counts::{PartitionCountUnknown, PartitionRowCount};
 pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;

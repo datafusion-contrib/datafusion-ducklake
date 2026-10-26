@@ -2241,6 +2241,142 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn get_partition_count_facts(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        partition_id: i64,
+        partition_key_index: i32,
+        values: &[String],
+    ) -> Result<Option<crate::partition_counts::PartitionCountFacts>> {
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            let partition_values: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) > 0 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'ducklake_file_partition_value'",
+            )
+            .fetch_one(&mut *self.connection().await?)
+            .await?;
+            if !(partition_values
+                && caps.data_file_partial_max
+                && caps.delete_file_partial_max
+                && caps.data_file_partition_id)
+            {
+                return Ok(None);
+            }
+            use crate::partition_counts::{PartitionCountFacts, PartitionCountFile};
+            let snapshot_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = ?)",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&mut *self.connection().await?)
+            .await?;
+            if !snapshot_exists {
+                return Ok(Some(PartitionCountFacts::new(
+                    false,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                )));
+            }
+            let mut inlined_rows_visible = false;
+            for table in self.registered_inlined_tables(table_id).await? {
+                let system = inlined_table_layout(&mut *self.connection().await?, &table)
+                    .await?
+                    .system;
+                let sql = format!(
+                    "SELECT EXISTS (SELECT 1 FROM {} WHERE {begin} <= ? \
+                     AND ({end} IS NULL OR {end} > ?))",
+                    quote_ident(&table),
+                    begin = system.begin_snapshot,
+                    end = system.end_snapshot,
+                );
+                let visible: bool = sqlx::query_scalar(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_one(&mut *self.connection().await?)
+                    .await?;
+                if visible {
+                    inlined_rows_visible = true;
+                    break;
+                }
+            }
+            // Every visible file of the table, as the Postgres statement reads
+            // them before narrowing by value; the narrowing is done here, since
+            // SQLite has no array parameter to bind the values to.
+            let rows = sqlx::query(
+                "WITH pv AS (
+                    SELECT data_file_id, COUNT(*) AS value_rows,
+                           MIN(partition_value) AS partition_value
+                    FROM ducklake_file_partition_value
+                    WHERE table_id = ?1 AND partition_key_index = ?3
+                    GROUP BY data_file_id),
+                live AS (
+                    SELECT d.data_file_id, d.partition_id,
+                           COALESCE(pv.value_rows, 0) AS value_rows,
+                           CASE WHEN pv.value_rows = 1 THEN pv.partition_value END
+                               AS partition_value,
+                           d.record_count, d.partial_max
+                    FROM ducklake_data_file AS d
+                    LEFT JOIN pv ON pv.data_file_id = d.data_file_id
+                    WHERE d.table_id = ?1 AND d.begin_snapshot <= ?2
+                      AND (d.end_snapshot IS NULL OR d.end_snapshot > ?2))
+                SELECT l.data_file_id, l.partition_id, l.value_rows, l.partition_value,
+                       l.record_count, l.partial_max,
+                       COUNT(f.delete_file_id),
+                       CASE WHEN COUNT(f.delete_file_id) = 1 THEN MAX(f.delete_count) END,
+                       CASE WHEN COUNT(f.delete_file_id) = 1 THEN MAX(f.partial_max) END
+                FROM live AS l
+                LEFT JOIN ducklake_delete_file AS f
+                  ON f.data_file_id = l.data_file_id AND f.table_id = ?1
+                 AND f.begin_snapshot <= ?2
+                 AND (f.end_snapshot IS NULL OR f.end_snapshot > ?2)
+                GROUP BY l.data_file_id, l.partition_id, l.value_rows, l.partition_value,
+                         l.record_count, l.partial_max",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(i64::from(partition_key_index))
+            .fetch_all(&mut *self.connection().await?)
+            .await?;
+            let requested: HashSet<&str> = values.iter().map(String::as_str).collect();
+            let mut stored_values = HashSet::new();
+            let mut files = Vec::new();
+            for row in &rows {
+                let file = PartitionCountFile::new(
+                    row.try_get(0)?,
+                    row.try_get(1)?,
+                    row.try_get(2)?,
+                    row.try_get(3)?,
+                    row.try_get(4)?,
+                    row.try_get(5)?,
+                )
+                .with_delete_files(
+                    row.try_get(6)?,
+                    row.try_get(7)?,
+                    row.try_get(8)?,
+                );
+                if let Some(value) = &file.partition_value {
+                    stored_values.insert(value.clone());
+                }
+                let attributable = file.value_rows == 1 && file.partition_id == Some(partition_id);
+                let wanted = file
+                    .partition_value
+                    .as_deref()
+                    .is_some_and(|value| requested.contains(value));
+                if wanted || !attributable {
+                    files.push(file);
+                }
+            }
+            Ok(Some(PartitionCountFacts::new(
+                true,
+                inlined_rows_visible,
+                stored_values.into_iter().collect(),
+                files,
+            )))
+        })
+    }
+
     fn get_inlined_deletes(
         &self,
         table_id: i64,
