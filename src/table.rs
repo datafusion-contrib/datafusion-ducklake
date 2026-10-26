@@ -3331,8 +3331,14 @@ impl DuckLakeTable {
         inlined: Option<&HashSet<i64>>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         let later = self.positions_inserted_later(state, table_file).await?;
+        // Read only the pages that hold `positions`: a lookup of a few rows
+        // should not decode the whole file. The selection must cover exactly
+        // the file's physical rows, so it is sized from the footer (cached
+        // after the first read), not from the catalog's record count.
+        let rows = self.file_row_count(state, &table_file.file).await?;
+        let selection = crate::rowid_lookup::positions_selection(positions, rows);
         let scan = self
-            .build_update_scan_with_snapshot(state, table_file, false, inlined, None)
+            .build_update_scan_selecting(state, table_file, false, inlined, None, Some(selection))
             .await?;
         let batches =
             datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx()).await?;
@@ -5213,6 +5219,30 @@ impl DuckLakeTable {
         inlined_positions: Option<&HashSet<i64>>,
         predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<UpdateSourceScan> {
+        self.build_update_scan_selecting(
+            state,
+            table_file,
+            want_snapshot_id,
+            inlined_positions,
+            predicate,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::build_update_scan_with_snapshot`], reading only the rows of
+    /// `selection` when one is given: the scan loads the file's page index and
+    /// fetches just the pages holding those rows.
+    #[cfg(feature = "write")]
+    pub(crate) async fn build_update_scan_selecting(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        want_snapshot_id: bool,
+        inlined_positions: Option<&HashSet<i64>>,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+        selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
+    ) -> DataFusionResult<UpdateSourceScan> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
 
@@ -5297,15 +5327,32 @@ impl DuckLakeTable {
         {
             source = source.with_predicate(Arc::clone(predicate));
         }
+        let mut file = self.partitioned_file(&table_file.file)?;
+        let selecting = selection.is_some();
+        if let Some(selection) = selection {
+            file = file.with_extension(
+                datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
+            );
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+        }
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
             self.scan_config_builder(Arc::new(source))
-                .with_file_group(FileGroup::new(vec![
-                    self.partitioned_file(&table_file.file)?,
-                ]))
+                .with_file_group(FileGroup::new(vec![file]))
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let mut plan = self.split_across_partitions(scan, state, &file_cfg)?;
+        // A selected read touches a few pages; splitting the file into byte
+        // ranges would only add opens.
+        let mut plan = if selecting {
+            scan
+        } else {
+            self.split_across_partitions(scan, state, &file_cfg)?
+        };
         // Mask with BOTH delete sources (#262): inlined positions and prior
         // Parquet ones. Only `existing_parquet_deletes` is carried forward into
         // the replacement delete file.

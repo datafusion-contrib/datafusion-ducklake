@@ -20,8 +20,16 @@
 //! Parquet cases it is.
 
 use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::Arc;
 
 use datafusion::catalog::Session;
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+use datafusion::parquet::arrow::async_reader::AsyncFileReader;
+use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::future::BoxFuture;
 
 use futures::{StreamExt, TryStreamExt};
@@ -29,6 +37,97 @@ use futures::{StreamExt, TryStreamExt};
 use crate::DuckLakeError;
 use crate::metadata_provider::{DuckLakeInlinedData, DuckLakeTableFile};
 use crate::table::DuckLakeTable;
+
+/// A selection of `positions` out of a file of `rows` rows.
+pub(crate) fn positions_selection(positions: &HashSet<i64>, rows: i64) -> RowSelection {
+    let mut sorted: Vec<i64> = positions
+        .iter()
+        .copied()
+        .filter(|p| (0..rows).contains(p))
+        .collect();
+    sorted.sort_unstable();
+    let mut selectors = Vec::with_capacity(sorted.len() * 2 + 1);
+    let mut at = 0i64;
+    for position in sorted {
+        if position > at {
+            selectors.push(RowSelector::skip((position - at) as usize));
+        }
+        selectors.push(RowSelector::select(1));
+        at = position + 1;
+    }
+    if rows > at {
+        selectors.push(RowSelector::skip((rows - at) as usize));
+    }
+    selectors.into()
+}
+
+/// Reads a file's metadata with its page index, whatever the scan asked for.
+///
+/// DataFusion loads the page index only for a page-pruning predicate. A scan
+/// that selects rows by position has none, and without the offset index the
+/// reader cannot tell which pages hold the selected rows, so it fetches each
+/// selected row group's whole column chunks.
+///
+/// DataFusion loads the page index for an external row selection itself from
+/// apache/datafusion#25460 on; once the pinned DataFusion includes it, this
+/// wrapper has nothing left to do and should be removed.
+#[derive(Debug)]
+pub(crate) struct PageIndexReaderFactory(pub(crate) Arc<dyn ParquetFileReaderFactory>);
+
+impl ParquetFileReaderFactory for PageIndexReaderFactory {
+    fn create_reader(
+        &self,
+        partition_index: usize,
+        partitioned_file: PartitionedFile,
+        metadata_size_hint: Option<usize>,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
+        let inner = self.0.create_reader(
+            partition_index,
+            partitioned_file,
+            metadata_size_hint,
+            metrics,
+        )?;
+        Ok(Box::new(PageIndexReader {
+            inner,
+            options: None,
+        }))
+    }
+}
+
+struct PageIndexReader {
+    inner: Box<dyn AsyncFileReader + Send>,
+    options: Option<ArrowReaderOptions>,
+}
+
+impl AsyncFileReader for PageIndexReader {
+    fn get_bytes(
+        &mut self,
+        range: Range<u64>,
+    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<bytes::Bytes>> {
+        self.inner.get_bytes(range)
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Vec<bytes::Bytes>>> {
+        self.inner.get_byte_ranges(ranges)
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>> {
+        self.options = Some(
+            options
+                .cloned()
+                .unwrap_or_default()
+                .with_page_index_policy(PageIndexPolicy::Optional),
+        );
+        self.inner.get_metadata(self.options.as_ref())
+    }
+}
 
 /// What [`DuckLakeTable::locate_rowids`] read: where each row is, and the
 /// inlined rows, the files and their inlined deletions it found them in.

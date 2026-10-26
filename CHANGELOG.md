@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `read_rows_by_rowid` reads only the pages holding the requested rows instead of decoding
+  each file that holds one; results are unchanged.
 - **BREAKING**: opening or initializing a writer never migrates; one an earlier release created
   is refused until its `migrate` (or `migrate_multicatalog_schema`) runs once (#372, #374).
 - **BREAKING**: writers refuse a catalog official DuckDB created; they write only their own.

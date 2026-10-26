@@ -1647,3 +1647,64 @@ mod official {
         }
     }
 }
+
+/// `read_rows_by_rowid` reads only the pages holding the rows it was asked
+/// for, and still leaves out a deleted one.
+///
+/// The bound is looser than [`NARROW_FRACTION`]: the writer's pages are 1 MiB,
+/// so each requested row still costs about a page of each wide column. A
+/// read of the whole file fetches all of it, which is what this test rules
+/// out.
+#[cfg(feature = "write")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn read_rows_by_rowid_reads_only_the_pages_of_the_rows_asked_for() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, 0..ROWS).await;
+    let h = open(&temp).await;
+    let (deleted, _) = h.dml("DELETE FROM ducklake.main.t WHERE id = 5").await;
+    assert_eq!(deleted, 1);
+    let table = h.table().await;
+    let total = file_bytes(&table.files().unwrap()[0]);
+
+    // Rows in three different row groups, and one deleted row.
+    let wanted = [5i64, 7, 4013, ROWS - 1];
+    h.store.take();
+    let batches = table
+        .read_rows_by_rowid(&h.ctx.state(), &wanted)
+        .await
+        .unwrap();
+    let bytes = h.store.take();
+
+    let mut got: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rowids = batch
+            .column(batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let payloads = batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryViewArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(payloads.value(i), payload(ids.value(i)).as_slice());
+            got.push((rowids.value(i), ids.value(i)));
+        }
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec![(7, 7), (4013, 4013), (ROWS - 1, ROWS - 1)]);
+    eprintln!("read_rows_by_rowid: read {bytes} of {total} bytes");
+    assert!(bytes > 0, "the counting store saw no reads");
+    assert!(
+        bytes * 2 < total,
+        "read {bytes} bytes of a {total}-byte file to return 3 rows"
+    );
+}
