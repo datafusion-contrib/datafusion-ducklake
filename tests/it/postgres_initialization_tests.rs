@@ -715,6 +715,57 @@ async fn concurrent_initializations_of_a_new_single_catalog_leave_it_whole() {
     }
 }
 
+/// A store that layout version 1 left has no `(table_id, column_id)` stats
+/// index (#403). Both layouts refuse it until it is migrated, and migrating it
+/// creates the index.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
+    let (_container, url) = start().await;
+    let pool = pool(&url).await;
+    for (layout, key) in [
+        ("multicatalog", "datafusion_ducklake_multicatalog_version"),
+        ("single", "datafusion_ducklake_version"),
+    ] {
+        reset(&pool).await;
+        match layout {
+            "multicatalog" => initialize_multicatalog_schema(&pool).await.unwrap(),
+            _ => initialize_single(&pool).await.unwrap(),
+        }
+        sqlx::query("DROP INDEX idx_file_column_stats_table_column")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{layout}: {e}"));
+        sqlx::query("UPDATE ducklake_metadata SET value = '1' WHERE key = $1")
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let opened = match layout {
+            "multicatalog" => initialize_multicatalog_schema(&pool).await,
+            _ => initialize_single(&pool).await,
+        };
+        assert!(
+            matches!(opened, Err(DuckLakeError::MigrationRequired(_))),
+            "{layout}: {opened:?}"
+        );
+        match layout {
+            "multicatalog" => migrate_multicatalog_schema(&pool).await.unwrap(),
+            _ => PostgresSingleCatalogMetadataWriter::migrate_pool(&pool)
+                .await
+                .unwrap(),
+        }
+        let indexed: bool = sqlx::query_scalar(
+            "SELECT to_regclass('idx_file_column_stats_table_column') IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(indexed, "{layout}");
+    }
+}
+
 /// The plan of one statistics CTE body of a filtered listing, as
 /// `stats_filter_sql` emits it, over a store holding `tables` tables of
 /// `files` files and `columns` columns each.

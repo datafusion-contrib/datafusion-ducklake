@@ -29,11 +29,13 @@ pub const LAYOUT_VERSION_KEY: &str = "datafusion_ducklake_version";
 /// multicatalog store.
 pub const MULTICATALOG_LAYOUT_VERSION_KEY: &str = "datafusion_ducklake_multicatalog_version";
 
-/// The single-catalog layout version this release writes.
-pub const LAYOUT_VERSION: u64 = 1;
+/// The single-catalog layout version this release writes. Version 2 adds the
+/// PostgreSQL `(table_id, column_id)` file-statistics index (#403).
+pub const LAYOUT_VERSION: u64 = 2;
 
-/// The multicatalog layout version this release writes.
-pub const MULTICATALOG_LAYOUT_VERSION: u64 = 1;
+/// The multicatalog layout version this release writes. Version 2 adds the
+/// `(table_id, column_id)` file-statistics index (#403).
+pub const MULTICATALOG_LAYOUT_VERSION: u64 = 2;
 
 /// A layout this crate writes, and the one a database might hold instead.
 #[derive(Debug, Clone, Copy)]
