@@ -714,3 +714,59 @@ async fn concurrent_initializations_of_a_new_single_catalog_leave_it_whole() {
             .unwrap_or_else(|e| panic!("round {round}: {e}"));
     }
 }
+
+/// The plan of one statistics CTE body of a filtered listing, as
+/// `stats_filter_sql` emits it, over a store holding `tables` tables of
+/// `files` files and `columns` columns each.
+async fn stats_cte_plan(pool: &PgPool, tables: i64, files: i64, columns: i64) -> String {
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, column_size_bytes, value_count,
+              null_count, min_value, max_value)
+         SELECT f, t, c, 100, 10, 0, '0', '9'
+         FROM generate_series(1, $1::bigint) AS t,
+              generate_series(1, $2::bigint) AS f,
+              generate_series(1, $3::bigint) AS c",
+    )
+    .bind(tables)
+    .bind(files)
+    .bind(columns)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE ducklake_file_column_stats")
+        .execute(pool)
+        .await
+        .unwrap();
+    let lines: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+         SELECT data_file_id, min_value, max_value, value_count
+         FROM ducklake_file_column_stats
+         WHERE column_id = 3 AND table_id = 1",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    lines.join("\n")
+}
+
+/// A filtered listing reads one column's statistics per filtered column. Both
+/// layouts index them by `(table_id, column_id)`, so that read touches only the
+/// rows it returns rather than every statistic of the table (#403).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_stats_filter_reads_only_its_columns_statistics() {
+    let (_container, url) = start().await;
+    let pool = pool(&url).await;
+    for layout in ["multicatalog", "single"] {
+        reset(&pool).await;
+        match layout {
+            "multicatalog" => initialize_multicatalog_schema(&pool).await.unwrap(),
+            _ => initialize_single(&pool).await.unwrap(),
+        }
+        let plan = stats_cte_plan(&pool, 2, 1_000, 20).await;
+
+        assert!(plan.contains("rows=1000 "), "{layout}:\n{plan}");
+        assert!(!plan.contains("Rows Removed"), "{layout}:\n{plan}");
+    }
+}

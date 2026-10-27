@@ -233,6 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PostgreSQL: a filtered scan reads only the filtered columns' file statistics, through a new
+  `(table_id, column_id)` index on `ducklake_file_column_stats` (#403).
 - `merge_adjacent_files` keeps every row's `rowid` (sorted tables, flushed and `UPDATE`
   files) by embedding row ids in its output, as official does since duckdb/ducklake#1611.
 - Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with
