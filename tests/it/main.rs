@@ -34,6 +34,7 @@ mod concurrent_staged_upload_tests;
 mod concurrent_tests;
 mod concurrent_write_tests;
 mod consistent_read_tests;
+mod ctas_tests;
 mod delete_conflict_tests;
 mod delete_filter_tests;
 mod duckdb_attach_reads_written_files_tests;
