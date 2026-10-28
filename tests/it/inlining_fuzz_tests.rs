@@ -2802,7 +2802,8 @@ mod known {
     /// The same recompute reads each inlined column's `MAX(..)::VARCHAR`,
     /// which DuckDB renders for the greatest `TIMESTAMPTZ` one millisecond
     /// past it (`294247-01-10 04:00:54.776806+00`); merging that text fails
-    /// its cast, and the rewrite with it. This crate's rewrite reads no
+    /// its cast, and the rewrite with it. DuckDB renders it in the session's
+    /// time zone, so the day is matched loosely. This crate's rewrite reads no
     /// inlined aggregate. Repro:
     /// `upstream-bugs/rewrite-inlined-max-timestamptz.sql`.
     pub(super) fn max_timestamptz_recompute_error(
@@ -2812,7 +2813,7 @@ mod known {
     ) -> bool {
         matches!(history.steps[step], Step::Rewrite | Step::Checkpoint)
             && error.contains("timestamp field value out of range")
-            && error.contains("294247-01-10")
+            && error.contains("294247-01-")
             && history.columns_at(step).iter().any(|c| c.ty == Ty::TsTz)
     }
 
