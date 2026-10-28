@@ -15,6 +15,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::Result;
 use crate::catalog_read_transaction::ReadTransaction;
+use crate::catalog_version::{MULTICATALOG, require_readable};
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
@@ -418,6 +419,9 @@ pub struct MulticatalogProvider {
     // The consistent read every catalog read runs in, when this provider is
     // bound to one (see `MetadataProvider::begin_consistent_read`).
     consistent: Option<Arc<MulticatalogRead>>,
+    // Set once the store's layout version is found readable (see
+    // `require_readable`). Shared across clones.
+    readable: Arc<tokio::sync::OnceCell<()>>,
 }
 
 /// A consistent read of a [`MulticatalogProvider`]: a transaction on a pooled
@@ -559,6 +563,7 @@ impl MulticatalogProvider {
             inlined_deletion_tables: Arc::default(),
             read_session: None,
             consistent: None,
+            readable: Arc::default(),
         })
     }
 
@@ -582,6 +587,7 @@ impl MulticatalogProvider {
             inlined_deletion_tables: Arc::default(),
             read_session: None,
             consistent: None,
+            readable: Arc::default(),
         })
     }
 
@@ -596,6 +602,7 @@ impl MulticatalogProvider {
     /// as [`Self::new`] opens its pool, so a connection the pool opens for it
     /// registers there.
     pub async fn begin_read_session(&self) -> Result<MetadataReadSession> {
+        self.require_readable().await?;
         let pool = self.pool.clone();
         let connection =
             crate::metadata_provider::connect_on_catalog_runtime(
@@ -636,7 +643,7 @@ impl MulticatalogProvider {
     /// Run `read` on the consistent read's connection while this provider is
     /// bound to an open one, else on the read session's connection while the
     /// session is open, else on one connection from the pool.
-    async fn on_connection<T, E: From<sqlx::Error>>(
+    async fn on_connection<T, E: From<sqlx::Error> + From<crate::DuckLakeError>>(
         &self,
         read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
@@ -644,10 +651,26 @@ impl MulticatalogProvider {
             .await
     }
 
+    /// Refuse a store this release must not read (see [`require_readable`]),
+    /// reading its version rows on the pool once per provider and its clones.
+    /// A read session or consistent read is begun after it, so a read on
+    /// either connection needs no check of its own.
+    async fn require_readable(&self) -> Result<()> {
+        self.readable
+            .get_or_try_init(|| async {
+                require_readable(
+                    &crate::metadata_provider_postgres::catalog_state(&self.pool, &MULTICATALOG)
+                        .await?,
+                )
+            })
+            .await?;
+        Ok(())
+    }
+
     /// [`Self::on_connection`], telling `read` whether its connection is
     /// inside a consistent read's transaction: a read session's connection is
     /// while any read is open on it, whichever provider began it.
-    async fn on_connection_in_transaction<T, E: From<sqlx::Error>>(
+    async fn on_connection_in_transaction<T, E: From<sqlx::Error> + From<crate::DuckLakeError>>(
         &self,
         read: impl AsyncFnOnce(&mut PgConnection, bool) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
@@ -663,6 +686,7 @@ impl MulticatalogProvider {
                 return read(connection, in_transaction).await;
             }
         }
+        self.require_readable().await?;
         let mut connection = self.pool.acquire().await?;
         read(&mut connection, false).await
     }
@@ -725,20 +749,14 @@ impl MulticatalogProvider {
     }
 
     /// Every row `query` returns, read as [`Self::on_connection`] reads.
-    async fn read_all(
-        &self,
-        query: Query<'_, Postgres, PgArguments>,
-    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
-        self.on_connection(async |connection| query.fetch_all(connection).await)
+    async fn read_all(&self, query: Query<'_, Postgres, PgArguments>) -> Result<Vec<PgRow>> {
+        self.on_connection(async |connection| Ok(query.fetch_all(connection).await?))
             .await
     }
 
     /// The one row `query` returns, read as [`Self::on_connection`] reads.
-    async fn read_one(
-        &self,
-        query: Query<'_, Postgres, PgArguments>,
-    ) -> std::result::Result<PgRow, sqlx::Error> {
-        self.on_connection(async |connection| query.fetch_one(connection).await)
+    async fn read_one(&self, query: Query<'_, Postgres, PgArguments>) -> Result<PgRow> {
+        self.on_connection(async |connection| Ok(query.fetch_one(connection).await?))
             .await
     }
 
@@ -746,8 +764,8 @@ impl MulticatalogProvider {
     async fn read_optional(
         &self,
         query: Query<'_, Postgres, PgArguments>,
-    ) -> std::result::Result<Option<PgRow>, sqlx::Error> {
-        self.on_connection(async |connection| query.fetch_optional(connection).await)
+    ) -> Result<Option<PgRow>> {
+        self.on_connection(async |connection| Ok(query.fetch_optional(connection).await?))
             .await
     }
 
@@ -1269,6 +1287,9 @@ impl MetadataProvider for MulticatalogProvider {
             && block_on(read.is_open())
         {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
+        }
+        if self.read_session.is_none() {
+            block_on(self.require_readable())?;
         }
         let read = block_on(async {
             if let Some(session) = &self.read_session {

@@ -118,14 +118,14 @@ pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
 pub mod metadata_provider_sqlite;
 
-// Write support (feature-gated)
 #[cfg(any(
-    feature = "write-sqlite",
-    feature = "write-duckdb",
-    feature = "write-mysql",
-    feature = "write-postgres"
+    feature = "metadata-sqlite",
+    feature = "metadata-duckdb",
+    feature = "metadata-mysql",
+    feature = "metadata-postgres"
 ))]
 pub mod catalog_version;
+// Write support (feature-gated)
 #[cfg(feature = "write")]
 pub mod compaction;
 #[cfg(feature = "write")]

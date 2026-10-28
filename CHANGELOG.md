@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension; official has none.
 - `migrate` on every writer, `migrate_multicatalog_schema`, `DuckLakeError::MigrationRequired`:
   opt-in migration of catalogs this crate created, by its own layout version (#372, #374).
-- A minimum writer version beside the layout version: a newer release's migration that older
-  releases can ignore no longer stops them writing (#405).
+- A minimum version beside the layout version, checked by writers, read providers and
+  `MulticatalogManager`: a migration older releases can ignore no longer stops them (#405).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).

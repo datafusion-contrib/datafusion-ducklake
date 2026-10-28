@@ -11,12 +11,12 @@
 
 use crate::Result;
 use crate::catalog_version::{
-    CatalogState, Layout, MULTICATALOG, MULTICATALOG_LAYOUT_VERSION_KEY, classify,
-    require_migratable, require_writable,
+    CatalogState, Layout, MULTICATALOG, require_migratable, require_writable,
 };
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::SUPERSEDED_INLINED_TABLES_SQL;
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget, block_on};
+use crate::metadata_provider_postgres::catalog_state;
 use crate::metadata_provider_postgres::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::CarriedTags;
 use crate::metadata_writer::{
@@ -903,42 +903,6 @@ fn multicatalog_ddl() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// The state of the catalog or store behind `pool` from its version rows, for
-/// `layout`; [`CatalogState::Absent`] when it has no `ducklake_metadata` table.
-/// Both layouts are PostgreSQL databases, so an unversioned one, which an
-/// earlier release created, is told apart by `ducklake_catalog`, which only
-/// the multicatalog layout has.
-pub(crate) async fn catalog_state(pool: &PgPool, layout: &Layout) -> Result<CatalogState> {
-    let read = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
-        layout.sql_keys()
-    )))
-    .fetch_all(pool)
-    .await;
-    let rows: Vec<(String, String)> = match read {
-        Ok(rows) => rows,
-        // undefined_table
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
-            return Ok(CatalogState::Absent);
-        },
-        Err(error) => return Err(error.into()),
-    };
-    match classify(&rows, layout)? {
-        CatalogState::NeedsMigration(None) => {
-            let multicatalog: bool =
-                sqlx::query_scalar("SELECT to_regclass('ducklake_catalog') IS NOT NULL")
-                    .fetch_one(pool)
-                    .await?;
-            if multicatalog == (layout.key == MULTICATALOG_LAYOUT_VERSION_KEY) {
-                Ok(CatalogState::NeedsMigration(None))
-            } else {
-                Ok(CatalogState::OtherLayout(layout.other_name))
-            }
-        },
-        state => Ok(state),
-    }
-}
-
 async fn multicatalog_state(pool: &PgPool) -> Result<CatalogState> {
     catalog_state(pool, &MULTICATALOG).await
 }
@@ -1002,7 +966,7 @@ async fn upgrade_multicatalog_and_stamp(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Record `layout`'s version and minimum writer version in `tx`, replacing
+/// Record `layout`'s version and minimum version in `tx`, replacing
 /// any earlier ones.
 pub(crate) async fn stamp(tx: &mut sqlx::PgConnection, layout: &Layout) -> Result<()> {
     for (key, value) in layout.stamp() {

@@ -37,15 +37,14 @@
 //!    `begin_snapshot`/`end_snapshot` newer than the base observed at begin.
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, SINGLE_CATALOG, classify, require_migratable, require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::InlinedSystemColumns;
+use crate::metadata_provider_duckdb::catalog_state;
 use crate::metadata_provider_duckdb::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
@@ -6348,31 +6347,6 @@ fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
-}
-
-/// The catalog's state from its version rows; [`CatalogState::Absent`] when
-/// it has no `ducklake_metadata` table.
-fn catalog_state(conn: &Connection) -> Result<CatalogState> {
-    let exists = |table: &str| -> Result<bool> {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = ?",
-            [table],
-            |row| row.get(0),
-        )?)
-    };
-    if !exists("ducklake_metadata")? {
-        return Ok(CatalogState::Absent);
-    }
-    let mut statement = conn.prepare(&format!(
-        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
-        SINGLE_CATALOG.sql_keys()
-    ))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    classify(&rows, &SINGLE_CATALOG)
 }
 
 #[cfg(test)]

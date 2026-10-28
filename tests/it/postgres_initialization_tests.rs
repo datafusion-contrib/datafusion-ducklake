@@ -534,6 +534,16 @@ async fn an_earlier_release_store_is_refused_until_migrated() {
     }
     forget_layout_version(&pool, "datafusion_ducklake_multicatalog_version").await;
     let multi = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog).await;
+    let managed = datafusion_ducklake::MulticatalogManager::new(pool.clone())
+        .create_catalog("d")
+        .await;
+    let read = {
+        use datafusion_ducklake::MetadataProvider;
+        datafusion_ducklake::MulticatalogProvider::with_pool_and_id(pool.clone(), catalog)
+            .await
+            .unwrap()
+            .get_current_snapshot()
+    };
     let initialized = initialize_multicatalog_schema(&pool).await;
     migrate_multicatalog_schema(&pool).await.unwrap();
     let multi_after =
@@ -549,16 +559,21 @@ async fn an_earlier_release_store_is_refused_until_migrated() {
         "{multi:?}"
     );
     assert!(
+        matches!(managed, Err(DuckLakeError::MigrationRequired(_))),
+        "{managed:?}"
+    );
+    assert!(read.is_ok(), "{read:?}");
+    assert!(
         matches!(initialized, Err(DuckLakeError::MigrationRequired(_))),
         "{initialized:?}"
     );
     assert!(multi_after.is_ok(), "{multi_after:?}");
 }
 
-/// Record `version` under `key` and `min_writer` under `min_key`, as a newer
+/// Record `version` under `key` and `min_version` under `min_key`, as a newer
 /// release's migration would.
-async fn stamp(pool: &PgPool, (key, version): (&str, u64), (min_key, min_writer): (&str, u64)) {
-    for (key, value) in [(key, version), (min_key, min_writer)] {
+async fn stamp(pool: &PgPool, (key, version): (&str, u64), (min_key, min_version): (&str, u64)) {
+    for (key, value) in [(key, version), (min_key, min_version)] {
         forget_layout_version(pool, key).await;
         sqlx::query("INSERT INTO ducklake_metadata (key, value) VALUES ($1, $2)")
             .bind(key)
@@ -578,18 +593,20 @@ async fn stamped(pool: &PgPool, key: &str) -> Vec<String> {
 }
 
 /// A multicatalog store a newer release migrated with an addition this
-/// release can ignore keeps accepting this release's writers, so a rolling
-/// deploy or a rollback across the newer release keeps writing; migrating it
-/// leaves its version alone. A store whose minimum writer version is above
-/// this release's is still refused (#405).
+/// release can ignore keeps accepting this release's writers, readers and
+/// manager, so a rolling deploy or a rollback across the newer release keeps
+/// working; migrating it leaves its version alone. A store whose minimum
+/// version is above this release's is refused by all three (#405).
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_newer_multicatalog_store_this_release_may_write_is_written() {
     use datafusion_ducklake::catalog_version::{
         MULTICATALOG_LAYOUT_VERSION as V, MULTICATALOG_LAYOUT_VERSION_KEY as KEY,
-        MULTICATALOG_MIN_WRITER_VERSION as MIN, MULTICATALOG_MIN_WRITER_VERSION_KEY as MIN_KEY,
+        MULTICATALOG_MIN_VERSION as MIN, MULTICATALOG_MIN_VERSION_KEY as MIN_KEY,
     };
-    use datafusion_ducklake::{MulticatalogManager, PostgresMetadataWriter};
+    use datafusion_ducklake::{
+        MetadataProvider, MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
+    };
     let (_container, url) = start().await;
     let pool = pool(&url).await;
     initialize_multicatalog_schema(&pool).await.unwrap();
@@ -609,20 +626,56 @@ async fn a_newer_multicatalog_store_this_release_may_write_is_written() {
     let connected = MulticatalogManager::connect(&url, 2).await.map(drop);
     let initialized = initialize_multicatalog_schema(&pool).await;
     let migrated = migrate_multicatalog_schema(&pool).await;
+    let managed = MulticatalogManager::new(pool.clone())
+        .create_catalog("d")
+        .await
+        .map(drop);
+    let provider = async || {
+        MulticatalogProvider::with_pool_and_id(pool.clone(), catalog)
+            .await
+            .unwrap()
+    };
+    let read = provider().await.get_current_snapshot();
     let versions = (stamped(&pool, KEY).await, stamped(&pool, MIN_KEY).await);
     stamp(&pool, (KEY, V + 1), (MIN_KEY, V + 1)).await;
     let refused = PostgresMetadataWriter::with_pool(pool.clone(), catalog).await;
+    let refused_managed = MulticatalogManager::new(pool.clone())
+        .create_catalog("e")
+        .await;
+    let refused_reads = [
+        provider().await.get_current_snapshot().map(drop),
+        provider().await.begin_consistent_read().map(drop),
+        provider().await.begin_read_session().await.map(drop),
+        MulticatalogProvider::with_pool(pool.clone(), "c")
+            .await
+            .unwrap()
+            .get_current_snapshot()
+            .map(drop),
+    ];
 
     assert_eq!(created, (vec![V.to_string()], vec![MIN.to_string()]));
     assert!(written.is_ok(), "{written:?}");
     assert!(connected.is_ok(), "{connected:?}");
     assert!(initialized.is_ok(), "{initialized:?}");
     assert!(migrated.is_ok(), "{migrated:?}");
+    assert!(managed.is_ok(), "{managed:?}");
+    assert!(read.is_ok(), "{read:?}");
     assert_eq!(versions, (vec![(V + 1).to_string()], vec![V.to_string()]));
     assert!(
         matches!(refused, Err(DuckLakeError::Unsupported(_))),
         "{refused:?}"
     );
+    assert!(
+        matches!(refused_managed, Err(DuckLakeError::Unsupported(_))),
+        "{refused_managed:?}"
+    );
+    for read in refused_reads {
+        assert!(
+            matches!(&read, Err(DuckLakeError::Unsupported(message))
+                if message.contains("newer than this release reads")),
+            "{read:?}"
+        );
+    }
 }
 
 /// The single-catalog layout, as
@@ -631,8 +684,8 @@ async fn a_newer_multicatalog_store_this_release_may_write_is_written() {
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_newer_single_catalog_this_release_may_write_is_written() {
     use datafusion_ducklake::catalog_version::{
-        LAYOUT_VERSION as V, LAYOUT_VERSION_KEY as KEY, MIN_WRITER_VERSION as MIN,
-        MIN_WRITER_VERSION_KEY as MIN_KEY,
+        LAYOUT_VERSION as V, LAYOUT_VERSION_KEY as KEY, MIN_VERSION as MIN,
+        MIN_VERSION_KEY as MIN_KEY,
     };
     let (_container, url) = start().await;
     let pool = pool(&url).await;
@@ -648,18 +701,31 @@ async fn a_newer_single_catalog_this_release_may_write_is_written() {
     .await;
     let initialized = initialize_single(&pool).await;
     let migrated = PostgresSingleCatalogMetadataWriter::migrate_pool(&pool).await;
+    let read = || {
+        use datafusion_ducklake::MetadataProvider;
+        datafusion_ducklake::PostgresMetadataProvider::from_pool(pool.clone())
+            .get_current_snapshot()
+    };
+    let compatible_read = read();
     let versions = (stamped(&pool, KEY).await, stamped(&pool, MIN_KEY).await);
     stamp(&pool, (KEY, V + 1), (MIN_KEY, V + 1)).await;
     let refused = PostgresSingleCatalogMetadataWriter::from_pool(pool.clone()).await;
+    let refused_read = read();
 
     assert_eq!(created, (vec![V.to_string()], vec![MIN.to_string()]));
     assert!(written.is_ok(), "{written:?}");
     assert!(initialized.is_ok(), "{initialized:?}");
     assert!(migrated.is_ok(), "{migrated:?}");
+    assert!(compatible_read.is_ok(), "{compatible_read:?}");
     assert_eq!(versions, (vec![(V + 1).to_string()], vec![V.to_string()]));
     assert!(
         matches!(refused, Err(DuckLakeError::Unsupported(_))),
         "{refused:?}"
+    );
+    assert!(
+        matches!(&refused_read, Err(DuckLakeError::Unsupported(message))
+            if message.contains("newer than this release reads")),
+        "{refused_read:?}"
     );
 }
 

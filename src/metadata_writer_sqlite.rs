@@ -10,15 +10,14 @@ use std::{
 };
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, SINGLE_CATALOG, classify, require_migratable, require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
+use crate::metadata_provider_sqlite::catalog_state;
 use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
@@ -925,25 +924,6 @@ async fn connect(
     })
     .await?;
     Ok((pool, lock_path))
-}
-
-/// The catalog's state from its version rows; [`CatalogState::Absent`] when
-/// it has no `ducklake_metadata` table.
-async fn catalog_state(pool: &SqlitePool) -> Result<CatalogState> {
-    let read = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
-        SINGLE_CATALOG.sql_keys()
-    )))
-    .fetch_all(pool)
-    .await;
-    let rows: Vec<(String, String)> = match read {
-        Ok(rows) => rows,
-        Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => {
-            return Ok(CatalogState::Absent);
-        },
-        Err(error) => return Err(error.into()),
-    };
-    classify(&rows, &SINGLE_CATALOG)
 }
 
 /// Create or upgrade every table, column and counter this writer uses, then

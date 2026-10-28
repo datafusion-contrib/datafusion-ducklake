@@ -692,7 +692,7 @@ async fn connect(connection_string: &str, max_connections: u32) -> Result<PgPool
 /// The catalog's state from its version rows; [`CatalogState::Absent`] when
 /// it has no `ducklake_metadata` table.
 async fn catalog_state(pool: &PgPool) -> Result<CatalogState> {
-    crate::metadata_writer_postgres::catalog_state(pool, &SINGLE_CATALOG).await
+    crate::metadata_provider_postgres::catalog_state(pool, &SINGLE_CATALOG).await
 }
 
 /// The `ducklake_metadata` counters this writer reserves ids from, with the

@@ -31,15 +31,14 @@
 //!    monotonic counter row rather than `SELECT MAX(snapshot_id)+1`.
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, SINGLE_CATALOG, classify, require_migratable, require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::InlinedSystemColumns;
+use crate::metadata_provider_mysql::catalog_state;
 use crate::metadata_provider_mysql::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
@@ -7195,26 +7194,6 @@ async fn connect(connection_string: &str, max_connections: u32) -> Result<MySqlP
         })
         .await?,
     )
-}
-
-/// The catalog's state from its version rows; [`CatalogState::Absent`] when
-/// it has no `ducklake_metadata` table.
-async fn catalog_state(pool: &MySqlPool) -> Result<CatalogState> {
-    let read = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT `key`, `value` FROM ducklake_metadata WHERE `key` IN {}",
-        SINGLE_CATALOG.sql_keys()
-    )))
-    .fetch_all(pool)
-    .await;
-    let rows: Vec<(String, String)> = match read {
-        Ok(rows) => rows,
-        // ER_NO_SUCH_TABLE
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42S02") => {
-            return Ok(CatalogState::Absent);
-        },
-        Err(error) => return Err(error.into()),
-    };
-    classify(&rows, &SINGLE_CATALOG)
 }
 
 #[cfg(test)]

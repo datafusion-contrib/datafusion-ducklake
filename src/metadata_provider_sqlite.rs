@@ -2,6 +2,7 @@
 
 use crate::Result;
 use crate::catalog_read_transaction::{CatalogConnection, ReadTransaction, catalog_connection};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, classify, require_readable};
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
     render_inlined_filter,
@@ -919,6 +920,9 @@ pub struct SqliteMetadataProvider {
     // The consistent read every catalog read runs on, when this provider is
     // bound to one (see `MetadataProvider::begin_consistent_read`).
     read: Option<Arc<ReadTransaction<Sqlite>>>,
+    // Set once the catalog's layout version is found readable (see
+    // `require_readable`). Shared across clones.
+    readable: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl SqliteMetadataProvider {
@@ -939,6 +943,7 @@ impl SqliteMetadataProvider {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
             read: None,
+            readable: Arc::default(),
         })
     }
 
@@ -960,14 +965,26 @@ impl SqliteMetadataProvider {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
             read: None,
+            readable: Arc::default(),
         }
     }
 
     /// The connection for one catalog statement: the consistent read's while
     /// this provider is bound to an open one, else one from the pool. See
-    /// [`catalog_connection`] for how long to hold it.
-    async fn connection(&self) -> std::result::Result<CatalogConnection<'_, Sqlite>, sqlx::Error> {
-        catalog_connection(self.read.as_deref(), &self.pool).await
+    /// [`catalog_connection`] for how long to hold it. The first refuses a
+    /// catalog this release must not read.
+    async fn connection(&self) -> Result<CatalogConnection<'_, Sqlite>> {
+        self.require_readable().await?;
+        Ok(catalog_connection(self.read.as_deref(), &self.pool).await?)
+    }
+
+    /// Refuse a catalog this release must not read (see [`require_readable`]),
+    /// reading its version rows on the pool once per provider and its clones.
+    async fn require_readable(&self) -> Result<()> {
+        self.readable
+            .get_or_try_init(|| async { require_readable(&catalog_state(&self.pool).await?) })
+            .await?;
+        Ok(())
     }
 
     /// The registered inlined-data tables of `table_id`; none on a catalog
@@ -1121,8 +1138,8 @@ impl SqliteMetadataProvider {
         snapshot_id: i64,
         after_data_file_id: Option<i64>,
         limit: i64,
-    ) -> std::result::Result<Vec<SqliteRow>, sqlx::Error> {
-        sqlx::query(AssertSqlSafe(sql))
+    ) -> Result<Vec<SqliteRow>> {
+        Ok(sqlx::query(AssertSqlSafe(sql))
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
@@ -1132,8 +1149,27 @@ impl SqliteMetadataProvider {
             .bind(after_data_file_id.unwrap_or(i64::MIN))
             .bind(limit)
             .fetch_all(&mut *self.connection().await?)
-            .await
+            .await?)
     }
+}
+
+/// The catalog's state from its version rows; [`CatalogState::Absent`] when
+/// it has no `ducklake_metadata` table.
+pub(crate) async fn catalog_state(pool: &SqlitePool) -> Result<CatalogState> {
+    let read = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
+        SINGLE_CATALOG.sql_keys()
+    )))
+    .fetch_all(pool)
+    .await;
+    let rows: Vec<(String, String)> = match read {
+        Ok(rows) => rows,
+        Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => {
+            return Ok(CatalogState::Absent);
+        },
+        Err(error) => return Err(error.into()),
+    };
+    classify(&rows, &SINGLE_CATALOG)
 }
 
 impl MetadataProvider for SqliteMetadataProvider {
@@ -1146,6 +1182,7 @@ impl MetadataProvider for SqliteMetadataProvider {
         if self.read.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
+        block_on(self.require_readable())?;
         let read = Arc::new(block_on(ReadTransaction::begin(&self.pool, &["BEGIN"]))?);
         let provider = Self {
             read: Some(Arc::clone(&read)),
@@ -1821,7 +1858,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     )
                     .await?
                 },
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             };
             let files = rows
                 .iter()
@@ -2454,10 +2491,12 @@ impl MetadataProvider for SqliteMetadataProvider {
                 begin = system.begin_snapshot,
             );
             let first: Option<i64> = block_on(async {
-                sqlx::query_scalar(AssertSqlSafe(sql))
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *self.connection().await?)
-                    .await
+                Ok::<_, crate::DuckLakeError>(
+                    sqlx::query_scalar(AssertSqlSafe(sql))
+                        .bind(snapshot_id)
+                        .fetch_one(&mut *self.connection().await?)
+                        .await?,
+                )
             })?;
             // As the flush, which skips a table whose schema version it
             // cannot resolve.
@@ -2465,12 +2504,14 @@ impl MetadataProvider for SqliteMetadataProvider {
                 continue;
             }
             let version: Option<i64> = block_on(async {
-                sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT {}",
-                    inlined_version_snapshot_sql(&table, ledger)
-                )))
-                .fetch_one(&mut *self.connection().await?)
-                .await
+                Ok::<_, crate::DuckLakeError>(
+                    sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT {}",
+                        inlined_version_snapshot_sql(&table, ledger)
+                    )))
+                    .fetch_one(&mut *self.connection().await?)
+                    .await?,
+                )
             })?;
             if version.is_some() {
                 oldest = oldest.into_iter().chain(first).min();
@@ -2498,21 +2539,25 @@ impl MetadataProvider for SqliteMetadataProvider {
                 begin = system.begin_snapshot,
             );
             let first: Option<i64> = block_on(async {
-                sqlx::query_scalar(AssertSqlSafe(sql))
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *self.connection().await?)
-                    .await
+                Ok::<_, crate::DuckLakeError>(
+                    sqlx::query_scalar(AssertSqlSafe(sql))
+                        .bind(snapshot_id)
+                        .fetch_one(&mut *self.connection().await?)
+                        .await?,
+                )
             })?;
             if first.is_none() {
                 continue;
             }
             let version: Option<i64> = block_on(async {
-                sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT {}",
-                    inlined_version_snapshot_sql(&table, ledger)
-                )))
-                .fetch_one(&mut *self.connection().await?)
-                .await
+                Ok::<_, crate::DuckLakeError>(
+                    sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT {}",
+                        inlined_version_snapshot_sql(&table, ledger)
+                    )))
+                    .fetch_one(&mut *self.connection().await?)
+                    .await?,
+                )
             })?;
             let Some(version) = version else {
                 continue;
