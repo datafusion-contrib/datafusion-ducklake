@@ -4,7 +4,8 @@
 //! Each test reads the written files' page index with the plain parquet reader,
 //! so a setting that never reached the writer shows up as pages of the parquet
 //! default size. The paths covered are every one that writes a data file: the
-//! table writer, SQL `INSERT`, the inlined-data flush, merge and rewrite. A
+//! table writer, SQL `INSERT` and `UPDATE`, the inlined-data flush, merge and
+//! rewrite. A
 //! small-page file must keep its page index (offset index and page-level
 //! statistics), read normally in official DuckDB, and let
 //! `read_columns_by_rowid` fetch less of it than a default-page file.
@@ -337,12 +338,12 @@ async fn unset_page_options_keep_the_parquet_defaults() {
 }
 
 /// A catalog's write options reach every path that writes a data file: SQL
-/// `INSERT`, the inlined-data flush, merge and rewrite, each output with pages
+/// `INSERT`, the inlined-data flush, merge, rewrite and SQL `UPDATE`, each output with pages
 /// of at most the configured rows. Guards against a maintenance path that
 /// builds its writer without the catalog's options, or copies the row-group
 /// settings but not the page ones.
 #[tokio::test(flavor = "multi_thread")]
-async fn insert_flush_merge_and_rewrite_write_small_pages() {
+async fn insert_flush_merge_rewrite_and_update_write_small_pages() {
     let temp = TempDir::new().unwrap();
     let data = temp.path().join("data");
     let url = new_lake(&temp).await;
@@ -420,6 +421,13 @@ async fn insert_flush_merge_and_rewrite_write_small_pages() {
     assert!(rewritten.files_created > 0, "{rewritten:?}");
     for file in new_files(&data, &seen, "rewrite") {
         assert_small_pages(&file, PAGE_ROWS, "rewrite");
+    }
+    seen = data_files(&data);
+
+    // Every live row, over the inlining limit, so the new versions go to a file.
+    sql(&ctx, "UPDATE lake.main.t SET v = concat('u-', v)").await;
+    for file in new_files(&data, &seen, "UPDATE") {
+        assert_small_pages(&file, PAGE_ROWS, "UPDATE");
     }
 
     let count = ctx
