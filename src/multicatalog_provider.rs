@@ -2098,49 +2098,6 @@ impl MetadataProvider for MulticatalogProvider {
                     .transpose()?,
                 None => None,
             };
-            let column_sizes = match self
-                .read_all_if_present(
-                    caps.file_column_stats,
-                    sqlx::query(
-                        "SELECT stats.column_id,
-                        CASE
-                          WHEN COUNT(*) = COUNT(stats.column_size_bytes)
-                           AND COUNT(*) = (
-                             SELECT COUNT(*) FROM ducklake_data_file visible
-                             WHERE visible.table_id = $1
-                               AND $2 >= visible.begin_snapshot
-                               AND ($3 < visible.end_snapshot OR visible.end_snapshot IS NULL)
-                           )
-                          THEN CAST(SUM(stats.column_size_bytes) AS BIGINT)
-                        END
-                 FROM ducklake_file_column_stats stats
-                 INNER JOIN ducklake_data_file data
-                   ON data.data_file_id = stats.data_file_id
-                  AND data.table_id = stats.table_id
-                 WHERE stats.table_id = $4
-                   AND $5 >= data.begin_snapshot
-                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
-                 GROUP BY stats.column_id",
-                    )
-                    .bind(table_id)
-                    .bind(snapshot_id)
-                    .bind(snapshot_id)
-                    .bind(table_id)
-                    .bind(snapshot_id)
-                    .bind(snapshot_id),
-                )
-                .await?
-            {
-                Some(rows) => rows
-                    .into_iter()
-                    .filter_map(|row| match row.try_get::<Option<i64>, _>(1) {
-                        Ok(Some(size)) => Some(row.try_get(0).map(|column_id| (column_id, size))),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error)),
-                    })
-                    .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                None => HashMap::new(),
-            };
             let bounds_are_exact: bool = self
                 .read_one(
                     sqlx::query(
@@ -2178,7 +2135,7 @@ impl MetadataProvider for MulticatalogProvider {
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
                             contains_nan: row.try_get(4)?,
-                            column_size_bytes: column_sizes.get(&column_id).copied(),
+                            column_size_bytes: None,
                             bounds_are_exact,
                         })
                     })

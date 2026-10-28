@@ -1953,41 +1953,6 @@ impl MetadataProvider for DuckdbMetadataProvider {
             Err(error) if is_missing_statistics_table(&error) => None,
             Err(error) => return Err(error.into()),
         };
-        let column_sizes: HashMap<i64, i64> = match conn.prepare(
-            "SELECT stats.column_id,
-                    CASE
-                      WHEN COUNT(*) = COUNT(stats.column_size_bytes)
-                       AND COUNT(*) = (
-                         SELECT COUNT(*) FROM ducklake_data_file visible
-                         WHERE visible.table_id = ?
-                           AND ? >= visible.begin_snapshot
-                           AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
-                       )
-                      THEN CAST(SUM(stats.column_size_bytes) AS BIGINT)
-                    END
-             FROM ducklake_file_column_stats stats
-             INNER JOIN ducklake_data_file data
-               ON data.data_file_id = stats.data_file_id
-              AND data.table_id = stats.table_id
-             WHERE stats.table_id = ?
-               AND ? >= data.begin_snapshot
-               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
-             GROUP BY stats.column_id",
-        ) {
-            Ok(mut stmt) => stmt
-                .query_map(
-                    params![table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
-                )?
-                .filter_map(|row| match row {
-                    Ok((column_id, Some(size))) => Some(Ok((column_id, size))),
-                    Ok((_, None)) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<_, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
-            Err(error) => return Err(error.into()),
-        };
         let bounds_are_exact: bool = conn.query_row(
             "SELECT NOT EXISTS (
                  SELECT 1 FROM ducklake_delete_file
@@ -2008,7 +1973,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         min_value: row.get(2)?,
                         max_value: row.get(3)?,
                         contains_nan: row.get(4)?,
-                        column_size_bytes: column_sizes.get(&column_id).copied(),
+                        column_size_bytes: None,
                         bounds_are_exact,
                     })
                 })?

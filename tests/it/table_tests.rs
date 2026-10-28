@@ -313,7 +313,8 @@ async fn test_catalog_statistics_are_exposed_to_datafusion() -> DataFusionResult
         a.max_value,
         Precision::Inexact(ScalarValue::Int32(Some(999)))
     );
-    assert!(matches!(a.byte_size, Precision::Inexact(bytes) if bytes > 0));
+    // No per-column size: summing it reads every file's statistics (#404).
+    assert_eq!(a.byte_size, Precision::Absent);
 
     let state = SessionContext::new().state();
     let plan = table.scan(&state, None, &[], None).await?;

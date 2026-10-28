@@ -2404,6 +2404,8 @@ pub struct DuckLakeTableColumnStatistics {
     /// see `float_bound_is_usable` in `table.rs`.
     pub contains_nan: Option<bool>,
     /// Sum of compressed bytes reported by every visible file for this column.
+    /// Built-in providers leave it `None`: summing it reads every file's
+    /// statistics.
     pub column_size_bytes: Option<i64>,
     /// Whether no delete file of the table is live at the requested snapshot.
     ///

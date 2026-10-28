@@ -94,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Building a table no longer sums every file's column sizes; table-level column `byte_size` in
+  `statistics()` is now absent on built-in providers (#404).
 - `read_rows_by_rowid` reads only the pages holding the requested rows instead of decoding
   each file that holds one; results are unchanged.
 - **BREAKING**: opening or initializing a writer never migrates; one an earlier release created
