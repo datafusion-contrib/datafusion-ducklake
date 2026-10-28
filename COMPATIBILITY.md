@@ -337,9 +337,12 @@ arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
 
 `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit` and `write_batch_size`
 set arrow-rs's data page limits for every data file a write, `UPDATE`, flush, merge or rewrite
-produces; unset, arrow-rs's defaults apply (20,000 rows, 1 MiB, 1,024 values). Official DuckLake has
-no such option, and stores none: they are writer settings, not catalog ones. The files remain
-ordinary Parquet with an offset index and page-level statistics, which DuckDB reads as any other.
+produces; unset, arrow-rs's defaults apply (20,000 rows, 1 MiB, 1,024 values).
+`DuckLakeWriteOptions::column_options` sets a column's page size, codec, dictionary and encoding on
+the same files; a column given a dictionary setting keeps it instead of the dictionary chosen from
+its first row group, and gets no bloom filter. Official DuckLake has none of these options, and
+stores none: they are writer settings, not catalog ones. The files remain ordinary Parquet with an
+offset index and page-level statistics, which DuckDB reads as any other.
 
 Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
 multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.

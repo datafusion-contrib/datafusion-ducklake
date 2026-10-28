@@ -694,6 +694,119 @@ async fn official_duckdb_reads_a_small_page_table() {
     }
 }
 
+/// Official DuckDB reads a table written with per-column settings a vector
+/// table uses: floats and a float list in `BYTE_STREAM_SPLIT` without a
+/// dictionary, strings in `DELTA_LENGTH_BYTE_ARRAY` with small pages and
+/// their own codec, integers in `DELTA_BINARY_PACKED`, rows per page
+/// uncapped. Guards against column settings that produce a file another
+/// Parquet reader cannot read.
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn official_duckdb_reads_a_table_with_column_options() {
+    use crate::inlined_mutation_differential_tests::{Metadata, duckdb_query};
+    use parquet::basic::{Compression, Encoding};
+
+    const ROWS: i64 = 5_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("v", DataType::Utf8, true),
+        Field::new("f", DataType::Float32, true),
+        Field::new(
+            "emb",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        ),
+    ]));
+    let emb = arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(
+        (0..ROWS).map(|id| Some([Some(id as f32), Some((2 * id) as f32)])),
+    );
+    let rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(StringArray::from_iter_values((0..ROWS).map(value))),
+            Arc::new(arrow::array::Float32Array::from_iter_values(
+                (0..ROWS).map(|id| id as f32),
+            )),
+            Arc::new(emb),
+        ],
+    )
+    .unwrap();
+    let split = ColumnWriteOptions::new()
+        .with_dictionary_enabled(false)
+        .with_encoding(Encoding::BYTE_STREAM_SPLIT);
+    let mut options = DuckLakeWriteOptions::default()
+        .with_column_options(
+            "id",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(false)
+                .with_encoding(Encoding::DELTA_BINARY_PACKED),
+        )
+        .with_column_options(
+            "v",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(false)
+                .with_encoding(Encoding::DELTA_LENGTH_BYTE_ARRAY)
+                .with_compression(Compression::SNAPPY)
+                .with_page_size_limit(1_024),
+        )
+        .with_column_options("f", split.clone())
+        .with_column_options("emb", split.with_page_size_limit(2_048));
+    options.data_page_row_count_limit = Some(usize::MAX);
+
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let url = new_lake(&temp).await;
+    table_writer(&url, &options)
+        .await
+        .write_table("main", "t", std::slice::from_ref(&rows))
+        .await
+        .unwrap();
+    let files = data_files(&data);
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(files.first().unwrap()).unwrap()).unwrap();
+    let encodings: Vec<(String, Vec<Encoding>)> = reader
+        .metadata()
+        .row_group(0)
+        .columns()
+        .iter()
+        .map(|chunk| (chunk.column_path().string(), chunk.encodings().collect()))
+        .collect();
+    for (column, encoding) in [
+        ("id", Encoding::DELTA_BINARY_PACKED),
+        ("v", Encoding::DELTA_LENGTH_BYTE_ARRAY),
+        ("f", Encoding::BYTE_STREAM_SPLIT),
+        ("emb.list.element", Encoding::BYTE_STREAM_SPLIT),
+    ] {
+        let (_, used) = encodings.iter().find(|(path, _)| path == column).unwrap();
+        assert!(used.contains(&encoding), "{column}: {used:?}");
+    }
+
+    let metadata = Metadata::Sqlite(temp.path().join("lake.db"));
+    let summary = duckdb_query(
+        &metadata,
+        &data,
+        "SELECT count(*), count(DISTINCT v), sum(id), sum(f)::BIGINT, \
+         sum(list_sum(emb))::BIGINT FROM lake.main.t",
+    );
+    let ids: i64 = (0..ROWS).sum();
+    assert_eq!(
+        summary,
+        vec![format!("{ROWS},{ROWS},{ids},{ids},{}", 3 * ids)]
+    );
+    let rows = duckdb_query(
+        &metadata,
+        &data,
+        "SELECT id, v, f::BIGINT, emb[2]::BIGINT FROM lake.main.t \
+         WHERE id IN (0, 1234, 4999) ORDER BY id",
+    );
+    let expected: Vec<String> = [0, 1234, 4999]
+        .iter()
+        .map(|id| format!("{id},{},{id},{}", value(*id), 2 * id))
+        .collect();
+    assert_eq!(rows, expected);
+}
+
 /// `read_columns_by_rowid` of a few rows reads far less of a file written with
 /// small pages than of the same rows in a default-page file, the footer
 /// already read. Guards against small pages that the read never sees: the
