@@ -37,16 +37,14 @@
 //!    `begin_snapshot`/`end_snapshot` newer than the base observed at begin.
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
-    require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::InlinedSystemColumns;
+use crate::metadata_provider_duckdb::catalog_state;
 use crate::metadata_provider_duckdb::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
@@ -1132,7 +1130,7 @@ impl DuckdbMetadataWriter {
             CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
                 "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
             )),
-            CatalogState::Current => Ok(()),
+            CatalogState::Current | CatalogState::NewerCompatible(_) => Ok(()),
             _ => {
                 require_migratable(&state)?;
                 upgrade_and_stamp(&mut conn)
@@ -6276,8 +6274,9 @@ fn enforce_inline_partition_fence(
 }
 
 /// Create or upgrade every table, column and counter this writer uses, then
-/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
-/// recorded last, so an interrupted run is completed by running it again.
+/// record the layout ([`crate::catalog_version::Layout::stamp`]). Each step
+/// is idempotent, and the version is recorded last, so an interrupted run is
+/// completed by running it again.
 fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(SQL_CREATE_SCHEMA)?;
     for (table, columns) in POSITIONAL_TABLES {
@@ -6336,47 +6335,25 @@ fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
             [],
         )?;
     }
-    tx.execute(
-        "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
-        [LAYOUT_VERSION_KEY],
-    )?;
-    tx.execute(
-        "INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)",
-        [LAYOUT_VERSION_KEY, &LAYOUT_VERSION.to_string()],
-    )?;
+    for (key, value) in SINGLE_CATALOG.stamp() {
+        tx.execute(
+            "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
+            [key],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)",
+            [key, &value],
+        )?;
+    }
     tx.commit()?;
     Ok(())
-}
-
-/// The catalog's state from its version rows; [`CatalogState::Absent`] when
-/// it has no `ducklake_metadata` table.
-fn catalog_state(conn: &Connection) -> Result<CatalogState> {
-    let exists = |table: &str| -> Result<bool> {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = ?",
-            [table],
-            |row| row.get(0),
-        )?)
-    };
-    if !exists("ducklake_metadata")? {
-        return Ok(CatalogState::Absent);
-    }
-    let mut statement = conn.prepare(&format!(
-        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
-        SINGLE_CATALOG.sql_keys()
-    ))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    classify(&rows, &SINGLE_CATALOG)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::DuckdbMetadataProvider;
+    use crate::catalog_version::LAYOUT_VERSION_KEY;
     use crate::metadata_provider::MetadataProvider;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;

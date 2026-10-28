@@ -1482,10 +1482,14 @@ async fn mysql_migrate_fixes_directory_paths_once() {
 }
 
 /// A catalog an earlier release created, with no layout version, is refused
-/// until migrated, once; a newer one is refused even then.
+/// until migrated, once. A newer one is read and written when its minimum
+/// version admits this release, and refused otherwise.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn mysql_refuses_a_catalog_until_migrated() {
+    use datafusion_ducklake::catalog_version::{
+        LAYOUT_VERSION, LAYOUT_VERSION_KEY, MIN_VERSION, MIN_VERSION_KEY,
+    };
     let container = Mysql::default().start().await.unwrap();
     let port = container.get_host_port_ipv4(3306).await.unwrap();
     let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
@@ -1493,6 +1497,10 @@ async fn mysql_refuses_a_catalog_until_migrated() {
     writer.create_snapshot().unwrap();
     drop(writer);
     let pool = MySqlPool::connect(&conn_str).await.unwrap();
+    let created = (
+        mysql_stamped(&pool, LAYOUT_VERSION_KEY).await,
+        mysql_stamped(&pool, MIN_VERSION_KEY).await,
+    );
     sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = 'datafusion_ducklake_version'")
         .execute(&pool)
         .await
@@ -1501,14 +1509,32 @@ async fn mysql_refuses_a_catalog_until_migrated() {
     let refused = MySqlMetadataWriter::new(&conn_str).await;
     MySqlMetadataWriter::migrate(&conn_str).await.unwrap();
     let reopened = MySqlMetadataWriter::new(&conn_str).await;
-    sqlx::query(
-        "UPDATE ducklake_metadata SET `value` = '999' WHERE `key` = 'datafusion_ducklake_version'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    mysql_stamp(&pool, LAYOUT_VERSION + 1, LAYOUT_VERSION).await;
+    let compatible_initialized = MySqlMetadataWriter::new_with_init(&conn_str)
+        .await
+        .map(drop);
+    let compatible_migrated = MySqlMetadataWriter::migrate(&conn_str).await;
+    let compatible = async { MySqlMetadataWriter::new(&conn_str).await?.create_snapshot() }.await;
+    let version = mysql_stamped(&pool, LAYOUT_VERSION_KEY).await;
+    let read = async || {
+        use datafusion_ducklake::MetadataProvider;
+        MySqlMetadataProvider::new(&conn_str)
+            .await?
+            .get_current_snapshot()
+    };
+    let compatible_read = read().await;
+    mysql_stamp(&pool, LAYOUT_VERSION + 1, LAYOUT_VERSION + 1).await;
     let newer = MySqlMetadataWriter::new(&conn_str).await;
+    let newer_read = read().await;
 
+    assert_eq!(
+        created,
+        (
+            vec![LAYOUT_VERSION.to_string()],
+            vec![MIN_VERSION.to_string()]
+        )
+    );
+    assert!(compatible_initialized.is_ok(), "{compatible_initialized:?}");
     assert!(
         matches!(
             refused,
@@ -1517,6 +1543,10 @@ async fn mysql_refuses_a_catalog_until_migrated() {
         "{refused:?}"
     );
     assert!(reopened.is_ok(), "{reopened:?}");
+    assert!(compatible_migrated.is_ok(), "{compatible_migrated:?}");
+    assert!(compatible.is_ok(), "{compatible:?}");
+    assert!(compatible_read.is_ok(), "{compatible_read:?}");
+    assert_eq!(version, vec![(LAYOUT_VERSION + 1).to_string()]);
     assert!(
         matches!(
             newer,
@@ -1524,6 +1554,38 @@ async fn mysql_refuses_a_catalog_until_migrated() {
         ),
         "{newer:?}"
     );
+    assert!(
+        matches!(&newer_read, Err(datafusion_ducklake::DuckLakeError::Unsupported(message))
+            if message.contains("newer than this release reads")),
+        "{newer_read:?}"
+    );
+}
+
+/// Record `version` as the catalog's layout version and `min_version` as its
+/// minimum version, as a newer release's migration would.
+async fn mysql_stamp(pool: &MySqlPool, version: u64, min_version: u64) {
+    use datafusion_ducklake::catalog_version::{LAYOUT_VERSION_KEY, MIN_VERSION_KEY};
+    for (key, value) in [(LAYOUT_VERSION_KEY, version), (MIN_VERSION_KEY, min_version)] {
+        sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = ?")
+            .bind(key)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ducklake_metadata (`key`, `value`) VALUES (?, ?)")
+            .bind(key)
+            .bind(value.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+async fn mysql_stamped(pool: &MySqlPool, key: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT `value` FROM ducklake_metadata WHERE `key` = ?")
+        .bind(key)
+        .fetch_all(pool)
+        .await
+        .unwrap()
 }
 
 /// `commit_compaction` stores a `Preserved` output's `row_id_start` (a merge

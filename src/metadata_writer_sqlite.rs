@@ -10,16 +10,14 @@ use std::{
 };
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
-    require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
+use crate::metadata_provider_sqlite::catalog_state;
 use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
@@ -895,7 +893,7 @@ impl SqliteMetadataWriter {
             CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
                 "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
             )),
-            CatalogState::Current => Ok(()),
+            CatalogState::Current | CatalogState::NewerCompatible(_) => Ok(()),
             _ => {
                 require_migratable(&state)?;
                 upgrade_and_stamp(&pool).await
@@ -928,28 +926,10 @@ async fn connect(
     Ok((pool, lock_path))
 }
 
-/// The catalog's state from its version rows; [`CatalogState::Absent`] when
-/// it has no `ducklake_metadata` table.
-async fn catalog_state(pool: &SqlitePool) -> Result<CatalogState> {
-    let read = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
-        SINGLE_CATALOG.sql_keys()
-    )))
-    .fetch_all(pool)
-    .await;
-    let rows: Vec<(String, String)> = match read {
-        Ok(rows) => rows,
-        Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => {
-            return Ok(CatalogState::Absent);
-        },
-        Err(error) => return Err(error.into()),
-    };
-    classify(&rows, &SINGLE_CATALOG)
-}
-
 /// Create or upgrade every table, column and counter this writer uses, then
-/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
-/// recorded last, so an interrupted run is completed by running it again.
+/// record the layout ([`crate::catalog_version::Layout::stamp`]). Each step
+/// is idempotent, and the version is recorded last, so an interrupted run is
+/// completed by running it again.
 async fn upgrade_and_stamp(pool: &SqlitePool) -> Result<()> {
     sqlx::query(SQL_CREATE_SCHEMA).execute(pool).await?;
     for (table, columns) in POSITIONAL_TABLES {
@@ -1003,15 +983,17 @@ async fn upgrade_and_stamp(pool: &SqlitePool) -> Result<()> {
         .await?;
     raise_head_watermarks_past_ids_in_use(pool).await?;
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
-        .bind(LAYOUT_VERSION_KEY)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)")
-        .bind(LAYOUT_VERSION_KEY)
-        .bind(LAYOUT_VERSION.to_string())
-        .execute(&mut *tx)
-        .await?;
+    for (key, value) in SINGLE_CATALOG.stamp() {
+        sqlx::query("DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -8174,6 +8156,7 @@ async fn enforce_inline_partition_fence(
 mod tests {
     use super::*;
     use crate::DuckLakeCatalog;
+    use crate::catalog_version::LAYOUT_VERSION_KEY;
     use crate::metadata_provider::MetadataProvider;
     use arrow::array::Int64Array;
     use datafusion::prelude::SessionContext;

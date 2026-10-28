@@ -2,6 +2,10 @@
 
 use crate::Result;
 use crate::catalog_read_transaction::{CatalogConnection, ReadTransaction, catalog_connection};
+use crate::catalog_version::{
+    CatalogState, Layout, MULTICATALOG_LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify,
+    require_readable,
+};
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedScanRead, InlinedSqlBind, InlinedSqlDialect,
     render_inlined_filter,
@@ -1583,6 +1587,9 @@ pub struct PostgresMetadataProvider {
     // The consistent read every catalog read runs on, when this provider is
     // bound to one (see `MetadataProvider::begin_consistent_read`).
     read: Option<Arc<ReadTransaction<Postgres>>>,
+    // Set once the catalog's layout version is found readable (see
+    // `require_readable`). Shared across clones.
+    readable: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl PostgresMetadataProvider {
@@ -1599,6 +1606,7 @@ impl PostgresMetadataProvider {
             schema_capabilities: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
+            readable: Arc::default(),
         })
     }
 
@@ -1621,16 +1629,28 @@ impl PostgresMetadataProvider {
             schema_capabilities: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
+            readable: Arc::default(),
         }
     }
 
     /// The connection for one catalog statement: the consistent read's while
     /// this provider is bound to an open one, else one from the pool. See
-    /// [`catalog_connection`] for how long to hold it.
-    async fn connection(
-        &self,
-    ) -> std::result::Result<CatalogConnection<'_, Postgres>, sqlx::Error> {
-        catalog_connection(self.read.as_deref(), &self.pool).await
+    /// [`catalog_connection`] for how long to hold it. The first refuses a
+    /// catalog this release must not read.
+    async fn connection(&self) -> Result<CatalogConnection<'_, Postgres>> {
+        self.require_readable().await?;
+        Ok(catalog_connection(self.read.as_deref(), &self.pool).await?)
+    }
+
+    /// Refuse a catalog this release must not read (see [`require_readable`]),
+    /// reading its version rows on the pool once per provider and its clones.
+    async fn require_readable(&self) -> Result<()> {
+        self.readable
+            .get_or_try_init(|| async {
+                require_readable(&catalog_state(&self.pool, &SINGLE_CATALOG).await?)
+            })
+            .await?;
+        Ok(())
     }
 
     /// Run `read`, a read of an optional catalog table, on the connection of
@@ -2030,6 +2050,42 @@ impl PostgresMetadataProvider {
     }
 }
 
+/// The state of the catalog or store behind `pool` from its version rows, for
+/// `layout`; [`CatalogState::Absent`] when it has no `ducklake_metadata` table.
+/// Both layouts are PostgreSQL databases, so an unversioned one, which an
+/// earlier release created, is told apart by `ducklake_catalog`, which only
+/// the multicatalog layout has.
+pub(crate) async fn catalog_state(pool: &PgPool, layout: &Layout) -> Result<CatalogState> {
+    let read = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT key, value FROM ducklake_metadata WHERE key IN {}",
+        layout.sql_keys()
+    )))
+    .fetch_all(pool)
+    .await;
+    let rows: Vec<(String, String)> = match read {
+        Ok(rows) => rows,
+        // undefined_table
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+            return Ok(CatalogState::Absent);
+        },
+        Err(error) => return Err(error.into()),
+    };
+    match classify(&rows, layout)? {
+        CatalogState::NeedsMigration(None) => {
+            let multicatalog: bool =
+                sqlx::query_scalar("SELECT to_regclass('ducklake_catalog') IS NOT NULL")
+                    .fetch_one(pool)
+                    .await?;
+            if multicatalog == (layout.key == MULTICATALOG_LAYOUT_VERSION_KEY) {
+                Ok(CatalogState::NeedsMigration(None))
+            } else {
+                Ok(CatalogState::OtherLayout(layout.other_name))
+            }
+        },
+        state => Ok(state),
+    }
+}
+
 impl MetadataProvider for PostgresMetadataProvider {
     /// One pooled connection inside `BEGIN ISOLATION LEVEL REPEATABLE READ,
     /// READ ONLY`, whose snapshot the first read fixes.
@@ -2037,6 +2093,7 @@ impl MetadataProvider for PostgresMetadataProvider {
         if self.read.as_ref().is_some_and(|read| read.is_open()) {
             return Ok(Some(ConsistentRead::within(Arc::new(self.clone()))));
         }
+        block_on(self.require_readable())?;
         let read = Arc::new(block_on(ReadTransaction::begin(
             &self.pool,
             &[CONSISTENT_READ_BEGIN],
