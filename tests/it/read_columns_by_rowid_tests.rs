@@ -204,9 +204,13 @@ fn official_rows(metadata: &Metadata, data: &Path, snapshot: i64) -> BTreeMap<i6
 }
 
 /// Run `statements` with official, and return the snapshot they leave.
-async fn official_phase(metadata: &Metadata, path: &Path, data: &Path, statements: &[&str]) -> i64 {
-    let statements: Vec<String> = statements.iter().map(ToString::to_string).collect();
-    official(metadata, data, &statements);
+async fn official_phase(
+    metadata: &Metadata,
+    path: &Path,
+    data: &Path,
+    statements: &[String],
+) -> i64 {
+    official(metadata, data, statements);
     sqlite_provider(path).await.get_current_snapshot().unwrap()
 }
 
@@ -227,48 +231,76 @@ async fn rows_by_rowid_match_official_through_its_history() {
     std::fs::create_dir_all(&data).unwrap();
     let metadata = Metadata::Sqlite(path.clone());
 
-    let phases: [&[&str]; 6] = [
+    let added = dir.path().join("added");
+    std::fs::create_dir_all(&added).unwrap();
+    let added = added.join("added.parquet");
+    let phases: Vec<Vec<String>> = [
         // Two files of one insert each, and a third the next phase's insert
         // is merged with.
-        &[
-            "CREATE TABLE lake.main.t (id INTEGER, v VARCHAR, emb FLOAT[])",
-            "CALL lake.set_option('data_inlining_row_limit', 10)",
-            "INSERT INTO lake.main.t SELECT i, 'a' || i, [i::FLOAT, i::FLOAT + 0.5] \
-             FROM range(0, 40) r(i)",
-            "INSERT INTO lake.main.t SELECT i, 'b' || i, [i::FLOAT, i::FLOAT + 0.5] \
-             FROM range(40, 80) r(i)",
-            "INSERT INTO lake.main.t SELECT i, 'm' || i, [i::FLOAT] FROM range(500, 520) r(i)",
+        vec![
+            "CREATE TABLE lake.main.t (id INTEGER, v VARCHAR, emb FLOAT[], s STRUCT(a INTEGER))"
+                .to_string(),
+            "CALL lake.set_option('data_inlining_row_limit', 10)".to_string(),
+            "INSERT INTO lake.main.t SELECT i, 'a' || i, [i::FLOAT, i::FLOAT + 0.5], {'a': i} \
+             FROM range(0, 40) r(i)"
+                .to_string(),
+            "INSERT INTO lake.main.t (id, v, emb) SELECT i, 'b' || i, [i::FLOAT, i::FLOAT + 0.5] \
+             FROM range(40, 80) r(i)"
+                .to_string(),
+            "INSERT INTO lake.main.t (id, v, emb) SELECT i, 'm' || i, [i::FLOAT] \
+             FROM range(500, 520) r(i)"
+                .to_string(),
         ],
-        &[
-            "INSERT INTO lake.main.t SELECT i, 'm' || i, [i::FLOAT] FROM range(520, 540) r(i)",
+        vec![
+            "INSERT INTO lake.main.t (id, v, emb) SELECT i, 'm' || i, [i::FLOAT] \
+             FROM range(520, 540) r(i)"
+                .to_string(),
             // Inlined rows.
-            "INSERT INTO lake.main.t VALUES (100, 'i100', [1.5]), (101, 'i101', NULL), \
-             (102, NULL, [2.5, 3.5])",
+            "INSERT INTO lake.main.t VALUES (100, 'i100', [1.5], {'a': 1}), \
+             (101, 'i101', NULL, NULL), (102, NULL, [2.5, 3.5], NULL)"
+                .to_string(),
+            // A file registered without field ids, read through a name
+            // mapping.
+            format!(
+                "COPY (SELECT (600 + i)::INTEGER AS id, 'x' || i AS v, [i::FLOAT] AS emb, \
+                 {{'a': i::INTEGER}} AS s FROM range(12) r(i)) TO '{}' (FORMAT PARQUET)",
+                added.display()
+            ),
+            format!(
+                "CALL ducklake_add_data_files('lake', 't', '{}')",
+                added.display()
+            ),
         ],
         // An inlined deletion of a file row, a delete file, a deleted inlined
         // row, and an updated file row.
-        &[
-            "DELETE FROM lake.main.t WHERE id = 3",
-            "DELETE FROM lake.main.t WHERE id BETWEEN 50 AND 69",
-            "DELETE FROM lake.main.t WHERE id = 101",
-            "UPDATE lake.main.t SET v = 'u45' WHERE id = 45",
+        vec![
+            "DELETE FROM lake.main.t WHERE id = 3".to_string(),
+            "DELETE FROM lake.main.t WHERE id BETWEEN 50 AND 69".to_string(),
+            "DELETE FROM lake.main.t WHERE id = 101".to_string(),
+            "UPDATE lake.main.t SET v = 'u45' WHERE id = 45".to_string(),
         ],
         // Schema evolution, and rows inlined and in a file at the new schema.
-        &[
-            "ALTER TABLE lake.main.t RENAME COLUMN v TO w",
-            "ALTER TABLE lake.main.t ALTER COLUMN id TYPE BIGINT",
-            "ALTER TABLE lake.main.t ADD COLUMN n INTEGER DEFAULT 7",
-            "INSERT INTO lake.main.t VALUES (200, 'i200', [4.5], 8), (201, 'i201', NULL, NULL)",
-            "INSERT INTO lake.main.t SELECT i, 'c' || i, [i::FLOAT], i FROM range(300, 340) r(i)",
-            "DELETE FROM lake.main.t WHERE id = 305",
+        vec![
+            "ALTER TABLE lake.main.t RENAME COLUMN v TO w".to_string(),
+            "ALTER TABLE lake.main.t ALTER COLUMN id TYPE BIGINT".to_string(),
+            "ALTER TABLE lake.main.t ADD COLUMN n INTEGER DEFAULT 7".to_string(),
+            "ALTER TABLE lake.main.t ADD COLUMN s.c INTEGER DEFAULT 9".to_string(),
+            "INSERT INTO lake.main.t (id, w, emb, n) VALUES (200, 'i200', [4.5], 8), \
+             (201, 'i201', NULL, NULL)"
+                .to_string(),
+            "INSERT INTO lake.main.t SELECT i, 'c' || i, [i::FLOAT], {'a': i, 'c': 1}, i \
+             FROM range(300, 340) r(i)"
+                .to_string(),
+            "DELETE FROM lake.main.t WHERE id = 305".to_string(),
         ],
-        &["CALL ducklake_merge_adjacent_files('lake')"],
-        &["CALL ducklake_flush_inlined_data('lake')"],
-    ];
+        vec!["CALL ducklake_merge_adjacent_files('lake')".to_string()],
+        vec!["CALL ducklake_flush_inlined_data('lake')".to_string()],
+    ]
+    .into();
     let mut marks = Vec::new();
     let mut saw_inlined = false;
     let mut saw_partial = false;
-    for statements in phases {
+    for statements in &phases {
         marks.push(official_phase(&metadata, &path, &data, statements).await);
         // Every snapshot so far: the one just made, and the earlier ones as
         // a merge or a flush since left them.

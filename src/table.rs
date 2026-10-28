@@ -3470,12 +3470,14 @@ impl DuckLakeTable {
     /// columns, each at most once) of `table_file`'s rows at `positions`, under
     /// the table's types, each batch paired with its rows' physical positions.
     ///
-    /// Reads only the pages of `columns` that hold `positions`, through the
-    /// file's page index, and resolves each column as a scan does: by field id
-    /// or the file's name mapping, a column the file predates reading its
-    /// initial default, and a narrower stored type widened to the table's.
-    /// Applies no deletion and no snapshot filter: the caller passes only
-    /// positions of rows visible at this table's snapshot.
+    /// Reads only the pages of `columns` that hold `positions`, and resolves
+    /// each column as a scan does: a file with a name mapping through its
+    /// mapping (Hive constants and nested defaults included), any other file by
+    /// field id as the reader opens it, so a renamed column reads its old
+    /// values, a column or struct child the file predates reads its initial
+    /// default, and a narrower stored type is widened. Applies no deletion and
+    /// no snapshot filter: the caller passes only positions of rows visible at
+    /// this table's snapshot.
     pub(crate) async fn read_file_columns_at(
         &self,
         state: &dyn Session,
@@ -3483,20 +3485,35 @@ impl DuckLakeTable {
         positions: &HashSet<i64>,
         columns: &[usize],
     ) -> DataFusionResult<Vec<(Vec<ArrayRef>, Int64Array)>> {
-        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         // The selection must cover exactly the file's physical rows, so it is
-        // sized from the footer (cached after the first read), not from the
-        // catalog's record count.
-        let selection = crate::rowid_lookup::positions_selection(positions, file_cfg.row_count);
+        // sized from the footer (kept by the table after the first read), not
+        // from the catalog's record count.
+        let rows = self.file_row_count(state, &table_file.file).await?;
+        let selection = crate::rowid_lookup::positions_selection(positions, rows);
+        let (read_schema, name_mapping, constants, resolved_by_field_id) =
+            match table_file.file.mapping_id {
+                Some(mapping_id) => {
+                    let resolved_path = self.resolve_file_path(&table_file.file)?;
+                    let (read_schema, name_mapping, constants) =
+                        self.mapped_schema(mapping_id, &resolved_path)?;
+                    (read_schema, name_mapping, constants, false)
+                },
+                None => (
+                    Arc::clone(&self.physical_schema),
+                    HashMap::new(),
+                    HashMap::new(),
+                    true,
+                ),
+            };
         let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
-            Arc::clone(&file_cfg.read_schema),
+            Arc::clone(&read_schema),
             self.physical_schema
                 .fields()
                 .iter()
                 .map(|field| field.name().as_str()),
         );
-        // The leading fields of the read schema are the table's physical
-        // columns in catalog order, so a catalog index is a read-schema index.
+        // Both read schemas are one field per physical column in catalog
+        // order, so a catalog index is a read-schema index.
         let mut proj: Vec<usize> = columns.to_vec();
         proj.push(pos_table_idx);
         let source = self
@@ -3510,13 +3527,33 @@ impl DuckLakeTable {
         let file = self.partitioned_file(&table_file.file)?.with_extension(
             datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
         );
-        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
-            self.scan_config_builder(Arc::new(source))
-                .with_file_group(FileGroup::new(vec![file]))
-                .with_projection_indices(Some(proj))?
-                .build(),
-        );
-        let plan = self.present_file_read_config(scan, &file_cfg, columns);
+        let mut builder = self
+            .scan_config_builder(Arc::new(source))
+            .with_file_group(FileGroup::new(vec![file]))
+            .with_projection_indices(Some(proj))?;
+        if resolved_by_field_id {
+            builder = builder.with_expr_adapter(Some(Arc::new(FieldIdExprAdapterFactory::new(
+                &self.columns,
+            ))));
+        }
+        let mut plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(builder.build());
+        let mut output_fields: Vec<Arc<Field>> = columns
+            .iter()
+            .map(|&index| Arc::clone(&self.physical_schema.fields()[index]))
+            .collect();
+        output_fields.extend(plan.schema().fields().iter().skip(columns.len()).cloned());
+        let output_schema = Arc::new(Schema::new(output_fields));
+        if !name_mapping.is_empty() || !constants.is_empty() || plan.schema() != output_schema {
+            let defaults = if resolved_by_field_id {
+                HashMap::new()
+            } else {
+                self.mapped_nested_defaults(&read_schema, Some(&columns.to_vec()))?
+            };
+            plan = Arc::new(
+                ColumnRenameExec::new_with_constants(plan, output_schema, name_mapping, constants)
+                    .with_defaults(defaults),
+            );
+        }
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
         let mut out = Vec::with_capacity(batches.len());
         for batch in &batches {
