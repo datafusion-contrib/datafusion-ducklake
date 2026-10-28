@@ -38,6 +38,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::properties::{DEFAULT_MAX_ROW_GROUP_ROW_COUNT, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
 
@@ -282,6 +283,41 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     writer: Option<ArrowWriter<W>>,
+    observer: Option<Box<dyn RowGroupObserver>>,
+}
+
+/// Sees every batch a data file's parquet encoder receives, and where the
+/// encoder closes each row group, so a caller can build a per-row-group side
+/// structure (an index, a sketch) from the rows being encoded instead of
+/// reading the finished file back.
+///
+/// The encoder decides row-group boundaries itself: by row count, and by its
+/// own estimate of encoded bytes, which can split a batch anywhere. So an
+/// observer must not assume one batch is one row group; it learns each
+/// boundary from `closed`.
+///
+/// An observer cannot fail the write. One that cannot keep up records that
+/// itself and reports nothing for the file.
+pub trait RowGroupObserver: Send + std::fmt::Debug {
+    /// `batch` was handed to the encoder exactly as given, with the file's
+    /// parquet schema. `closed` lists, in order, the row count of each row
+    /// group the encoder closed while encoding it. A closed group can hold
+    /// rows of earlier batches; the rows of `batch` past the last boundary
+    /// stay in the open row group.
+    fn on_encoded(&mut self, batch: &RecordBatch, closed: &[usize]);
+
+    /// The file is complete and its footer is about to be written.
+    /// `row_groups` is every row group of the file, in order, the last
+    /// (partial) one included.
+    fn on_finished(&mut self, row_groups: &[RowGroupMetaData]);
+}
+
+/// Makes a [`RowGroupObserver`] for each data file a write opens.
+pub trait RowGroupObserverFactory: Send + Sync + std::fmt::Debug {
+    /// Called when a write opens a data file. `object_path` is the
+    /// object-store key the file is uploaded to, which names it for good.
+    /// `None` observes nothing.
+    fn observe(&self, object_path: &str) -> Option<Box<dyn RowGroupObserver>>;
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -292,14 +328,21 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             buffered_rows: 0,
             buffered_bytes: 0,
             writer: None,
+            observer: None,
         }
+    }
+
+    /// Report this file's encoding to `observer`.
+    pub(crate) fn with_observer(mut self, observer: Option<Box<dyn RowGroupObserver>>) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
     /// the first row group is incomplete, and opens the file once it is.
     pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if let Some(writer) = &mut self.writer {
-            writer.write(batch)?;
+            encode(writer, &mut self.observer, batch)?;
             return Ok(());
         }
         if batch.num_rows() == 0 {
@@ -325,7 +368,7 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         let props = props_for_row_group(&base, &self.buffered)?;
         let mut writer = ArrowWriter::try_new(sink, schema, Some(props))?;
         for batch in std::mem::take(&mut self.buffered) {
-            writer.write(&batch)?;
+            encode(&mut writer, &mut self.observer, &batch)?;
         }
         self.writer = Some(writer);
         Ok(())
@@ -348,9 +391,35 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         if self.writer.is_none() {
             self.open()?;
         }
-        let writer = self.writer.take().expect("writer opened above");
+        let mut writer = self.writer.take().expect("writer opened above");
+        if let Some(observer) = &mut self.observer {
+            // Close the last row group first, so the observer sees every group.
+            writer.flush()?;
+            observer.on_finished(writer.flushed_row_groups());
+        }
         Ok(writer.into_inner()?)
     }
+}
+
+/// Encode `batch` and tell `observer` which row groups the encoder closed
+/// while doing it.
+fn encode<W: Write + Send>(
+    writer: &mut ArrowWriter<W>,
+    observer: &mut Option<Box<dyn RowGroupObserver>>,
+    batch: &RecordBatch,
+) -> Result<()> {
+    let Some(observer) = observer else {
+        writer.write(batch)?;
+        return Ok(());
+    };
+    let before = writer.flushed_row_groups().len();
+    writer.write(batch)?;
+    let closed: Vec<usize> = writer.flushed_row_groups()[before..]
+        .iter()
+        .map(|group| usize::try_from(group.num_rows()).unwrap_or(0))
+        .collect();
+    observer.on_encoded(batch, &closed);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -503,5 +572,129 @@ mod tests {
         assert_eq!(writer.bytes_written() + writer.in_progress_size(), 0);
         writer.write(&batch(1_000, 2_000)).unwrap();
         assert!(writer.bytes_written() + writer.in_progress_size() > 0);
+    }
+
+    /// Records which `id` values the observer assigned to each row group.
+    #[derive(Debug, Default)]
+    struct Recording {
+        groups: Vec<Vec<i64>>,
+        open: Vec<i64>,
+        finished: Option<Vec<i64>>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingObserver(std::sync::Arc<std::sync::Mutex<Recording>>);
+
+    impl RowGroupObserver for RecordingObserver {
+        fn on_encoded(&mut self, batch: &RecordBatch, closed: &[usize]) {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let mut rec = self.0.lock().unwrap();
+            let mut row = 0;
+            for &rows in closed {
+                let need = rows - rec.open.len();
+                let taken: Vec<i64> = (row..row + need).map(|i| ids.value(i)).collect();
+                rec.open.extend(taken);
+                let group = std::mem::take(&mut rec.open);
+                rec.groups.push(group);
+                row += need;
+            }
+            let rest: Vec<i64> = (row..batch.num_rows()).map(|i| ids.value(i)).collect();
+            rec.open.extend(rest);
+        }
+
+        fn on_finished(&mut self, row_groups: &[RowGroupMetaData]) {
+            let mut rec = self.0.lock().unwrap();
+            if !rec.open.is_empty() {
+                let group = std::mem::take(&mut rec.open);
+                rec.groups.push(group);
+            }
+            rec.finished = Some(row_groups.iter().map(|g| g.num_rows()).collect());
+        }
+    }
+
+    /// Write `batches`, and return the observer's groups beside the groups
+    /// the file actually holds (read back from it).
+    fn observed_and_actual(
+        batches: &[RecordBatch],
+        props: WriterProperties,
+    ) -> (Recording, Vec<Vec<i64>>) {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut writer = RowGroupSampledWriter::new(Vec::new(), schema(), props)
+            .with_observer(Some(Box::new(RecordingObserver(shared.clone()))));
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+        let groups = builder.metadata().num_row_groups();
+        let mut actual = Vec::new();
+        for group in 0..groups {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                .unwrap()
+                .with_row_groups(vec![group])
+                .build()
+                .unwrap();
+            let mut ids = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                ids.extend(col.values().iter().copied());
+            }
+            actual.push(ids);
+        }
+        let rec = std::mem::take(&mut *shared.lock().unwrap());
+        (rec, actual)
+    }
+
+    fn assert_observer_matches(batches: &[RecordBatch], props: WriterProperties) {
+        let (rec, actual) = observed_and_actual(batches, props);
+        assert!(actual.len() > 1, "the case must produce several row groups");
+        assert_eq!(rec.groups, actual, "observer groups differ from the file's");
+        let finished = rec.finished.expect("on_finished was called");
+        let sizes: Vec<i64> = actual.iter().map(|g| g.len() as i64).collect();
+        assert_eq!(finished, sizes);
+    }
+
+    #[test]
+    fn observer_sees_row_count_boundaries_inside_and_across_batches() {
+        // 1,700-row batches against 1,000-row groups: boundaries fall inside
+        // batches, a group spans two batches, and the last group is partial.
+        let batches: Vec<_> = (0..7).map(|b| batch(b * 1_700, (b + 1) * 1_700)).collect();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_000))
+            .build();
+        assert_observer_matches(&batches, props);
+    }
+
+    #[test]
+    fn observer_sees_byte_cap_boundaries() {
+        // The byte cap splits batches at points only the encoder knows.
+        let batches: Vec<_> = (0..30).map(|b| batch(b * 997, (b + 1) * 997)).collect();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_000_000))
+            .set_max_row_group_bytes(Some(64 * 1024))
+            .build();
+        assert_observer_matches(&batches, props);
+    }
+
+    #[test]
+    fn observer_sees_a_file_smaller_than_its_first_row_group() {
+        let (rec, actual) = observed_and_actual(
+            &[batch(0, 10), batch(10, 25)],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(1_000))
+                .build(),
+        );
+        assert_eq!(actual.len(), 1);
+        assert_eq!(rec.groups, actual);
     }
 }

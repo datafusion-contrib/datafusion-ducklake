@@ -32,6 +32,7 @@ use crate::path_resolver::{join_paths, parse_object_store_url};
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::{DELETE_POS_COL, delete_file_schema};
 use crate::write_encoding::{DataFileProperties, RowGroupSampledWriter};
+pub use crate::write_encoding::{RowGroupObserver, RowGroupObserverFactory};
 
 // The partition-group shape is shared with the split logic in `partition`.
 pub use crate::partition::PartitionGroup;
@@ -903,6 +904,9 @@ pub struct DuckLakeTableWriter {
     /// `sort_on_insert` says, as official's flush does.
     flushing_inlined: bool,
     hive_file_pattern: bool,
+    /// Sees the encoding of every data file a write session opens; see
+    /// [`Self::with_row_group_observers`].
+    row_group_observers: Option<Arc<dyn RowGroupObserverFactory>>,
 }
 
 /// Whether an error came from the metadata database or the object store or
@@ -952,7 +956,25 @@ impl DuckLakeTableWriter {
             sort_on_insert: true,
             flushing_inlined: false,
             hive_file_pattern: true,
+            row_group_observers: None,
         })
+    }
+
+    /// Report the parquet encoding of every data file a write session of this
+    /// writer opens — single-file, rolled and partitioned alike — to an
+    /// observer `factory` makes for that file. Compaction and inlined-data
+    /// flushes are not observed.
+    #[must_use]
+    pub fn with_row_group_observers(mut self, factory: Arc<dyn RowGroupObserverFactory>) -> Self {
+        self.row_group_observers = Some(factory);
+        self
+    }
+
+    /// An observer for the data file at `object_path`, when one is wanted.
+    fn observer_for(&self, object_path: &ObjectPath) -> Option<Box<dyn RowGroupObserver>> {
+        self.row_group_observers
+            .as_ref()
+            .and_then(|factory| factory.observe(object_path.as_ref()))
     }
 
     /// Starts a write transaction that can stage changes for multiple tables.
@@ -1533,7 +1555,8 @@ impl DuckLakeTableWriter {
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props)
+            .with_observer(self.observer_for(&object_path));
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1562,6 +1585,7 @@ impl DuckLakeTableWriter {
                         target_file_size: self.target_file_size,
                         max_open: self.max_open_partitions,
                         hive_file_pattern: self.hive_file_pattern,
+                        observers: self.row_group_observers.clone(),
                         open: Vec::new(),
                         uploads: StagedUploads::new(
                             Arc::clone(&self.object_store),
@@ -1585,7 +1609,8 @@ impl DuckLakeTableWriter {
                 self.target_file_size,
                 // Keep `TableWriteSession::file_path` accurate for the first file.
                 Some(catalog_path.clone()),
-            ))
+            )
+            .with_observers(self.row_group_observers.clone()))
         } else {
             None
         };
@@ -4449,6 +4474,8 @@ struct RollingFileWriter {
     /// `target_file_size`, only) file, so rolling does not silently change what an
     /// existing caller observes. Taken on first use.
     first_catalog_path: Option<String>,
+    /// Makes an observer for each file this roller opens.
+    observers: Option<Arc<dyn RowGroupObserverFactory>>,
 }
 
 impl RollingFileWriter {
@@ -4470,7 +4497,15 @@ impl RollingFileWriter {
             props,
             target_file_size,
             open: None,
+            observers: None,
         }
+    }
+
+    /// Report the encoding of each file this roller opens to an observer
+    /// `observers` makes for it.
+    fn with_observers(mut self, observers: Option<Arc<dyn RowGroupObserverFactory>>) -> Self {
+        self.observers = observers;
+        self
     }
 
     /// Append `batch`, opening a file if none is in progress. Returns the finished
@@ -4538,8 +4573,13 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
+        let observer = self
+            .observers
+            .as_ref()
+            .and_then(|factory| factory.observe(object_path.as_ref()));
         let writer =
-            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
+            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone())
+                .with_observer(observer);
         Ok(OpenFile {
             writer,
             temp,
@@ -4649,6 +4689,8 @@ struct PartitionSink {
     target_file_size: usize,
     max_open: usize,
     hive_file_pattern: bool,
+    /// Makes an observer for each partition file opened.
+    observers: Option<Arc<dyn RowGroupObserverFactory>>,
     /// One roller per partition with a file in progress, oldest first (eviction takes
     /// from the front). Paired with the partition values its files carry.
     open: Vec<(Vec<Option<String>>, RollingFileWriter)>,
@@ -4712,7 +4754,8 @@ impl PartitionSink {
                         self.props.clone(),
                         self.target_file_size,
                         None,
-                    ),
+                    )
+                    .with_observers(self.observers.clone()),
                 ));
                 self.open.len() - 1
             },
