@@ -204,14 +204,22 @@ pub struct FileOwners {
 /// Manages DuckLake catalogs within a shared metadata database.
 ///
 /// `MulticatalogManager` executes SQL against the pool, keeping only a memo of
-/// the inlined-data registry's existence. Multiple managers against the same
-/// pool are safe.
+/// the inlined-data registry's existence and of the store's layout version
+/// check. Multiple managers against the same pool are safe.
+///
+/// Each method that changes the store, or reads what file cleanup deletes by,
+/// first refuses a store a multicatalog writer would refuse (see
+/// [`crate::catalog_version`]): one that needs migrating, or one a newer
+/// release wrote whose minimum version is above this release's. The check runs
+/// once per manager and its clones.
 #[derive(Debug, Clone)]
 pub struct MulticatalogManager {
     pool: PgPool,
     /// Set once the store is seen to have the `ducklake_inlined_data_tables`
     /// registry, which is never dropped.
     has_inlined_registry: Arc<OnceLock<()>>,
+    /// Set once the store is found writable by this release.
+    writable: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl MulticatalogManager {
@@ -248,15 +256,26 @@ impl MulticatalogManager {
         Ok(Self::new(pool))
     }
 
-    /// Construct a manager bound to a Postgres pool. It reads no layout
-    /// version: use [`Self::connect`], or run [`initialize_multicatalog_schema`]
-    /// first, so a store that needs migrating, or one a newer release wrote, is
-    /// refused before the manager changes it.
+    /// Construct a manager bound to a Postgres pool. It reads the store's
+    /// layout version before the first method that changes the store; see
+    /// [`MulticatalogManager`].
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             has_inlined_registry: Arc::new(OnceLock::new()),
+            writable: Arc::default(),
         }
+    }
+
+    /// Refuse a store a multicatalog writer would refuse, reading its version
+    /// rows once per manager and its clones.
+    async fn require_writable(&self) -> Result<()> {
+        self.writable
+            .get_or_try_init(|| {
+                crate::metadata_writer_postgres::require_writable_multicatalog(&self.pool)
+            })
+            .await?;
+        Ok(())
     }
 
     /// The manager's pool.
@@ -278,6 +297,7 @@ impl MulticatalogManager {
     /// Idempotent. Concurrency-safety relies on the `UNIQUE (catalog_name)`
     /// constraint on `ducklake_catalog`.
     pub async fn create_catalog(&self, name: &str) -> Result<i64> {
+        self.require_writable().await?;
         if name.trim().is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "Catalog name cannot be empty".to_string(),
@@ -371,6 +391,7 @@ impl MulticatalogManager {
     /// the metadata rows are gone. Callers needing synchronous cleanup must
     /// still arrange it around this metadata-only operation.
     pub async fn drop_catalog(&self, name: &str) -> Result<bool> {
+        self.require_writable().await?;
         if name.trim().is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "Catalog name cannot be empty".to_string(),
@@ -612,6 +633,7 @@ impl MulticatalogManager {
         schema_name: &str,
         table_name: &str,
     ) -> Result<bool> {
+        self.require_writable().await?;
         if catalog_name.trim().is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "Catalog name cannot be empty".to_string(),
@@ -709,6 +731,7 @@ impl MulticatalogManager {
 
     /// List every live, legacy, or dropped catalog root that may need orphan cleanup.
     pub async fn list_data_paths(&self) -> Result<Vec<String>> {
+        self.require_writable().await?;
         let paths = if crate::multicatalog_provider::catalog_has_data_path(&self.pool).await? {
             sqlx::query_scalar(
                 "SELECT data_path FROM (
@@ -747,6 +770,7 @@ impl MulticatalogManager {
         data_paths: &[String],
         dropped_before: DateTime<Utc>,
     ) -> Result<()> {
+        self.require_writable().await?;
         sqlx::query(
             "DELETE FROM ducklake_dropped_data_path
              WHERE data_path::TEXT = ANY($1) AND dropped_at <= $2",
@@ -789,6 +813,7 @@ impl MulticatalogManager {
         catalog_name: &str,
         criteria: ExpireCriteria,
     ) -> Result<Vec<ExpiredSnapshot>> {
+        self.require_writable().await?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("SET LOCAL lock_timeout = 30000")
             .execute(&mut *tx)
@@ -1127,6 +1152,7 @@ impl MulticatalogManager {
         catalog_name: &str,
         criteria: &CleanupCriteria,
     ) -> Result<Vec<ScheduledFile>> {
+        self.require_writable().await?;
         let catalog_id = match self.find_catalog_id(catalog_name).await? {
             Some(id) => id,
             None => return Ok(Vec::new()),
@@ -1180,6 +1206,7 @@ impl MulticatalogManager {
         catalog_name: &str,
         paths: &[String],
     ) -> Result<()> {
+        self.require_writable().await?;
         if paths.is_empty() {
             return Ok(());
         }
@@ -1202,6 +1229,7 @@ impl MulticatalogManager {
     /// where OTHER catalogs' own files live. Catalogs with no `data_path` configured
     /// are omitted: nothing can be said about where their files sit.
     pub(crate) async fn list_catalog_data_paths(&self) -> Result<Vec<(i64, String)>> {
+        self.require_writable().await?;
         let rows = sqlx::query(
             "SELECT catalog_id, data_path::TEXT FROM ducklake_catalog
              WHERE data_path IS NOT NULL",
@@ -1239,6 +1267,7 @@ impl MulticatalogManager {
     /// reference, and including it would make the catalog defer its own reclaim
     /// against itself forever.
     pub async fn all_reference_paths(&self) -> Result<Vec<String>> {
+        self.require_writable().await?;
         let mut conn = self.pool.acquire().await?;
         let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
         let q = crate::metadata_writer_postgres::reference_paths_sql(legacy);
@@ -1263,6 +1292,7 @@ impl MulticatalogManager {
     /// records it in tables of its own, not in columns on `ducklake_data_file` and
     /// `ducklake_delete_file`.
     pub async fn table_file_owners(&self, catalog_id: i64, table_id: i64) -> Result<FileOwners> {
+        self.require_writable().await?;
         let mut conn = self.pool.acquire().await?;
         let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
         let owner = |reference: &str, legacy_column: bool| {
@@ -1313,6 +1343,7 @@ impl MulticatalogManager {
     /// Cheap on a store that holds no references: the reference tables are empty,
     /// and only their rows are joined to the file tables.
     pub async fn has_live_references(&self) -> Result<bool> {
+        self.require_writable().await?;
         let mut conn = self.pool.acquire().await?;
         let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
         let mut arms = vec![
@@ -1352,6 +1383,7 @@ impl MulticatalogManager {
         catalog_name: &str,
         paths: &[String],
     ) -> Result<()> {
+        self.require_writable().await?;
         if paths.is_empty() {
             return Ok(());
         }
@@ -1394,6 +1426,7 @@ impl MulticatalogManager {
         &self,
         data_paths: &[String],
     ) -> Result<Vec<(String, bool)>> {
+        self.require_writable().await?;
         let mut conn = self.pool.acquire().await?;
         let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
         let references = crate::metadata_writer_postgres::reference_paths_sql(legacy);
