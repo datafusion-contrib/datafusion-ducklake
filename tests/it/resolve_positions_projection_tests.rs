@@ -1261,6 +1261,49 @@ async fn name_mapped_file() {
     // Guard against an oracle that could agree by accident.
     let unique: HashSet<_> = rows.iter().map(|(id, _)| *id).collect();
     assert_eq!(unique.len(), ROWS as usize);
+
+    // Rows read by `rowid` read the key the file stores as `source_id` and
+    // the Hive constant the file does not store at all.
+    let row_id_start = file
+        .row_id_start
+        .expect("a registered file records row ids");
+    let positions = [4_013i64, 2, ROWS - 1];
+    let wanted: Vec<i64> = positions.iter().map(|p| row_id_start + p).collect();
+    let schema = table.schema();
+    let projection = [
+        schema.index_of("part").unwrap(),
+        schema.index_of("id").unwrap(),
+        schema.index_of("k2").unwrap(),
+    ];
+    let read = table
+        .read_columns_by_rowid(&h.ctx.state(), &wanted, Some(&projection))
+        .await
+        .unwrap();
+    assert_eq!(read.row_ids, wanted);
+    let part = read
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let id = read
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let k2 = read
+        .batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    for (row, position) in positions.iter().enumerate() {
+        let (want_id, want_k2) = rows[usize::try_from(*position).unwrap()];
+        assert_eq!(part.value(row), 10, "the Hive constant");
+        assert_eq!(Some(id.value(row)), want_id, "the mapped key");
+        assert_eq!(Some(i64::from(k2.value(row))), want_k2);
+    }
 }
 
 /// A lambda's parameter is a `LambdaVariable` whose index is its slot AFTER the
@@ -1706,5 +1749,114 @@ async fn read_rows_by_rowid_reads_only_the_pages_of_the_rows_asked_for() {
     assert!(
         bytes * 2 < total,
         "read {bytes} bytes of a {total}-byte file to return 3 rows"
+    );
+}
+
+/// `read_columns_by_rowid` reads only the pages of the columns it projects
+/// that hold the rows asked for, and reads no footer again on a later call.
+///
+/// Each assertion separates one saving: the key column alone reads a small
+/// fraction of the file (the projection), the 1.5 KiB payload column reads a
+/// page per row rather than its whole column chunk (the page-level
+/// selection, as for `read_rows_by_rowid`), and a projection with no data
+/// column reads only the delete file locating the rows needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn read_columns_by_rowid_reads_only_the_projected_pages() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, 0..ROWS).await;
+    let h = open(&temp).await;
+    let (deleted, _) = h.dml("DELETE FROM ducklake.main.t WHERE id = 5").await;
+    assert_eq!(deleted, 1);
+    let table = h.table().await;
+    let files = table.files().unwrap();
+    let total = file_bytes(&files[0]);
+    let delete_bytes =
+        u64::try_from(files[0].delete_file.as_ref().unwrap().file_size_bytes).unwrap();
+    let schema = table.schema();
+    let index = |name: &str| schema.index_of(name).unwrap();
+
+    // Rows in three row groups, out of order, and a deleted one.
+    let wanted = [ROWS - 1, 7, 5, 4013];
+    let found = vec![ROWS - 1, 7, 4013];
+    let state = h.ctx.state();
+    // The first call reads the footer, which the table then keeps.
+    let first = table
+        .read_columns_by_rowid(&state, &wanted, Some(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first.row_ids, found);
+    assert_eq!(first.missing(&wanted), vec![5]);
+
+    h.store.take();
+    let none = table
+        .read_columns_by_rowid(&state, &wanted, Some(&[]))
+        .await
+        .unwrap();
+    let bytes_none = h.store.take();
+    assert_eq!(none.row_ids, found);
+    assert!(
+        bytes_none <= 2 * delete_bytes,
+        "no data column read {bytes_none} bytes; the delete file is {delete_bytes}"
+    );
+
+    let ids = table
+        .read_columns_by_rowid(&state, &wanted, Some(&[index("id")]))
+        .await
+        .unwrap();
+    let bytes_id = h.store.take();
+    let id_values = ids
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(id_values.values().to_vec(), found, "rowid is the id here");
+    assert_narrow(bytes_id, total, "the key column");
+
+    let wide = table
+        .read_columns_by_rowid(&state, &wanted, Some(&[index("payload"), index("id")]))
+        .await
+        .unwrap();
+    let bytes_wide = h.store.take();
+    assert_eq!(wide.row_ids, found);
+    let payloads = wide
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryViewArray>()
+        .unwrap();
+    let id_values = wide
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for row in 0..wide.batch.num_rows() {
+        assert_eq!(
+            payloads.value(row),
+            payload(id_values.value(row)).as_slice()
+        );
+    }
+    eprintln!(
+        "read_columns_by_rowid of {total} bytes: none {bytes_none}, id {bytes_id}, \
+         payload {bytes_wide}"
+    );
+    assert!(bytes_wide > bytes_id, "the payload pages are read");
+    assert!(
+        bytes_wide * 2 < total,
+        "read {bytes_wide} bytes of a {total}-byte file for 3 payloads"
+    );
+
+    // Every column, as `SELECT *`.
+    let all = table
+        .read_columns_by_rowid(&state, &wanted, None)
+        .await
+        .unwrap();
+    let bytes_all = h.store.take();
+    assert_eq!(all.row_ids, found);
+    assert_eq!(all.batch.schema(), schema);
+    assert!(
+        bytes_all * 2 < total,
+        "read {bytes_all} bytes of a {total}-byte file for 3 rows"
     );
 }

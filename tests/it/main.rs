@@ -97,6 +97,7 @@ mod postgres_initialization_tests;
 mod postgres_metadata_provider_test;
 mod postgres_single_catalog_write_tests;
 mod pushdown_row_preservation_tests;
+mod read_columns_by_rowid_tests;
 mod renamed_columns_tests;
 mod resolve_positions_projection_tests;
 mod restore_rows_tests;
