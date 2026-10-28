@@ -189,6 +189,24 @@ pub struct DuckLakeWriteOptions {
     pub max_row_group_rows: Option<usize>,
     /// Max uncompressed bytes per row group; `None` = parquet default.
     pub max_row_group_bytes: Option<usize>,
+    /// Target number of rows per Parquet data page; `None` = parquet default
+    /// (20,000). Smaller pages let a read of a few rows, located through the
+    /// file's page index, fetch and decode less of each column. The writer
+    /// checks the limit after each mini-batch of values it encodes, so keep
+    /// [`Self::write_batch_size`] at or below it for pages this small.
+    /// Clamped to at least 1. A physical Parquet setting: official DuckLake
+    /// has no such option, and the files it produces read as any other.
+    pub data_page_row_count_limit: Option<usize>,
+    /// Target encoded bytes per Parquet data page; `None` = parquet default
+    /// (1 MiB). Best effort: the writer compares its estimate of the page's
+    /// encoded size with the limit between mini-batches, so a page can run
+    /// past it. A physical Parquet setting with no official equivalent, as
+    /// [`Self::data_page_row_count_limit`].
+    pub data_page_size_limit: Option<usize>,
+    /// Values the Parquet writer encodes per mini-batch, between which it
+    /// checks the page limits; `None` = parquet default (1,024). Clamped to
+    /// at least 1. A physical Parquet setting with no official equivalent.
+    pub write_batch_size: Option<usize>,
     /// Target data file size for rollover (approx encoded bytes); `None` leaves
     /// the writer default ([`DEFAULT_TARGET_FILE_SIZE`]).
     pub target_file_size: Option<usize>,
@@ -241,6 +259,10 @@ impl DuckLakeWriteOptions {
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
             max_row_group_bytes: setting_size(settings, "parquet_row_group_size_bytes", None)?,
+            // Official stores no page settings; a writer's own apply.
+            data_page_row_count_limit: None,
+            data_page_size_limit: None,
+            write_batch_size: None,
             target_file_size: setting_size(
                 settings,
                 "target_file_size",
@@ -334,6 +356,15 @@ impl DuckLakeWriteOptions {
         }
         if overrides.max_row_group_bytes.is_some() {
             self.max_row_group_bytes = overrides.max_row_group_bytes;
+        }
+        if overrides.data_page_row_count_limit.is_some() {
+            self.data_page_row_count_limit = overrides.data_page_row_count_limit;
+        }
+        if overrides.data_page_size_limit.is_some() {
+            self.data_page_size_limit = overrides.data_page_size_limit;
+        }
+        if overrides.write_batch_size.is_some() {
+            self.write_batch_size = overrides.write_batch_size;
         }
         if overrides.target_file_size.is_some() {
             self.target_file_size = overrides.target_file_size;
@@ -680,6 +711,12 @@ pub struct DuckLakeTableWriter {
     /// once, so a byte cap bounds reader memory for wide schemas (e.g. large
     /// vector columns). Set via [`DuckLakeTableWriter::with_max_row_group_bytes`].
     max_row_group_bytes: Option<usize>,
+    /// Optional Parquet data page row count limit, data page byte limit and
+    /// write batch size ([`DuckLakeWriteOptions::data_page_row_count_limit`]
+    /// and its siblings). `None` leaves each parquet default.
+    data_page_row_count_limit: Option<usize>,
+    data_page_size_limit: Option<usize>,
+    write_batch_size: Option<usize>,
     /// How many finished data files a write uploads concurrently. Defaults to
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
@@ -743,6 +780,9 @@ impl DuckLakeTableWriter {
             writer_version: WriterVersion::PARQUET_2_0,
             max_row_group_rows: None,
             max_row_group_bytes: None,
+            data_page_row_count_limit: None,
+            data_page_size_limit: None,
+            write_batch_size: None,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
@@ -823,8 +863,8 @@ impl DuckLakeTableWriter {
         self
     }
 
-    /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
-    /// target, open-partition cap, upload concurrency). Each field overrides the
+    /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, data
+    /// page limits, rollover target, open-partition cap, upload concurrency). Each field overrides the
     /// corresponding setting only when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
         if let Some(limit) = options.data_inlining_row_limit {
@@ -841,6 +881,15 @@ impl DuckLakeTableWriter {
         }
         if let Some(bytes) = options.max_row_group_bytes {
             self.max_row_group_bytes = Some(bytes);
+        }
+        if let Some(rows) = options.data_page_row_count_limit {
+            self.data_page_row_count_limit = Some(rows.max(1));
+        }
+        if let Some(bytes) = options.data_page_size_limit {
+            self.data_page_size_limit = Some(bytes);
+        }
+        if let Some(values) = options.write_batch_size {
+            self.write_batch_size = Some(values.max(1));
         }
         if let Some(bytes) = options.target_file_size {
             self.target_file_size = bytes;
@@ -860,8 +909,14 @@ impl DuckLakeTableWriter {
         self
     }
 
-    /// Build the parquet [`WriterProperties`] shared by every write path from this
-    /// writer's configured compression and row-group caps.
+    /// Build the parquet [`WriterProperties`] shared by every data file write
+    /// path from this writer's configured compression, row-group caps and
+    /// data page limits.
+    ///
+    /// Statistics and the offset index keep the parquet defaults: page-level
+    /// statistics, so every column chunk gets a column index and an offset
+    /// index. Page limits only narrow a read of a few rows because the reader
+    /// finds their pages through that page index.
     fn build_writer_props(&self) -> WriterProperties {
         let mut builder = WriterProperties::builder()
             .set_writer_version(self.writer_version)
@@ -871,6 +926,15 @@ impl DuckLakeTableWriter {
         }
         if let Some(bytes) = self.max_row_group_bytes {
             builder = builder.set_max_row_group_bytes(Some(bytes));
+        }
+        if let Some(rows) = self.data_page_row_count_limit {
+            builder = builder.set_data_page_row_count_limit(rows);
+        }
+        if let Some(bytes) = self.data_page_size_limit {
+            builder = builder.set_data_page_size_limit(bytes);
+        }
+        if let Some(values) = self.write_batch_size {
+            builder = builder.set_write_batch_size(values);
         }
         builder.build()
     }
@@ -1245,21 +1309,12 @@ impl DuckLakeTableWriter {
         // Strip leading slash for object_store Path (it expects relative keys)
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
-        // Apply caller-configured row-group caps. The ArrowWriter enforces both
-        // natively (flushing the row group when either is hit). The byte cap
-        // matters for wide schemas: a parquet reader decodes a whole row group
-        // at once, so an uncapped large vector column builds multi-GiB row
-        // groups that OOM readers. Both default to the parquet default (unset).
-        let mut props_builder = WriterProperties::builder()
-            .set_writer_version(self.writer_version)
-            .set_compression(self.compression);
-        if let Some(rows) = self.max_row_group_rows {
-            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
-        }
-        if let Some(bytes) = self.max_row_group_bytes {
-            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
-        }
-        let props = props_builder.build();
+        // Apply caller-configured row-group caps and page limits. The ArrowWriter
+        // enforces both row-group caps natively (flushing the row group when
+        // either is hit). The byte cap matters for wide schemas: a parquet
+        // reader decodes a whole row group at once, so an uncapped large vector
+        // column builds multi-GiB row groups that OOM readers.
+        let props = self.build_writer_props();
         // Stream the parquet to a local staging file rather than an in-memory
         // buffer: a multi-GB table would otherwise be held whole in RAM and,
         // worse, uploaded as a single PUT (object stores cap a single PUT at
@@ -1983,16 +2038,7 @@ impl DuckLakeTableWriter {
             Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
         };
 
-        let mut props_builder = WriterProperties::builder()
-            .set_writer_version(self.writer_version)
-            .set_compression(self.compression);
-        if let Some(rows) = self.max_row_group_rows {
-            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
-        }
-        if let Some(bytes) = self.max_row_group_bytes {
-            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
-        }
-        let props = props_builder.build();
+        let props = self.build_writer_props();
 
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
@@ -6138,6 +6184,97 @@ mod tests {
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));
+    }
+
+    /// The writer hands the page settings to parquet, clamping the two a zero
+    /// would stall the encoder on, and leaves parquet's defaults without them.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_props_carry_page_settings() {
+        use parquet::file::properties::{
+            DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT, DEFAULT_PAGE_SIZE, DEFAULT_WRITE_BATCH_SIZE,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", temp.path().join("c.db").display());
+        let metadata = crate::SqliteMetadataWriter::new_with_init(&url)
+            .await
+            .unwrap();
+        metadata
+            .set_data_path(temp.path().to_str().unwrap())
+            .unwrap();
+        let writer = DuckLakeTableWriter::new(
+            Arc::new(metadata),
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        )
+        .unwrap();
+        let column = parquet::schema::types::ColumnPath::from("c");
+
+        let props = writer.build_writer_props();
+        assert_eq!(
+            props.data_page_row_count_limit(),
+            DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
+        assert_eq!(props.data_page_size_limit(), DEFAULT_PAGE_SIZE);
+        assert_eq!(props.write_batch_size(), DEFAULT_WRITE_BATCH_SIZE);
+        assert!(!props.offset_index_disabled());
+        assert_eq!(
+            props.statistics_enabled(&column),
+            parquet::file::properties::EnabledStatistics::Page
+        );
+
+        let options = DuckLakeWriteOptions {
+            data_page_row_count_limit: Some(64),
+            data_page_size_limit: Some(4_096),
+            write_batch_size: Some(16),
+            ..Default::default()
+        };
+        let props = writer.clone().with_options(&options).build_writer_props();
+        assert_eq!(props.data_page_row_count_limit(), 64);
+        assert_eq!(props.data_page_size_limit(), 4_096);
+        assert_eq!(props.write_batch_size(), 16);
+        assert!(!props.offset_index_disabled());
+
+        let zero = DuckLakeWriteOptions {
+            data_page_row_count_limit: Some(0),
+            data_page_size_limit: Some(0),
+            write_batch_size: Some(0),
+            ..Default::default()
+        };
+        let props = writer.with_options(&zero).build_writer_props();
+        assert_eq!(props.data_page_row_count_limit(), 1);
+        assert_eq!(props.data_page_size_limit(), 0);
+        assert_eq!(props.write_batch_size(), 1);
+    }
+
+    #[test]
+    fn page_options_are_never_stored_and_override_per_field() {
+        // Official stores no data page settings, so none is read from the
+        // catalog however its other options are set.
+        let stored = DuckLakeWriteOptions::from_metadata_settings(&HashMap::from([(
+            "parquet_row_group_size".to_string(),
+            "1000".to_string(),
+        )]))
+        .unwrap();
+        assert_eq!(stored.data_page_row_count_limit, None);
+        assert_eq!(stored.data_page_size_limit, None);
+        assert_eq!(stored.write_batch_size, None);
+
+        let explicit = DuckLakeWriteOptions {
+            data_page_row_count_limit: Some(64),
+            data_page_size_limit: Some(8_192),
+            write_batch_size: Some(32),
+            ..Default::default()
+        };
+        let options = stored.clone().with_overrides(&explicit);
+        assert_eq!(options.data_page_row_count_limit, Some(64));
+        assert_eq!(options.data_page_size_limit, Some(8_192));
+        assert_eq!(options.write_batch_size, Some(32));
+        assert_eq!(options.max_row_group_rows, Some(1_000));
+        // An unset override keeps what is configured.
+        let kept = options.with_overrides(&DuckLakeWriteOptions::default());
+        assert_eq!(kept.data_page_row_count_limit, Some(64));
+        assert_eq!(kept.data_page_size_limit, Some(8_192));
+        assert_eq!(kept.write_batch_size, Some(32));
     }
 
     #[test]

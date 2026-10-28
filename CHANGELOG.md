@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`:
+  Parquet data page settings for every data file a write produces. A library extension.
 - `DuckLakeTable::read_columns_by_rowid` and `RowsByRowId`: the columns a projection names of the
   live rows with given `rowid`s at the table's snapshot, inlined or in data files, under the
   table's current schema (renamed, widened and added columns read as a scan reads them), each row
