@@ -146,6 +146,16 @@ const SQL_CREATE_TABLES: &[&str] = &[
     // recommends for the same predicate.
     r#"CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_column
         ON ducklake_file_column_stats (table_id, column_id)"#,
+    // A listing page then reads every statistic of the files it returned,
+    // `table_id = ? AND data_file_id` in the page's range, and the column-size
+    // roll-up reads `column_size_bytes` of every file of a table. The index
+    // above narrows either only to the table, so each page would read every
+    // statistic of the table. The multicatalog layout's index of the same name
+    // and shape serves both (see its definition for the column order and why
+    // `min_value` / `max_value` stay out of `INCLUDE`).
+    r#"CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_file_column
+        ON ducklake_file_column_stats (table_id, data_file_id, column_id)
+        INCLUDE (column_size_bytes)"#,
     // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
     r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
         table_id BIGINT NOT NULL,

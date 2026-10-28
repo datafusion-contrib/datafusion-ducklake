@@ -1269,11 +1269,13 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
 
 - **`ducklake_file_column_stats` carries indexes this crate creates on PostgreSQL.**
   `idx_file_column_stats_table_file_column (table_id, data_file_id, column_id)`
-  (multicatalog layout) serves the paged statistics reads.
-  `idx_file_column_stats_table_column (table_id, column_id)` (both layouts) serves
-  a filtered listing's per-column statistics, the shape duckdb/ducklake#1147
-  recommends. Each is added by schema bootstrap and by migration; no table or
-  column changes.
+  serves the paged statistics reads, and
+  `idx_file_column_stats_table_column (table_id, column_id)` a filtered listing's
+  per-column statistics, the shape duckdb/ducklake#1147 recommends. Both layouts
+  have both. Each is added by schema bootstrap and by `migrate`, which builds it
+  inside its transaction and so blocks statistics writes until it commits; no
+  table or column changes. Official creates neither and reads a catalog with them
+  as it is.
 
 - **Partitioned writes record partition values as official does.** Hive directories take
   official's key names (`GetPartitionKeyName`): an identity key its column's name, a

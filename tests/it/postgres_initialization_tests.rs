@@ -889,9 +889,11 @@ async fn concurrent_initializations_of_a_new_single_catalog_leave_it_whole() {
     }
 }
 
-/// A store that layout version 1 left has no `(table_id, column_id)` stats
-/// index (#403). Both layouts refuse it until it is migrated, and migrating it
-/// creates the index.
+/// A store that layout version 1 left lacks the statistics indexes of version 2
+/// (#403): `(table_id, column_id)` on both layouts, and `(table_id, data_file_id,
+/// column_id)` on the single-catalog one. Both layouts refuse it until it is
+/// migrated. Migrating creates the indexes and records version 2 with a minimum
+/// version of 1, so a release at version 1 still reads and writes the store.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
@@ -906,7 +908,11 @@ async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
             "multicatalog" => initialize_multicatalog_schema(&pool).await.unwrap(),
             _ => initialize_single(&pool).await.unwrap(),
         }
-        sqlx::query("DROP INDEX idx_file_column_stats_table_column")
+        let added = match layout {
+            "multicatalog" => "idx_file_column_stats_table_column",
+            _ => "idx_file_column_stats_table_column, idx_file_column_stats_table_file_column",
+        };
+        sqlx::query(AssertSqlSafe(format!("DROP INDEX {added}")))
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("{layout}: {e}"));
@@ -931,19 +937,34 @@ async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
                 .unwrap(),
         }
         let indexed: bool = sqlx::query_scalar(
-            "SELECT to_regclass('idx_file_column_stats_table_column') IS NOT NULL",
+            "SELECT to_regclass('idx_file_column_stats_table_column') IS NOT NULL
+                AND to_regclass('idx_file_column_stats_table_file_column') IS NOT NULL",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
+        let min_key = key.replace("_version", "_min_version");
+        let versions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM ducklake_metadata WHERE key IN ($1, $2) ORDER BY key",
+        )
+        .bind(key)
+        .bind(&min_key)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
         assert!(indexed, "{layout}");
+        assert_eq!(
+            versions,
+            [(min_key, "1".to_string()), (key.to_string(), "2".to_string())],
+            "{layout}"
+        );
     }
 }
 
-/// The plan of one statistics CTE body of a filtered listing, as
-/// `stats_filter_sql` emits it, over a store holding `tables` tables of
-/// `files` files and `columns` columns each.
-async fn stats_cte_plan(pool: &PgPool, tables: i64, files: i64, columns: i64) -> String {
+/// Fill the statistics table with `tables` tables of `files` files and
+/// `columns` columns each.
+async fn fill_stats(pool: &PgPool, tables: i64, files: i64, columns: i64) {
     sqlx::query(
         "INSERT INTO ducklake_file_column_stats
              (data_file_id, table_id, column_id, column_size_bytes, value_count,
@@ -963,21 +984,25 @@ async fn stats_cte_plan(pool: &PgPool, tables: i64, files: i64, columns: i64) ->
         .execute(pool)
         .await
         .unwrap();
-    let lines: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
-         SELECT data_file_id, min_value, max_value, value_count
-         FROM ducklake_file_column_stats
-         WHERE column_id = 3 AND table_id = 1",
-    )
+}
+
+/// The plan of `query`, run.
+async fn plan(pool: &PgPool, query: &str) -> String {
+    let lines: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) {query}"
+    )))
     .fetch_all(pool)
     .await
     .unwrap();
     lines.join("\n")
 }
 
-/// A filtered listing reads one column's statistics per filtered column. Both
-/// layouts index them by `(table_id, column_id)`, so that read touches only the
-/// rows it returns rather than every statistic of the table (#403).
+/// A filtered listing reads one column's statistics per filtered column, then
+/// every statistic of the files on each page. Both layouts index the first by
+/// `(table_id, column_id)` and the second by `(table_id, data_file_id,
+/// column_id)`, so each read touches only the rows it returns rather than every
+/// statistic of the table (#403). The plans name the index, since another index
+/// on `table_id` can also return just those rows when the planner picks it.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_stats_filter_reads_only_its_columns_statistics() {
@@ -989,9 +1014,36 @@ async fn a_stats_filter_reads_only_its_columns_statistics() {
             "multicatalog" => initialize_multicatalog_schema(&pool).await.unwrap(),
             _ => initialize_single(&pool).await.unwrap(),
         }
-        let plan = stats_cte_plan(&pool, 2, 1_000, 20).await;
+        fill_stats(&pool, 2, 1_000, 20).await;
+        // One statistics CTE body, as `stats_filter_sql` emits it.
+        let column = plan(
+            &pool,
+            "SELECT data_file_id, min_value, max_value, value_count
+             FROM ducklake_file_column_stats
+             WHERE column_id = 3 AND table_id = 1",
+        )
+        .await;
+        // The statistics of one page's files: 200 files of 20 columns.
+        let page = plan(
+            &pool,
+            "SELECT data_file_id, column_id, min_value, max_value
+             FROM ducklake_file_column_stats
+             WHERE table_id = 1 AND data_file_id > 200 AND data_file_id <= 400
+             ORDER BY data_file_id, column_id",
+        )
+        .await;
 
-        assert!(plan.contains("rows=1000 "), "{layout}:\n{plan}");
-        assert!(!plan.contains("Rows Removed"), "{layout}:\n{plan}");
+        for (plan, index, rows) in [
+            (&column, "idx_file_column_stats_table_column", "rows=1000 "),
+            (
+                &page,
+                "idx_file_column_stats_table_file_column",
+                "rows=4000 ",
+            ),
+        ] {
+            assert!(plan.contains(&format!(" on {index} ")), "{layout}:\n{plan}");
+            assert!(plan.contains(rows), "{layout}:\n{plan}");
+            assert!(!plan.contains("Rows Removed"), "{layout}:\n{plan}");
+        }
     }
 }
