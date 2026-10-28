@@ -195,7 +195,7 @@ pub use metadata_provider::{
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use partition_counts::{PartitionCountUnknown, PartitionRowCount};
-pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};
+pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation, RowsByRowId};
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};

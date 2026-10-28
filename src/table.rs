@@ -3466,6 +3466,138 @@ impl DuckLakeTable {
         Ok(out)
     }
 
+    /// The catalog columns `columns` (indices into the table's physical
+    /// columns, each at most once) of `table_file`'s rows at `positions`, under
+    /// the table's types, each batch paired with its rows' physical positions.
+    ///
+    /// Reads only the pages of `columns` that hold `positions`, and resolves
+    /// each column as a scan does: a file with a name mapping through its
+    /// mapping (Hive constants and nested defaults included), any other file by
+    /// field id as the reader opens it, so a renamed column reads its old
+    /// values, a column or struct child the file predates reads its initial
+    /// default, and a narrower stored type is widened. Applies no deletion and
+    /// no snapshot filter: the caller passes only positions of rows visible at
+    /// this table's snapshot.
+    pub(crate) async fn read_file_columns_at(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        positions: &HashSet<i64>,
+        columns: &[usize],
+    ) -> DataFusionResult<Vec<(Vec<ArrayRef>, Int64Array)>> {
+        // The selection must cover exactly the file's physical rows, so it is
+        // sized from the footer (kept by the table after the first read), not
+        // from the catalog's record count.
+        let rows = self.file_row_count(state, &table_file.file).await?;
+        let selection = crate::rowid_lookup::positions_selection(positions, rows);
+        let (read_schema, name_mapping, constants, resolved_by_field_id) =
+            match table_file.file.mapping_id {
+                Some(mapping_id) => {
+                    let resolved_path = self.resolve_file_path(&table_file.file)?;
+                    let (read_schema, name_mapping, constants) =
+                        self.mapped_schema(mapping_id, &resolved_path)?;
+                    (read_schema, name_mapping, constants, false)
+                },
+                None => (
+                    Arc::clone(&self.physical_schema),
+                    HashMap::new(),
+                    HashMap::new(),
+                    true,
+                ),
+            };
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            Arc::clone(&read_schema),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
+        // Both read schemas are one field per physical column in catalog
+        // order, so a catalog index is a read-schema index.
+        let mut proj: Vec<usize> = columns.to_vec();
+        proj.push(pos_table_idx);
+        let source = self
+            .create_parquet_source(state, table_schema)?
+            .with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+        let file = self.partitioned_file(&table_file.file)?.with_extension(
+            datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
+        );
+        let mut builder = self
+            .scan_config_builder(Arc::new(source))
+            .with_file_group(FileGroup::new(vec![file]))
+            .with_projection_indices(Some(proj))?;
+        if resolved_by_field_id {
+            builder = builder.with_expr_adapter(Some(Arc::new(FieldIdExprAdapterFactory::new(
+                &self.columns,
+            ))));
+        }
+        let mut plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(builder.build());
+        let mut output_fields: Vec<Arc<Field>> = columns
+            .iter()
+            .map(|&index| Arc::clone(&self.physical_schema.fields()[index]))
+            .collect();
+        output_fields.extend(plan.schema().fields().iter().skip(columns.len()).cloned());
+        let output_schema = Arc::new(Schema::new(output_fields));
+        if !name_mapping.is_empty() || !constants.is_empty() || plan.schema() != output_schema {
+            let defaults = if resolved_by_field_id {
+                HashMap::new()
+            } else {
+                self.mapped_nested_defaults(&read_schema, Some(&columns.to_vec()))?
+            };
+            plan = Arc::new(
+                ColumnRenameExec::new_with_constants(plan, output_schema, name_mapping, constants)
+                    .with_defaults(defaults),
+            );
+        }
+        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let read_positions =
+                arrow::compute::cast(batch.column(columns.len()), &DataType::Int64)?;
+            let read_positions = read_positions
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("physical-position column is not Int64".into())
+                })?;
+            // The selection names exactly `positions`; the filter keeps that
+            // true whatever rows the reader returns around them.
+            let keep = BooleanArray::from(
+                read_positions
+                    .values()
+                    .iter()
+                    .map(|position| positions.contains(position))
+                    .collect::<Vec<_>>(),
+            );
+            if keep.true_count() == 0 {
+                continue;
+            }
+            let mut values = Vec::with_capacity(columns.len());
+            for (output, &index) in columns.iter().enumerate() {
+                let column = arrow::compute::filter(batch.column(output), &keep)?;
+                values.push(crate::column_rename::coerce_column(
+                    &column,
+                    self.physical_schema.field(index).data_type(),
+                )?);
+            }
+            let kept = arrow::compute::filter(read_positions, &keep)?;
+            let kept = kept
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("physical-position column is not Int64".into())
+                })?
+                .clone();
+            out.push((values, kept));
+        }
+        Ok(out)
+    }
+
     /// Roll one scan group's per-file catalog statistics up into the group- and
     /// scan-level [`Statistics`] DataFusion's cost-based rules read.
     ///
@@ -5089,9 +5221,8 @@ impl DuckLakeTable {
     }
 
     /// Physical (data-column) schema this table reads/writes, without the
-    /// synthetic `rowid`. Used by [`DuckLakeUpdateExec`] to author the rewritten
-    /// data file.
-    #[cfg(feature = "write")]
+    /// synthetic `rowid`. Used by `DuckLakeUpdateExec` to author the rewritten
+    /// data file, and by the reads by `rowid`.
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         self.physical_schema.clone()
     }
@@ -5138,8 +5269,8 @@ impl DuckLakeTable {
         self.schema_name.as_deref()
     }
 
-    /// This table's name. Used by the compaction ops for output file paths.
-    #[cfg(feature = "write")]
+    /// This table's name. Used by the compaction ops for output file paths, and
+    /// in errors.
     pub(crate) fn table_name(&self) -> &str {
         &self.table_name
     }

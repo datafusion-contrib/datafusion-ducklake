@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTable::read_columns_by_rowid` and `RowsByRowId`: the columns a projection names of the
+  live rows with given `rowid`s at the table's snapshot, inlined or in data files, under the
+  table's current schema (renamed, widened and added columns read as a scan reads them), each row
+  with its `rowid`, in the order the ids were first requested. Only the pages of the projected
+  columns holding the rows are read, a few files at once. A library extension; official has none.
 - `DuckLakeTable::partition_live_row_counts` and `MetadataProvider::get_partition_count_facts`:
   the live row count of each requested value of a non-float identity partition key from catalog
   metadata, exact or unknown with the reason (any visible inlined row, and below the head an

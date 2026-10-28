@@ -1071,9 +1071,12 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   more go to a delete file, which replaces the file's live one carrying every position with its
   snapshot, and a file it would empty is ended instead. `DuckLakeTableWriter::write_delete_file`
   with `MetadataWriter::set_delete_file` still writes a delete file unconditionally.
-- **Row lookup by `rowid`** (`DuckLakeTable::locate_rowids`, `read_rows_by_rowid`): where each
-  live row is (inlined, or a data file and position) and the rows themselves, reading only the
-  files that hold them. A file that embeds `_ducklake_internal_row_id` (a flush, merge, rewrite
+- **Row lookup by `rowid`** (`DuckLakeTable::locate_rowids`, `read_rows_by_rowid`,
+  `read_columns_by_rowid`): where each live row is (inlined, or a data file and position) and the
+  rows themselves, reading only the files that hold them. `read_columns_by_rowid` reads only the
+  projected columns, under the table's current schema as a scan reads them, and returns each
+  row's `rowid` with it, in the order the ids were requested; a row the table does not hold at
+  its snapshot is left out, as official's `SELECT ... WHERE rowid IN (...)` leaves it out. A file that embeds `_ducklake_internal_row_id` (a flush, merge, rewrite
   or `UPDATE` output) takes its row ids from that column, as official's reader does, even when
   the catalog records a `row_id_start`; `DuckLakeTable::file_row_id_layout` tells which a file is,
   from its footer, and `DuckLakeTableFile::may_embed_row_ids` gives the catalog's hint.

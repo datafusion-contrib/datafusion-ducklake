@@ -12,18 +12,22 @@
 //!   `row_id_start + position` names the wrong row;
 //! - in any other Parquet file, at position `rowid - row_id_start`.
 //!
-//! [`DuckLakeTable::locate_rowids`] answers where each live row is, and
-//! `DuckLakeTable::read_rows_by_rowid` (with the `write` feature) reads them,
-//! both at the table's snapshot and without the caller knowing which case
-//! applies.
+//! [`DuckLakeTable::locate_rowids`] answers where each live row is,
+//! [`DuckLakeTable::read_columns_by_rowid`] reads the columns a caller asks
+//! for of each, with its `rowid`, and `DuckLakeTable::read_rows_by_rowid`
+//! (with the `write` feature) reads them whole, all at the table's snapshot
+//! and without the caller knowing which case applies.
 //! [`DuckLakeTable::file_row_id_layout`] tells, for one file, which of the two
 //! Parquet cases it is.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use datafusion::catalog::Session;
+use arrow::array::ArrayRef;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
 use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
@@ -134,7 +138,6 @@ impl AsyncFileReader for PageIndexReader {
 struct Located {
     rows: Vec<RowIdLocation>,
     inlined: Vec<DuckLakeInlinedData>,
-    #[cfg_attr(not(feature = "write"), allow(dead_code))]
     files: Vec<DuckLakeTableFile>,
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     inlined_deletes: std::collections::HashMap<i64, HashSet<i64>>,
@@ -468,6 +471,278 @@ impl DuckLakeTable {
         batches.extend(read.into_iter().flatten());
         Ok(batches)
     }
+}
+
+/// The rows [`DuckLakeTable::read_columns_by_rowid`] found.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RowsByRowId {
+    /// The `rowid` of each row of [`Self::batch`], row for row.
+    pub row_ids: Vec<i64>,
+    /// The requested columns of the rows found, under the table's names and
+    /// types, in the order their `rowid`s were first requested.
+    pub batch: RecordBatch,
+}
+
+impl RowsByRowId {
+    /// The ids of `requested` that no row was found for, each once, in the
+    /// order first requested: ids of rows deleted at the table's snapshot,
+    /// inserted after it, or never assigned.
+    #[must_use]
+    pub fn missing(&self, requested: &[i64]) -> Vec<i64> {
+        let found: HashSet<i64> = self.row_ids.iter().copied().collect();
+        let mut seen = HashSet::new();
+        requested
+            .iter()
+            .copied()
+            .filter(|row_id| !found.contains(row_id) && seen.insert(*row_id))
+            .collect()
+    }
+}
+
+/// Rows read from one place, inlined rows or a data file: the values of the
+/// read columns and each row's `rowid`.
+struct ReadPart {
+    columns: Vec<ArrayRef>,
+    row_ids: Vec<i64>,
+}
+
+impl DuckLakeTable {
+    /// The live rows with one of `row_ids` at this table's snapshot, with
+    /// the columns `projection` names, as a scan with that projection reads
+    /// them, and each row's `rowid`.
+    ///
+    /// `projection` holds indices into the table's schema (its
+    /// `TableProvider::schema`, which ends with `rowid` when the table was
+    /// opened with row lineage), as a scan takes them; `None` reads every
+    /// column. Columns read under the table's current names and types: a
+    /// renamed column reads its values from before the rename, a column a
+    /// row predates reads its initial default, and a column stored narrower
+    /// is widened.
+    ///
+    /// A row is found wherever it is: inlined in the catalog, or in a data
+    /// file, with its `rowid` taken as the table's scans take it. A row the
+    /// table does not hold at its snapshot (deleted by a delete file or an
+    /// inlined deletion, inserted after the snapshot, including the later rows
+    /// of a merged file, or never assigned) is not found. The result has one
+    /// row per found id, in the order the ids were first requested, whatever
+    /// order the reads finish in; [`RowsByRowId::missing`] lists the ids not
+    /// found.
+    ///
+    /// Only the data files that hold a requested row are read, at most the
+    /// session's `target_partitions` at once, and of each only the pages of
+    /// the projected columns that hold the requested rows. A projection of
+    /// only `rowid`, or of nothing, reads no data page.
+    ///
+    /// A table kept across calls keeps what it learnt of each file's footer,
+    /// so a later call reads no footer again; its catalog reads (the file
+    /// listing, the inlined rows and inlined deletions) are made on every
+    /// call, unless the table's provider memoizes them
+    /// ([`CatalogReadMemo`](crate::CatalogReadMemo)).
+    pub async fn read_columns_by_rowid(
+        &self,
+        state: &dyn Session,
+        row_ids: &[i64],
+        projection: Option<&[usize]>,
+    ) -> crate::Result<RowsByRowId> {
+        let schema = TableProvider::schema(self);
+        let physical_len = self.physical_schema().fields().len();
+        let projection: Vec<usize> = match projection {
+            Some(projection) => projection.to_vec(),
+            None => (0..schema.fields().len()).collect(),
+        };
+        if let Some(index) = projection
+            .iter()
+            .find(|&&index| index >= schema.fields().len())
+        {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "projection index {index} is out of range for table \"{}\" with {} columns",
+                self.table_name(),
+                schema.fields().len()
+            )));
+        }
+        let output_schema = Arc::new(schema.project(&projection)?);
+        // The physical columns to read, each once, in catalog order. An index
+        // at or past them is the `rowid` column, which needs no read.
+        let read: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|&index| index < physical_len)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let located = self.locate(state, row_ids).await?;
+        let mut parts: Vec<ReadPart> = Vec::new();
+        let mut inlined_ids = HashSet::new();
+        let mut by_file: HashMap<i64, HashMap<i64, i64>> = HashMap::new();
+        for row in &located.rows {
+            match &row.location {
+                RowLocation::Inlined {
+                    ..
+                } => {
+                    inlined_ids.insert(row.row_id);
+                },
+                RowLocation::File {
+                    data_file_id,
+                    position,
+                    ..
+                } => {
+                    by_file
+                        .entry(*data_file_id)
+                        .or_default()
+                        .insert(*position, row.row_id);
+                },
+            }
+        }
+
+        for rows in &located.inlined {
+            let keep = arrow::array::BooleanArray::from(
+                rows.row_ids
+                    .iter()
+                    .map(|row_id| inlined_ids.contains(row_id))
+                    .collect::<Vec<_>>(),
+            );
+            if keep.true_count() == 0 {
+                continue;
+            }
+            if rows.batch.num_columns() != physical_len {
+                return Err(DuckLakeError::Internal(format!(
+                    "inlined rows of \"{}\" have {} columns, the table has {physical_len}",
+                    rows.table_name,
+                    rows.batch.num_columns(),
+                )));
+            }
+            let mut columns = Vec::with_capacity(read.len());
+            for &index in &read {
+                let column = arrow::compute::filter(rows.batch.column(index), &keep)?;
+                columns.push(
+                    crate::column_rename::coerce_column(&column, schema.field(index).data_type())
+                        .map_err(df_error)?,
+                );
+            }
+            let row_ids = rows
+                .row_ids
+                .iter()
+                .copied()
+                .filter(|row_id| inlined_ids.contains(row_id))
+                .collect();
+            parts.push(ReadPart {
+                columns,
+                row_ids,
+            });
+        }
+
+        if read.is_empty() {
+            // Nothing to read from the files: their rows' ids are all that is
+            // asked for, and locating them found those.
+            for positions in by_file.values() {
+                parts.push(ReadPart {
+                    columns: Vec::new(),
+                    row_ids: positions.values().copied().collect(),
+                });
+            }
+        } else if !by_file.is_empty() {
+            let by_file = &by_file;
+            let read = &read;
+            let concurrency = state.config().target_partitions().max(1);
+            let pending: Vec<BoxFuture<'_, crate::Result<Vec<ReadPart>>>> = located
+                .files
+                .iter()
+                .filter_map(|file| {
+                    let positions = by_file.get(&file.data_file_id)?;
+                    Some(Box::pin(async move {
+                        let wanted: HashSet<i64> = positions.keys().copied().collect();
+                        let batches = self
+                            .read_file_columns_at(state, file, &wanted, read)
+                            .await
+                            .map_err(df_error)?;
+                        Ok(batches
+                            .into_iter()
+                            .map(|(columns, read_positions)| ReadPart {
+                                columns,
+                                row_ids: read_positions
+                                    .values()
+                                    .iter()
+                                    .map(|position| positions[position])
+                                    .collect(),
+                            })
+                            .collect())
+                    })
+                        as BoxFuture<'_, crate::Result<Vec<ReadPart>>>)
+                })
+                .collect();
+            // Collected in listing order, whatever order the reads finish in.
+            let files: Vec<Vec<ReadPart>> = futures::stream::iter(pending)
+                .buffered(concurrency)
+                .try_collect()
+                .await?;
+            parts.extend(files.into_iter().flatten());
+        }
+
+        assemble(&output_schema, &projection, &read, row_ids, &parts)
+    }
+}
+
+/// The rows of `parts` with one of `requested`, one per id in the order the
+/// ids were first requested, as `output_schema`: each of `projection`'s
+/// columns taken from the part's column of the same index in `read`, or, past
+/// the physical columns `read` names, the row's `rowid`.
+fn assemble(
+    output_schema: &SchemaRef,
+    projection: &[usize],
+    read: &[usize],
+    requested: &[i64],
+    parts: &[ReadPart],
+) -> crate::Result<RowsByRowId> {
+    let mut at: HashMap<i64, (usize, usize)> = HashMap::new();
+    for (part_index, part) in parts.iter().enumerate() {
+        for (row, row_id) in part.row_ids.iter().enumerate() {
+            at.entry(*row_id).or_insert((part_index, row));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut indices = Vec::new();
+    let mut row_ids = Vec::new();
+    for row_id in requested {
+        if let Some(&index) = at.get(row_id)
+            && seen.insert(*row_id)
+        {
+            indices.push(index);
+            row_ids.push(*row_id);
+        }
+    }
+    if indices.is_empty() {
+        return Ok(RowsByRowId {
+            row_ids,
+            batch: RecordBatch::new_empty(Arc::clone(output_schema)),
+        });
+    }
+    let mut read_columns: Vec<ArrayRef> = Vec::with_capacity(read.len());
+    for column in 0..read.len() {
+        let arrays: Vec<&dyn arrow::array::Array> = parts
+            .iter()
+            .map(|part| part.columns[column].as_ref())
+            .collect();
+        read_columns.push(arrow::compute::interleave(&arrays, &indices)?);
+    }
+    let row_id_column: ArrayRef = Arc::new(arrow::array::Int64Array::from(row_ids.clone()));
+    let columns: Vec<ArrayRef> = projection
+        .iter()
+        .map(|index| match read.binary_search(index) {
+            Ok(position) => Arc::clone(&read_columns[position]),
+            Err(_) => Arc::clone(&row_id_column),
+        })
+        .collect();
+    let batch = RecordBatch::try_new_with_options(
+        Arc::clone(output_schema),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_ids.len())),
+    )?;
+    Ok(RowsByRowId {
+        row_ids,
+        batch,
+    })
 }
 
 /// Run `pending`, at most `limit` at once, and collect their results in
