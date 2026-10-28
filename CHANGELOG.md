@@ -240,6 +240,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PostgreSQL: a filtered scan reads only the file statistics it needs (#403). Layout version 2:
+  run `migrate` on every backend; on PostgreSQL it blocks statistics writes while it indexes.
 - `merge_adjacent_files` keeps every row's `rowid` (sorted tables, flushed and `UPDATE`
   files) by embedding row ids in its output, as official does since duckdb/ducklake#1611.
 - Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with

@@ -458,6 +458,25 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
             END IF;
         END
     $$"#,
+    // The index above cannot serve a filtered listing's statistics CTEs
+    // (`stats_filter_sql`), which read one column of one table:
+    // `column_id = ? AND table_id = ?`, two equalities and no range. Behind
+    // `data_file_id` the `column_id` key narrows nothing, so each CTE read every
+    // statistic of the table, growing with files x columns (#403). This is the
+    // shape duckdb/ducklake#1147 recommends for the same predicate.
+    r#"DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_index
+                       WHERE indexrelid = to_regclass('idx_file_column_stats_table_column')
+                         AND NOT indisvalid) THEN
+                DROP INDEX idx_file_column_stats_table_column;
+            END IF;
+            IF to_regclass('idx_file_column_stats_table_column') IS NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_column
+                    ON ducklake_file_column_stats (table_id, column_id);
+            END IF;
+        END
+    $$"#,
     // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
     r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
         table_id BIGINT NOT NULL,
