@@ -22,8 +22,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions, MergeOptions,
-    MetadataWriter, RewriteOptions, SqliteMetadataProvider, SqliteMetadataWriter,
+    ColumnWriteOptions, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 use object_store::local::LocalFileSystem;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
@@ -335,6 +335,177 @@ async fn unset_page_options_keep_the_parquet_defaults() {
         v.rows.len()
     );
     assert!(id.has_column_index && v.has_column_index);
+}
+
+/// Per-column settings reach the file: a column's compression, dictionary and
+/// encoding are read back from its chunk metadata and its page size from the
+/// page index, on every leaf of a list column too, while the other columns keep
+/// the file-wide settings. A set dictionary outranks the one the first row group
+/// would choose, both ways. Rows per page uncapped leave a narrow column one page
+/// per row group. Guards against column settings set on the wrong path, lost to
+/// the row-group dictionary choice, or applied to every column.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_options_reach_the_written_file() {
+    use parquet::basic::{Compression, Encoding};
+    use parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT;
+
+    const ROWS: i64 = 50_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        // Distinct values: the first row group alone would write no dictionary.
+        Field::new("v", DataType::Utf8, true),
+        // Four values: the first row group alone would write a dictionary.
+        Field::new("s", DataType::Utf8, true),
+        Field::new(
+            "emb",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        ),
+    ]));
+    let emb = arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(
+        (0..ROWS).map(|id| Some((0..4).map(move |i| Some((id * 4 + i) as f32)))),
+    );
+    let rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(StringArray::from_iter_values((0..ROWS).map(value))),
+            Arc::new(StringArray::from_iter_values(
+                (0..ROWS).map(|id| format!("status-{}", id % 4)),
+            )),
+            Arc::new(emb),
+        ],
+    )
+    .unwrap();
+
+    let mut options = DuckLakeWriteOptions::default()
+        .with_column_options(
+            "v",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(true)
+                .with_compression(Compression::SNAPPY),
+        )
+        .with_column_options(
+            "s",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(false)
+                .with_page_size_limit(4_096),
+        )
+        .with_column_options(
+            "emb",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(false)
+                .with_encoding(Encoding::BYTE_STREAM_SPLIT),
+        );
+    options.data_page_row_count_limit = Some(usize::MAX);
+    options.max_row_group_rows = Some(usize::try_from(ROWS).unwrap());
+
+    let temp = TempDir::new().unwrap();
+    let url = new_lake(&temp).await;
+    table_writer(&url, &options)
+        .await
+        .write_table("main", "t", std::slice::from_ref(&rows))
+        .await
+        .unwrap();
+    let files = data_files(&temp.path().join("data"));
+    let file = files.first().unwrap();
+    let reader = SerializedFileReader::new(std::fs::File::open(file).unwrap()).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    let chunk = |path: &str| {
+        row_group
+            .columns()
+            .iter()
+            .find(|chunk| chunk.column_path().string() == path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no chunk {path} in {:?}",
+                    row_group
+                        .columns()
+                        .iter()
+                        .map(|chunk| chunk.column_path().string())
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    let dictionary = |path: &str| chunk(path).dictionary_page_offset().is_some();
+    let encodings = |path: &str| chunk(path).encodings().collect::<Vec<_>>();
+
+    assert!(dictionary("v"), "v keeps the dictionary it was given");
+    assert_eq!(chunk("v").compression(), Compression::SNAPPY);
+    assert!(
+        !dictionary("s"),
+        "s drops the dictionary it would have chosen"
+    );
+    assert_eq!(chunk("s").compression(), Compression::UNCOMPRESSED);
+    assert!(!dictionary("emb.list.element"));
+    assert!(
+        encodings("emb.list.element").contains(&Encoding::BYTE_STREAM_SPLIT),
+        "{:?}",
+        encodings("emb.list.element")
+    );
+    assert_eq!(chunk("id").compression(), Compression::UNCOMPRESSED);
+    assert!(!encodings("id").contains(&Encoding::BYTE_STREAM_SPLIT));
+
+    let chunks = pages(file);
+    let pages_of = |path: &str| chunks.iter().find(|chunk| chunk.column == path).unwrap();
+    // `s` pages stay near its own 4 KiB limit; `v`'s run to the file's 1 MiB.
+    let s = pages_of("s");
+    assert!(
+        s.bytes.iter().all(|&bytes| bytes <= 2 * 4_096),
+        "{:?}",
+        s.bytes
+    );
+    assert!(s.bytes.len() > 8, "{} pages of s", s.bytes.len());
+    assert!(pages_of("v").bytes.len() < s.bytes.len() / 4);
+    // No row cap: 50,000 8-byte ids fit one 1 MiB page, past the default
+    // 20,000-row cap.
+    let id = pages_of("id");
+    assert_eq!(id.rows, vec![ROWS], "id pages");
+    assert!(ROWS > i64::try_from(DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT).unwrap());
+
+    // The values read back.
+    let ctx = session(&url, DuckLakeWriteOptions::default()).await;
+    let check = ctx
+        .sql("SELECT count(*), count(DISTINCT v), count(DISTINCT s), sum(emb[2]) FROM lake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let check = arrow::util::pretty::pretty_format_batches(&check)
+        .unwrap()
+        .to_string();
+    // sum over id of (4 * id + 1)
+    let emb_sum: i64 = (0..ROWS).map(|id| 4 * id + 1).sum();
+    assert!(check.contains("| 50000 "), "{check}");
+    assert!(check.contains("| 4 "), "{check}");
+    assert!(check.contains(&emb_sum.to_string()), "{check}");
+}
+
+/// A column encoding its type cannot take fails the write with an error, not
+/// the panic the Parquet writer raises for it, and the write leaves no file.
+/// Guards against an encoding handed to the writer unchecked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_encoding_the_column_type_cannot_take_fails_the_write() {
+    let temp = TempDir::new().unwrap();
+    let url = new_lake(&temp).await;
+    let options = DuckLakeWriteOptions::default().with_column_options(
+        "v",
+        ColumnWriteOptions::new()
+            .with_dictionary_enabled(false)
+            .with_encoding(parquet::basic::Encoding::DELTA_BINARY_PACKED),
+    );
+    let error = table_writer(&url, &options)
+        .await
+        .write_table("main", "t", &[batch(0..100)])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, datafusion_ducklake::DuckLakeError::InvalidConfig(message)
+            if message.contains("DELTA_BINARY_PACKED") && message.contains("column v")),
+        "{error}"
+    );
+    assert!(data_files(&temp.path().join("data")).is_empty());
 }
 
 /// A catalog's write options reach every path that writes a data file: SQL
