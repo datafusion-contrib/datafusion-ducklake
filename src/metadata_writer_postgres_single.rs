@@ -20,10 +20,7 @@
 //! that has no single-catalog equivalent.
 
 use crate::Result;
-use crate::catalog_version::{
-    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, require_migratable,
-    require_writable,
-};
+use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::{TagObjectType, TagTarget};
 use crate::metadata_writer::{
@@ -471,7 +468,7 @@ impl PostgresSingleCatalogMetadataWriter {
             CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
                 "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
             )),
-            CatalogState::Current => Ok(()),
+            CatalogState::Current | CatalogState::NewerCompatible(_) => Ok(()),
             _ => {
                 require_migratable(&state)?;
                 upgrade_and_stamp(pool).await
@@ -716,8 +713,9 @@ const COUNTERS: [(&str, &str); 4] = [
 ];
 
 /// Create or upgrade every table, column, function and counter this writer
-/// uses, then record [`LAYOUT_VERSION`], in one transaction. It creates and
-/// alters only what the catalog lacks, so a failed run changes nothing.
+/// uses, then record the layout ([`crate::catalog_version::Layout::stamp`]),
+/// in one transaction. It creates and alters only what the catalog lacks, so a
+/// failed run changes nothing.
 async fn upgrade_and_stamp(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
     create_missing_tables(&mut tx).await?;
@@ -764,15 +762,7 @@ async fn upgrade_and_stamp(pool: &PgPool) -> Result<()> {
     // A catalog this writer created before it kept the id watermarks has
     // none; raise the head's past every id in use.
     raise_head_watermarks(&mut tx).await?;
-    sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
-        .bind(LAYOUT_VERSION_KEY)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES ($1, $2, NULL)")
-        .bind(LAYOUT_VERSION_KEY)
-        .bind(LAYOUT_VERSION.to_string())
-        .execute(&mut *tx)
-        .await?;
+    crate::metadata_writer_postgres::stamp(&mut tx, &SINGLE_CATALOG).await?;
     tx.commit().await?;
     Ok(())
 }

@@ -81,6 +81,11 @@ and migrates from it when attached with `AUTOMATIC_MIGRATION`.
   `datafusion_ducklake_version` (single-catalog layouts) or
   `datafusion_ducklake_multicatalog_version` (PostgreSQL multicatalog). It never writes
   official's `version`. The crate's layout versions follow its own releases, not official's.
+  Beside it, `datafusion_ducklake_min_writer_version` (or
+  `datafusion_ducklake_multicatalog_min_writer_version`) records the oldest layout version
+  whose release may still write the catalog. A release raises it only for a change an older
+  writer would get wrong; an addition older writers can ignore, such as an index, leaves it.
+  It never goes down.
 - Opening a writer reads those rows and official's `version` and runs no DDL. A catalog at the
   current layout version opens as it is. `initialize_schema` (and `new_with_init`,
   `initialize_multicatalog_schema`, `MulticatalogManager::connect`) creates a catalog in a
@@ -90,7 +95,11 @@ and migrates from it when attached with `AUTOMATIC_MIGRATION`.
   `DuckLakeError::MigrationRequired` until the writer's `migrate` function runs:
   `SqliteMetadataWriter::migrate`, `DuckdbMetadataWriter::migrate`,
   `MySqlMetadataWriter::migrate`, `PostgresSingleCatalogMetadataWriter::migrate` /
-  `migrate_pool`, or `migrate_multicatalog_schema`. A catalog a newer release wrote is refused.
+  `migrate_pool`, or `migrate_multicatalog_schema`.
+- A catalog a newer release wrote opens as a current one when its minimum writer version is at
+  most this release's layout version, so a rolling deploy or a rollback across that release
+  keeps writing; `migrate` leaves it unchanged. It is refused when its minimum writer version is
+  above this release's, or when it records none.
 - Writers write and migrate only catalogs this crate created. A catalog official DuckDB created
   (it has `version` and no crate layout version) is refused, and nothing changes it. A
   single-catalog writer also refuses a multicatalog store, and the reverse.
@@ -98,7 +107,8 @@ and migrates from it when attached with `AUTOMATIC_MIGRATION`.
   write a catalog this crate created* below), but neither engine migrates the other's
   catalogs: official sees no `version` on one this crate created and applies none of its own
   migrations to it.
-- Read providers do not check layout versions.
+- Read providers do not check layout versions, so the minimum writer version guards writes only.
+  A layout change older readers would misread is out of its scope.
 - `migrate` is idempotent. On SQLite, DuckDB and MySQL it runs its steps in order and records
   the layout version last, so an interrupted run is completed by running it again; on
   PostgreSQL it applies in one transaction, for both layouts. Two migrations racing on one

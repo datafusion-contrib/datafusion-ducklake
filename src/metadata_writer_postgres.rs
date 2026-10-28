@@ -11,8 +11,8 @@
 
 use crate::Result;
 use crate::catalog_version::{
-    CatalogState, Layout, MULTICATALOG, MULTICATALOG_LAYOUT_VERSION,
-    MULTICATALOG_LAYOUT_VERSION_KEY, classify, require_migratable, require_writable,
+    CatalogState, Layout, MULTICATALOG, MULTICATALOG_LAYOUT_VERSION_KEY, classify,
+    require_migratable, require_writable,
 };
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::SUPERSEDED_INLINED_TABLES_SQL;
@@ -972,7 +972,7 @@ pub(crate) async fn migrate_multicatalog_layout(pool: &PgPool) -> Result<()> {
             "no multicatalog store to migrate; create one with initialize_multicatalog_schema"
                 .to_string(),
         )),
-        CatalogState::Current => Ok(()),
+        CatalogState::Current | CatalogState::NewerCompatible(_) => Ok(()),
         _ => {
             require_migratable(&state)?;
             upgrade_multicatalog_and_stamp(pool).await
@@ -981,7 +981,7 @@ pub(crate) async fn migrate_multicatalog_layout(pool: &PgPool) -> Result<()> {
 }
 
 /// Apply the multicatalog DDL in one round trip, run the data migrations of
-/// earlier releases and record [`MULTICATALOG_LAYOUT_VERSION`], all in one
+/// earlier releases and record the layout ([`Layout::stamp`]), all in one
 /// transaction, so a failed run changes nothing and another process sees the
 /// store either as it was or current. Each statement that could lock an
 /// existing table checks the system catalogs first, so the transaction locks
@@ -997,16 +997,25 @@ async fn upgrade_multicatalog_and_stamp(pool: &PgPool) -> Result<()> {
         .await?;
     let legacy = legacy_owner_columns(&mut tx).await?;
     copy_legacy_file_ownership(&mut tx, legacy).await?;
-    sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
-        .bind(MULTICATALOG_LAYOUT_VERSION_KEY)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES ($1, $2, NULL)")
-        .bind(MULTICATALOG_LAYOUT_VERSION_KEY)
-        .bind(MULTICATALOG_LAYOUT_VERSION.to_string())
-        .execute(&mut *tx)
-        .await?;
+    stamp(&mut tx, &MULTICATALOG).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Record `layout`'s version and minimum writer version in `tx`, replacing
+/// any earlier ones.
+pub(crate) async fn stamp(tx: &mut sqlx::PgConnection, layout: &Layout) -> Result<()> {
+    for (key, value) in layout.stamp() {
+        sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO ducklake_metadata (key, value, scope) VALUES ($1, $2, NULL)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+    }
     Ok(())
 }
 

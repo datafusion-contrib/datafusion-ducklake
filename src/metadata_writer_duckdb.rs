@@ -38,8 +38,7 @@
 
 use crate::Result;
 use crate::catalog_version::{
-    CatalogState, LAYOUT_VERSION, LAYOUT_VERSION_KEY, SINGLE_CATALOG, classify, require_migratable,
-    require_writable,
+    CatalogState, SINGLE_CATALOG, classify, require_migratable, require_writable,
 };
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
@@ -1132,7 +1131,7 @@ impl DuckdbMetadataWriter {
             CatalogState::Absent => Err(crate::DuckLakeError::InvalidConfig(
                 "no DuckLake catalog to migrate; create one with new_with_init".to_string(),
             )),
-            CatalogState::Current => Ok(()),
+            CatalogState::Current | CatalogState::NewerCompatible(_) => Ok(()),
             _ => {
                 require_migratable(&state)?;
                 upgrade_and_stamp(&mut conn)
@@ -6276,8 +6275,9 @@ fn enforce_inline_partition_fence(
 }
 
 /// Create or upgrade every table, column and counter this writer uses, then
-/// record [`LAYOUT_VERSION`]. Each step is idempotent, and the version is
-/// recorded last, so an interrupted run is completed by running it again.
+/// record the layout ([`crate::catalog_version::Layout::stamp`]). Each step
+/// is idempotent, and the version is recorded last, so an interrupted run is
+/// completed by running it again.
 fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(SQL_CREATE_SCHEMA)?;
     for (table, columns) in POSITIONAL_TABLES {
@@ -6336,14 +6336,16 @@ fn upgrade_and_stamp(conn: &mut Connection) -> Result<()> {
             [],
         )?;
     }
-    tx.execute(
-        "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
-        [LAYOUT_VERSION_KEY],
-    )?;
-    tx.execute(
-        "INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)",
-        [LAYOUT_VERSION_KEY, &LAYOUT_VERSION.to_string()],
-    )?;
+    for (key, value) in SINGLE_CATALOG.stamp() {
+        tx.execute(
+            "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
+            [key],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_metadata (key, value, scope) VALUES (?, ?, NULL)",
+            [key, &value],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -6377,6 +6379,7 @@ fn catalog_state(conn: &Connection) -> Result<CatalogState> {
 mod tests {
     use super::*;
     use crate::DuckdbMetadataProvider;
+    use crate::catalog_version::LAYOUT_VERSION_KEY;
     use crate::metadata_provider::MetadataProvider;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
