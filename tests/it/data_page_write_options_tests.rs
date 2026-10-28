@@ -482,30 +482,89 @@ async fn column_options_reach_the_written_file() {
     assert!(check.contains(&emb_sum.to_string()), "{check}");
 }
 
-/// A column encoding its type cannot take fails the write with an error, not
-/// the panic the Parquet writer raises for it, and the write leaves no file.
-/// Guards against an encoding handed to the writer unchecked.
+/// A column encoding its type cannot take fails every kind of write with an
+/// error, not the panic the Parquet writer raises for it, and the failed write
+/// commits nothing and leaves no file: a new table, an append, a streaming
+/// session and a SQL `INSERT`. Guards against an encoding handed to the
+/// writer unchecked, or checked only after a write has committed its setup.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_encoding_the_column_type_cannot_take_fails_the_write() {
+    use datafusion_ducklake::{MetadataProvider, WriteMode};
+
     let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
     let url = new_lake(&temp).await;
-    let options = DuckLakeWriteOptions::default().with_column_options(
-        "v",
-        ColumnWriteOptions::new()
-            .with_dictionary_enabled(false)
-            .with_encoding(parquet::basic::Encoding::DELTA_BINARY_PACKED),
-    );
-    let error = table_writer(&url, &options)
+    let bad = DuckLakeWriteOptions::default()
+        .with_column_options(
+            "v",
+            ColumnWriteOptions::new()
+                .with_dictionary_enabled(false)
+                .with_encoding(parquet::basic::Encoding::DELTA_BINARY_PACKED),
+        )
+        .with_data_inlining_row_limit(0);
+    let refused = |error: &datafusion_ducklake::DuckLakeError| {
+        matches!(error, datafusion_ducklake::DuckLakeError::InvalidConfig(message)
+            if message.contains("DELTA_BINARY_PACKED") && message.contains("column v"))
+    };
+    let provider = SqliteMetadataProvider::new(&url).await.unwrap();
+
+    // A new table.
+    let error = table_writer(&url, &bad)
+        .await
+        .write_table("main", "new", &[batch(0..100)])
+        .await
+        .unwrap_err();
+    assert!(refused(&error), "{error}");
+    assert!(data_files(&data).is_empty());
+
+    // An existing table, written without the bad option first.
+    table_writer(&url, &DuckLakeWriteOptions::default())
         .await
         .write_table("main", "t", &[batch(0..100)])
         .await
+        .unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let files = data_files(&data);
+    let unchanged = |what: &str| {
+        assert_eq!(
+            provider.get_current_snapshot().unwrap(),
+            head,
+            "{what}: committed"
+        );
+        assert_eq!(data_files(&data), files, "{what}: left a file");
+    };
+
+    let error = table_writer(&url, &bad)
+        .await
+        .append_table("main", "t", &[batch(100..200)])
+        .await
         .unwrap_err();
-    assert!(
-        matches!(&error, datafusion_ducklake::DuckLakeError::InvalidConfig(message)
-            if message.contains("DELTA_BINARY_PACKED") && message.contains("column v")),
-        "{error}"
-    );
-    assert!(data_files(&temp.path().join("data")).is_empty());
+    assert!(refused(&error), "{error}");
+    unchanged("append");
+
+    let writer = table_writer(&url, &bad).await;
+    match writer.begin_write("main", "t", schema().as_ref(), WriteMode::Append) {
+        Err(error) => assert!(refused(&error), "{error}"),
+        Ok(mut session) => {
+            let error = match session.write_batch(&batch(100..200)) {
+                Err(error) => error,
+                Ok(()) => session.finish().await.unwrap_err(),
+            };
+            assert!(refused(&error), "{error}");
+        },
+    }
+    unchanged("streaming session");
+
+    let ctx = session(&url, bad).await;
+    let error = ctx
+        .sql("INSERT INTO lake.main.t SELECT value, 'x' FROM generate_series(0, 99)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("DELTA_BINARY_PACKED"), "{error}");
+    unchanged("INSERT");
 }
 
 /// A catalog's write options reach every path that writes a data file: SQL
