@@ -257,8 +257,8 @@ pub use restore::RestoreResult;
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, InlinedFlushPolicy,
-    TableWriteOptions, TableWriteSession,
+    ColumnWriteOptions, DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction,
+    InlinedFlushPolicy, TableWriteOptions, TableWriteSession,
 };
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;
