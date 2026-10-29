@@ -252,7 +252,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PostgreSQL: `register_existing_data_files` and `MulticatalogManager::fork_table` resolve a
   partition key's column by its field id. A nested column (a list, a struct) before the key
   made them check the key's value against another column's type, refusing a valid fork
-  (`... on a Int32 column`) or skipping the check.
+  (`... on a Int32 column`) or skipping the check. Promoted columns that lack a partition
+  key's column are now refused, where that key's value went unchecked.
 - PostgreSQL: a filtered scan reads only the file statistics it needs (#403). Layout version 2:
   run `migrate` on every backend; on PostgreSQL it blocks statistics writes while it indexes.
 - `merge_adjacent_files` keeps every row's `rowid` (sorted tables, flushed and `UPDATE`

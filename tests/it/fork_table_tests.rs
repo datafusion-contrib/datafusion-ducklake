@@ -2118,6 +2118,84 @@ async fn fork_of_a_table_partitioned_after_a_nested_column(pool: sqlx::PgPool) {
             source.append_parquet("t", &rows([5, 6, 7, 8])).await;
             assert_eq!(source.data_files("t"), 4, "{case}: two files per partition");
 
+            // A promoted file whose `n` value is not an INTEGER is refused,
+            // naming the key's own type. `day = '40'` would cast to the
+            // column after `day`, so only a check of `n` itself refuses it.
+            // A table this test created numbers its catalog columns in
+            // depth-first order, so `column_id` order is the order
+            // `register_existing_data_file` takes.
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), true).unwrap())
+                .collect::<Vec<_>>();
+            let column_ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL
+                 ORDER BY column_id",
+            )
+            .bind(source.table_id("t"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let spec = source
+                .provider
+                .get_partition_spec(source.table_id("t"), source.head())
+                .unwrap()
+                .unwrap();
+            let promote = |columns: &[ColumnDef], column_ids: &[i64]| {
+                let file = DataFileInfo::new("day=40/n=x/f.parquet", 256, 1).with_partition(
+                    spec.partition_id,
+                    vec![(0, Some("40".to_string())), (1, Some("x".to_string()))],
+                );
+                source.writer.register_existing_data_file(
+                    "main",
+                    "t",
+                    columns,
+                    column_ids,
+                    &file,
+                    datafusion_ducklake::WriteMode::Append,
+                )
+            };
+            let error = promote(&columns, &column_ids)
+                .expect_err(&format!("{case}: a non-integer value for `n` is refused"))
+                .to_string();
+            assert!(
+                error.contains("for key 1") && error.contains("Int32"),
+                "{case}: the refusal names `n` and its type: {error}"
+            );
+
+            // Promoted columns that do not carry a partition key's column are
+            // refused rather than registered with that key unchecked.
+            let n_id: i64 = sqlx::query_scalar(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL AND column_name = 'n'",
+            )
+            .bind(source.table_id("t"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let mut without_n = columns.clone();
+            without_n.remove(schema.index_of("n").unwrap());
+            let ids_without_n: Vec<i64> = column_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != n_id)
+                .collect();
+            let error = match promote(&without_n, &ids_without_n) {
+                Ok(_) => panic!("{case}: columns without the key `n` are refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("partition key 1") && error.contains(&format!("column_id {n_id}")),
+                "{case}: the refusal names the missing key column: {error}"
+            );
+            assert_eq!(
+                source.data_files("t"),
+                4,
+                "{case}: no refused file is registered"
+            );
+
             let destination = make(None).await;
             fork(&manager, &source, source.head(), &destination)
                 .await
@@ -2180,51 +2258,6 @@ async fn fork_of_a_table_partitioned_after_a_nested_column(pool: sqlx::PgPool) {
                 matching,
                 vec![d040.clone(), d040],
                 "{case}: the key filter prunes to that partition's files"
-            );
-
-            // A promoted file whose `n` value is not an INTEGER is refused,
-            // naming the key's own type. A table this test created numbers
-            // its catalog columns in depth-first order, so `column_id` order
-            // is the order `register_existing_data_file` takes.
-            let columns = schema
-                .fields()
-                .iter()
-                .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), true).unwrap())
-                .collect::<Vec<_>>();
-            let column_ids: Vec<i64> = sqlx::query_scalar(
-                "SELECT column_id FROM ducklake_column
-                 WHERE table_id = $1 AND end_snapshot IS NULL
-                 ORDER BY column_id",
-            )
-            .bind(source.table_id("t"))
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-            let spec = source
-                .provider
-                .get_partition_spec(source.table_id("t"), source.head())
-                .unwrap()
-                .unwrap();
-            let not_an_integer = DataFileInfo::new("day=d040/n=x/f.parquet", 256, 1)
-                .with_partition(
-                    spec.partition_id,
-                    vec![(0, Some("d040".to_string())), (1, Some("x".to_string()))],
-                );
-            let error = source
-                .writer
-                .register_existing_data_file(
-                    "main",
-                    "t",
-                    &columns,
-                    &column_ids,
-                    &not_an_integer,
-                    datafusion_ducklake::WriteMode::Append,
-                )
-                .expect_err(&format!("{case}: a non-integer value for `n` is refused"))
-                .to_string();
-            assert!(
-                error.contains("for key 1") && error.contains("Int32"),
-                "{case}: the refusal names `n` and its type: {error}"
             );
         }
     }

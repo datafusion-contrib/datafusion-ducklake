@@ -1836,22 +1836,28 @@ impl PostgresMetadataWriter {
                 .bind(partition_id)
                 .fetch_all(&mut *tx)
                 .await?;
-                for row in &key_rows {
+                for (key_index, row) in key_rows.iter().enumerate() {
                     transforms.push(row.try_get::<String, _>(0)?);
                     // Resolve each key's column_id to the Arrow type of the column
                     // node with that field id, so an `identity` value can be
                     // cast-checked the way official's MapHiveColumn does. Official
                     // looks a partition field up by field id too
-                    // (`GetByFieldIndex`).
+                    // (`GetByFieldIndex`), among the table's own fields, so it
+                    // always finds the key's column: official refuses to drop a
+                    // partition key's column. Promoted columns without it are
+                    // refused for the same reason, rather than registered with
+                    // the key unchecked.
                     let column_id: i64 = row.try_get(1)?;
-                    key_column_types.push(
-                        catalog_fields
-                            .iter()
-                            .find(|(id, _)| *id == column_id)
-                            .and_then(|(_, ducklake_type)| {
-                                crate::types::ducklake_to_arrow_type(ducklake_type).ok()
-                            }),
-                    );
+                    let Some((_, ducklake_type)) =
+                        catalog_fields.iter().find(|(id, _)| *id == column_id)
+                    else {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "cannot promote into table {table_id}: its live partition key \
+                             {key_index} is on column_id {column_id}, which the promoted \
+                             columns do not include"
+                        )));
+                    };
+                    key_column_types.push(crate::types::ducklake_to_arrow_type(ducklake_type).ok());
                 }
             }
 

@@ -1958,17 +1958,22 @@ pub(crate) fn enforce_partition_fence(
 /// - one value per partition key, no more and no fewer;
 /// - key indices exactly `0..n-1`, each once (a duplicated or out-of-range index
 ///   would silently drop or mis-assign a key on read);
-/// - for `bucket(N)`, a value that parses as an integer in `0..N`, or SQL NULL.
-///   NULL is legal for every transform — a NULL input yields a NULL partition value,
-///   which is a partition in its own right (DuckDB's `__HIVE_DEFAULT_PARTITION__`).
-///   Official agrees: `IsValidTransformedHivePartitionValue` returns early for a NULL
-///   hive value before its bucket-range check.
+/// - for `identity`, a value that casts to the key column's type
+///   (`key_column_types[i]` for key `i`), as `MapHiveColumn` requires; a key whose
+///   column type has no Arrow mapping (`None`) is checked as a string;
+/// - for `year`/`month`/`day`/`hour`, a value that parses as an integer;
+/// - for `bucket(N)`, a value that parses as an integer in `0..N`.
 ///
-/// Values for `identity` and the temporal transforms are opaque strings here: the
-/// column type they must cast to is not part of the spec, so type checking belongs
-/// to whoever produced them. A caller that cannot vouch for the file's contents
-/// should verify against the parquet footer's per-column min/max before promoting —
-/// for `identity`, `min == max == value` proves the file is single-partition.
+/// SQL NULL is legal for every transform — a NULL input yields a NULL partition
+/// value, which is a partition in its own right (DuckDB's
+/// `__HIVE_DEFAULT_PARTITION__`). Official agrees:
+/// `IsValidTransformedHivePartitionValue` returns early for a NULL hive value
+/// before its bucket-range check.
+///
+/// None of this proves the file's rows hold these values. A caller that cannot
+/// vouch for the file's contents should verify against the parquet footer's
+/// per-column min/max before promoting — for `identity`, `min == max == value`
+/// proves the file is single-partition.
 pub(crate) fn validate_promoted_partition_values(
     table_id: i64,
     transforms: &[String],
@@ -2005,9 +2010,9 @@ pub(crate) fn validate_promoted_partition_values(
         // Check the value is well-formed for the transform and, for `identity`, that
         // it casts to the key column's type — official does the same
         // (`MapHiveColumn` errors when the Hive value will not cast). A NULL value is
-        // legitimate under any transform and always passes. An unknown column type
-        // (a key column absent from the promoted schema) skips the type check rather
-        // than guessing.
+        // legitimate under any transform and always passes. A column type with no
+        // Arrow mapping is checked as a string rather than guessed; the caller
+        // refuses a key whose column the promoted schema lacks before this runs.
         let transform = PartitionTransform::parse(&transforms[index]);
         let column_type = key_column_types
             .get(index)
