@@ -73,6 +73,32 @@ pub(crate) fn positions_bytes(positions: &HashSet<i64>) -> usize {
     positions.capacity() * (size_of::<i64>() + 1) * 8 / 7 + size_of::<HashSet<i64>>()
 }
 
+/// [`positions_bytes`] of a set of `positions` positions shrunk to fit them:
+/// a power-of-two bucket count holding them at the 7/8 load factor.
+pub(crate) fn set_bytes_for(positions: usize) -> usize {
+    // As the hash table sizes itself: at least 4 buckets, 8 below 8 slots,
+    // else the next power of two at the 7/8 load factor.
+    let buckets = if positions < 4 {
+        4
+    } else if positions < 8 {
+        8
+    } else {
+        (positions.saturating_mul(8) / 7)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+    };
+    let capacity = if buckets < 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
+    };
+    capacity
+        .saturating_mul(size_of::<i64>() + 1)
+        .saturating_mul(8)
+        / 7
+        + size_of::<HashSet<i64>>()
+}
+
 /// The positions each data file's delete file removes, kept for later scans of
 /// the same table.
 ///
@@ -136,6 +162,23 @@ impl DeletePositionMemo {
             .map(|entry| Arc::clone(&entry.positions))
     }
 
+    /// Whether `positions` positions read from the delete file at `path`
+    /// for data file `data_file_id` would fit the memo's budget, kept in a set
+    /// sized for them ([`positions_bytes`] of a set no larger than needed),
+    /// beside what the memo already holds for other data files.
+    pub(crate) fn fits(&self, data_file_id: i64, path: &str, positions: usize) -> bool {
+        let bytes = size_of::<DeleteMemoEntry>() + path.len() + set_bytes_for(positions);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let replaced = state
+            .files
+            .get(&data_file_id)
+            .map_or(0, |entry| entry.bytes);
+        (state.bytes - replaced).saturating_add(bytes) <= self.max_bytes
+    }
+
     /// Keep the positions read from the delete file at `path` for data file
     /// `data_file_id`, replacing what the memo kept for that data file, unless
     /// they would take the memo over its budget.
@@ -182,6 +225,24 @@ mod tests {
 
         let memoized = DuckLakeReadOptions::memoized();
         assert!(DeletePositionMemo::new(memoized.delete_memo_bytes).is_some());
+    }
+
+    #[test]
+    fn fits_estimates_a_set_shrunk_to_its_positions() {
+        for positions in [0usize, 1, 3, 4, 7, 100, 1_000, 666_667] {
+            let mut set: HashSet<i64> = (0..positions as i64).collect();
+            set.shrink_to_fit();
+            assert!(
+                positions_bytes(&set) <= set_bytes_for(positions),
+                "{positions}: {} > {}",
+                positions_bytes(&set),
+                set_bytes_for(positions)
+            );
+        }
+        let one = size_of::<DeleteMemoEntry>() + "a".len() + set_bytes_for(10);
+        let memo = DeletePositionMemo::new(one).unwrap();
+        assert!(memo.fits(1, "a", 10));
+        assert!(!memo.fits(1, "a", 1_000));
     }
 
     #[test]

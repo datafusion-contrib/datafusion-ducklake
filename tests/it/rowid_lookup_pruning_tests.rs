@@ -714,6 +714,27 @@ mod official_history {
                 let cost = reader
                     .check(&format!("official, phase {phase}, snapshot {snapshot}"))
                     .await;
+                if phase + 1 == phases.len() && at + 1 == snapshots.len() {
+                    // The rewritten file official wrote, 8,192-row row groups
+                    // and no page index: a single id decodes its row group.
+                    let truth = reader.truth().await;
+                    let ids: Vec<i64> = truth.keys().copied().collect();
+                    let state = reader.ctx.state();
+                    for id in [ids[3], ids[ids.len() / 2], ids[ids.len() - 2]] {
+                        let one = reader
+                            .table
+                            .read_columns_by_rowid(&state, &[id], None)
+                            .await
+                            .unwrap();
+                        assert_eq!(one.row_ids, vec![id]);
+                        assert!(
+                            one.rows_decoded <= 2 * 8_192 + 1,
+                            "rowid {id}: decoded {} of {} rows",
+                            one.rows_decoded,
+                            truth.len()
+                        );
+                    }
+                }
                 if at == 0 {
                     // The first insert's rows: after the merge, the first
                     // rows of a file merged with the second insert's, read
@@ -810,6 +831,118 @@ async fn a_lookup_reads_only_the_deletes_it_needs() {
         "decoded {} rows with the positions kept",
         again.rows_decoded
     );
+
+    // A memo too small for the file reads as without one, on every lookup,
+    // rather than reading the file whole each time to keep nothing.
+    let tiny = reader_with(
+        &lake.provider,
+        lake.head(),
+        DuckLakeReadOptions::default().with_delete_memo(64 << 10),
+    )
+    .await;
+    let state = tiny.ctx.state();
+    for round in 0..2 {
+        let over = tiny
+            .table
+            .read_columns_by_rowid(&state, &wanted, None)
+            .await
+            .unwrap();
+        assert_eq!(over.row_ids, live);
+        assert!(
+            over.rows_decoded <= read.rows_decoded,
+            "round {round}: decoded {} rows through a memo too small, {} without one",
+            over.rows_decoded,
+            read.rows_decoded
+        );
+    }
+
+    // A reservation too small for the delete file the memo would keep is
+    // refused before that file is read, and nothing stays charged.
+    let filling = reader_with(&lake.provider, lake.head(), DuckLakeReadOptions::memoized()).await;
+    let state = filling.ctx.state();
+    let (pool, small) = reservation(256 << 10);
+    let error = filling
+        .table
+        .read_columns_by_rowid_with(
+            &state,
+            &wanted,
+            None,
+            RowIdReadOptions::default().with_reservation(&small),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            DuckLakeError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(pool.reserved(), 0);
+    // Nothing was kept, and so nothing was read whole: the next lookup with
+    // room reads the file whole to keep it.
+    let (_pool, room) = reservation(1 << 30);
+    let kept = filling
+        .table
+        .read_columns_by_rowid_with(
+            &state,
+            &wanted,
+            None,
+            RowIdReadOptions::default().with_reservation(&room),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kept.row_ids, live);
+    assert!(
+        kept.rows_decoded >= deleted,
+        "the memo reads the file whole"
+    );
+    assert_eq!(room.size(), kept.batch.get_array_memory_size());
+}
+
+/// A lookup in a file whose delete file is gone from storage fails with the
+/// error a scan gives, naming the missing delete file, with and without the
+/// delete memo. Guards against the raw storage error from the lookup's own
+/// footer read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_delete_file_is_named() {
+    let lake = Lake::new(0).await;
+    lake.insert(0, INSERT_ROWS).await;
+    lake.sql("DELETE FROM lake.main.t WHERE id % 3 = 0").await;
+    let reader = lake.reader(lake.head()).await;
+    let name = reader.table.files().unwrap()[0]
+        .delete_file
+        .as_ref()
+        .expect("a delete file")
+        .path
+        .clone();
+    let mut stack = vec![lake._temp.path().join("data")];
+    let mut removed = false;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with(name.as_str()) {
+                std::fs::remove_file(&path).unwrap();
+                removed = true;
+            }
+        }
+    }
+    assert!(removed, "removed {name}");
+    for options in [DuckLakeReadOptions::default(), DuckLakeReadOptions::memoized()] {
+        let reader = reader_with(&lake.provider, lake.head(), options).await;
+        let error = reader
+            .table
+            .read_columns_by_rowid(&reader.ctx.state(), &[1, 2], None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Delete file") && error.contains("not found"),
+            "{error}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

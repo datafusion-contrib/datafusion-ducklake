@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `read_columns_by_rowid_with` and `RowIdReadOptions`: a rowid read that charges a DataFusion
-  `MemoryReservation` and fails before over-allocating; `RowsByRowId::rows_decoded`.
+- `read_columns_by_rowid_with` and `RowIdReadOptions`: a rowid read that charges the batches it
+  holds and its result to a DataFusion `MemoryReservation`; `RowsByRowId::rows_decoded`.
 - `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`,
   and per-column `column_options` (`ColumnWriteOptions`: page size, codec, dictionary, encoding):
   Parquet writer settings for every data file a write produces. A library extension.

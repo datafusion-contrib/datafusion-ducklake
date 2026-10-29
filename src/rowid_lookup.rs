@@ -139,19 +139,32 @@ impl AsyncFileReader for PageIndexReader {
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct RowIdReadOptions<'a> {
-    /// Memory the read charges what it holds to. Each batch read from a data
-    /// file is charged while it is held, the rows kept of it and of the
-    /// inlined rows until the result is built, and the result before it is
-    /// built. A charge the pool refuses fails the read with the pool's
+    /// Memory the read charges what it holds to:
+    ///
+    /// - each batch it reads, from a data file (its `rowid`, snapshot or
+    ///   requested columns) or from a delete file, while it holds it;
+    /// - the rows it keeps of them and of the inlined rows, until the result
+    ///   is built;
+    /// - a delete file read whole into the table's delete memo, estimated
+    ///   from its row count before the read starts;
+    /// - the result, before it is built.
+    ///
+    /// A batch is charged once the Parquet reader hands it over, so the read
+    /// may exceed the pool by the batches in flight: one per file read at once
+    /// (at most the session's `target_partitions`). A charge the pool refuses
+    /// fails the read with the pool's
     /// [`DataFusionError::ResourcesExhausted`](datafusion::error::DataFusionError::ResourcesExhausted)
     /// (as [`DuckLakeError::DataFusion`]), with nothing more allocated for
-    /// it, and the reservation back at its size before the call. A read that
-    /// returns leaves the reservation grown by the returned batch's memory
-    /// size, for the caller to shrink when it drops the batch. `None`
-    /// charges nothing.
+    /// it, and the reservation back at its size before the call, as it is for
+    /// a read cancelled by dropping its future. A read that returns leaves the
+    /// reservation grown by the returned batch's memory size, for the caller to
+    /// shrink when it drops the batch. `None` charges nothing.
     ///
-    /// The catalog's listing of the table's files and inlined rows is not
-    /// charged: it is read before the lookup starts, as a scan reads it.
+    /// Not charged: the catalog's listing of the table's files, inlined rows
+    /// and inlined deletions, which is read before the lookup starts, as a
+    /// scan reads it; the files' footers and page indexes; the set of
+    /// requested ids; and the delete memo's own positions, which its byte
+    /// budget bounds.
     pub reservation: Option<&'a MemoryReservation>,
 }
 
@@ -206,11 +219,19 @@ impl<'a> RowIdReadAccounting<'a> {
     }
 
     /// Release every byte this lookup charged.
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         let grown = self.grown.swap(0, Ordering::Relaxed);
         if let Some(reservation) = self.reservation {
             reservation.shrink(grown);
         }
+    }
+}
+
+impl Drop for RowIdReadAccounting<'_> {
+    /// A read dropped before it finishes, cancelled with its future,
+    /// releases what it charged.
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -689,7 +710,9 @@ impl DuckLakeTable {
         accounting.release();
         let mut read = read?;
         if let Some(reservation) = options.reservation {
-            reservation.grow(read.batch.get_array_memory_size());
+            reservation
+                .try_grow(read.batch.get_array_memory_size())
+                .map_err(DuckLakeError::DataFusion)?;
         }
         read.rows_decoded = accounting.decoded.load(Ordering::Relaxed) as u64;
         Ok(read)

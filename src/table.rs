@@ -3573,42 +3573,13 @@ impl DuckLakeTable {
             return Ok(deleted);
         };
         let read_snapshot = Some(self.snapshot_id);
-        if let Some(memo) = &self.delete_memo {
-            let (scan, path) = self.delete_file_scan(state, delete_file)?;
-            let positions = match memo.get(table_file.data_file_id, &path, read_snapshot) {
-                Some(positions) => positions,
-                None => {
-                    let positions = Arc::new(
-                        read_delete_positions(
-                            &scan,
-                            &state.task_ctx(),
-                            self.object_store_url.as_ref(),
-                            &path,
-                            read_snapshot,
-                        )
-                        .await?,
-                    );
-                    accounting.decoded(positions.len());
-                    memo.insert(table_file.data_file_id, &path, read_snapshot, &positions);
-                    positions
-                },
-            };
-            deleted.extend(
-                candidates
-                    .iter()
-                    .filter(|position| positions.contains(position)),
-            );
-            return Ok(deleted);
-        }
-
-        let mut sorted: Vec<i64> = candidates.iter().copied().collect();
-        sorted.sort_unstable();
         let resolved_path = self.resolve_file_path(delete_file)?;
+        let context = state.task_ctx();
         #[cfg(feature = "encryption")]
         let encryption_key = delete_file.encryption_key.as_deref();
         #[cfg(not(feature = "encryption"))]
         let encryption_key = None;
-        let metadata = fetch_parquet_metadata(
+        let metadata = match fetch_parquet_metadata(
             state,
             self.object_store_url.as_ref(),
             &resolved_path,
@@ -3617,7 +3588,71 @@ impl DuckLakeTable {
             encryption_key,
             Some(datafusion::parquet::file::metadata::PageIndexPolicy::Optional),
         )
-        .await?;
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(crate::lazy_delete_filter::classify_delete_file_read_error(
+                    &context,
+                    self.object_store_url.as_ref(),
+                    &resolved_path,
+                    error,
+                )
+                .await);
+            },
+        };
+        let rows = usize::try_from(metadata.file_metadata().num_rows()).unwrap_or(0);
+
+        // The memo serves a file it holds, and keeps one it can hold: such a
+        // file is read whole once. One it cannot hold is read as without a
+        // memo, so a memo over its budget costs no more than none.
+        if let Some(memo) = &self.delete_memo {
+            if let Some(positions) =
+                memo.get(table_file.data_file_id, &resolved_path, read_snapshot)
+            {
+                deleted.extend(
+                    candidates
+                        .iter()
+                        .filter(|position| positions.contains(position)),
+                );
+                return Ok(deleted);
+            }
+            if memo.fits(table_file.data_file_id, &resolved_path, rows) {
+                let (scan, path) = self.delete_file_scan(state, delete_file)?;
+                // What the read holds, charged before it starts: the entries
+                // it collects, a batch at a time, and the set it builds. The
+                // set is the memo's, within the memo's budget, once kept.
+                let entry = std::mem::size_of::<(i64, Option<i64>)>();
+                let batch = state.config().batch_size().saturating_mul(3 * entry);
+                let charge = crate::delete_memo::set_bytes_for(rows)
+                    .saturating_add(rows.saturating_mul(entry))
+                    .saturating_add(batch);
+                accounting.try_grow(charge)?;
+                let read = read_delete_positions(
+                    &scan,
+                    &context,
+                    self.object_store_url.as_ref(),
+                    &path,
+                    read_snapshot,
+                )
+                .await;
+                accounting.shrink(charge);
+                let mut positions = read?;
+                positions.shrink_to_fit();
+                let positions = Arc::new(positions);
+                accounting.decoded(rows);
+                memo.insert(table_file.data_file_id, &path, read_snapshot, &positions);
+                deleted.extend(
+                    candidates
+                        .iter()
+                        .filter(|position| positions.contains(position)),
+                );
+                return Ok(deleted);
+            }
+        }
+
+        let mut sorted: Vec<i64> = candidates.iter().copied().collect();
+        sorted.sort_unstable();
         let selection = delete_pos_selection(&metadata, &sorted);
         if selection
             .as_ref()
@@ -3626,23 +3661,31 @@ impl DuckLakeTable {
             return Ok(deleted);
         }
         let (scan, path) = self.delete_file_scan_selecting(state, delete_file, selection)?;
-        let entries = read_delete_entries(
+        crate::lazy_delete_filter::for_each_delete_batch(
             &scan,
-            &state.task_ctx(),
+            &context,
             self.object_store_url.as_ref(),
             &path,
+            |batch, entries| {
+                accounting.decoded(batch.num_rows());
+                // Charged while held; only the candidates' deletions are kept.
+                let held = batch.get_array_memory_size()
+                    + entries.capacity() * std::mem::size_of::<(i64, Option<i64>)>();
+                accounting.try_grow(held)?;
+                deleted.extend(
+                    entries
+                        .into_iter()
+                        .filter(|(position, snapshot)| {
+                            candidates.contains(position)
+                                && snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id)
+                        })
+                        .map(|(position, _)| position),
+                );
+                accounting.shrink(held);
+                Ok(())
+            },
         )
         .await?;
-        accounting.decoded(entries.len());
-        deleted.extend(
-            entries
-                .into_iter()
-                .filter(|(position, snapshot)| {
-                    candidates.contains(position)
-                        && snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id)
-                })
-                .map(|(position, _)| position),
-        );
         Ok(deleted)
     }
 
@@ -3746,6 +3789,10 @@ impl DuckLakeTable {
         while let Some(batch) = futures::StreamExt::next(&mut stream).await {
             let batch = batch?;
             accounting.decoded(batch.num_rows());
+            // Charged while held; the rows kept of it are charged below.
+            let held = batch.get_array_memory_size();
+            accounting.try_grow(held)?;
+            let before = rows.len();
             let row_ids = int64(&batch, 0)?;
             let snapshots = snapshot_name
                 .is_some()
@@ -3761,6 +3808,9 @@ impl DuckLakeTable {
                     .and_then(|snapshots| snapshots.is_valid(row).then(|| snapshots.value(row)));
                 rows.push((positions.value(row), row_ids.value(row), snapshot));
             }
+            accounting.shrink(held);
+            accounting
+                .try_grow((rows.len() - before) * std::mem::size_of::<(i64, i64, Option<i64>)>())?;
         }
         Ok(Some(rows))
     }
@@ -3862,12 +3912,17 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(vec![read_schema.fields().len() - 1, pos_table_idx]))?
                 .build(),
         );
-        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
         let mut later = HashSet::new();
-        for batch in &batches {
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            let held = batch.get_array_memory_size();
             if let Some(accounting) = accounting {
                 accounting.decoded(batch.num_rows());
+                // Charged while held.
+                accounting.try_grow(held)?;
             }
+            let batch = &batch;
             let snapshots = arrow::compute::cast(batch.column(0), &DataType::Int64)?;
             let snapshots = snapshots
                 .as_any()
@@ -3882,6 +3937,9 @@ impl DuckLakeTable {
                 if snapshots.is_null(row) || snapshots.value(row) > self.snapshot_id {
                     later.insert(positions.value(row));
                 }
+            }
+            if let Some(accounting) = accounting {
+                accounting.shrink(held);
             }
         }
         Ok(later)
