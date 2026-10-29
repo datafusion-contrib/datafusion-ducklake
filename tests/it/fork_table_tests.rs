@@ -2027,6 +2027,242 @@ async fn fork_of_a_partitioned_source_emptied_by_a_replace(pool: sqlx::PgPool) {
     );
 }
 
+/// A table partitioned by scalar keys that follow a nested column forks, and
+/// the fork reads and prunes as the source does; a promoted file whose value
+/// does not cast to such a key's type is refused. The catalog numbers a nested
+/// column's children too (a list's element, a struct's fields), so a key's
+/// column id is not its position among the top-level columns. Guards against
+/// resolving a key's column type by that position, which checked `day`
+/// against the `n` column after it and refused the fork, and skipped the check
+/// for `n` itself. The key-first layout is the control.
+async fn fork_of_a_table_partitioned_after_a_nested_column(pool: sqlx::PgPool) {
+    use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
+    use arrow::datatypes::Float32Type;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
+    use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo};
+
+    let manager = MulticatalogManager::new(pool.clone());
+    let make = multicatalog(pool.clone());
+    let list: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(1.5), Some(2.5)]),
+        Some(vec![]),
+        None,
+        Some(vec![Some(-1.0)]),
+    ]));
+    let struct_fields: arrow::datatypes::Fields =
+        vec![Field::new("a", DataType::Int64, true)].into();
+    let structs: ArrayRef = Arc::new(StructArray::new(
+        struct_fields,
+        vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40]))],
+        None,
+    ));
+    for (shape, nested) in [("list", list), ("struct", structs)] {
+        for key_first in [false, true] {
+            let case = format!(
+                "{shape} column {} the keys",
+                if key_first {
+                    "after"
+                } else {
+                    "before"
+                }
+            );
+            let rows = |ids: [i64; 4]| {
+                let mut columns: Vec<(Field, ArrayRef)> = vec![
+                    (
+                        Field::new("id", DataType::Int64, true),
+                        Arc::new(Int64Array::from(ids.to_vec())),
+                    ),
+                    (
+                        Field::new("day", DataType::Utf8, true),
+                        Arc::new(StringArray::from(vec!["d040", "d041", "d040", "d041"])),
+                    ),
+                    (
+                        Field::new("n", DataType::Int32, true),
+                        Arc::new(Int32Array::from(vec![7, 8, 7, 8])),
+                    ),
+                ];
+                let nested_column = (
+                    Field::new("nested", nested.data_type().clone(), true),
+                    Arc::clone(&nested),
+                );
+                columns.insert(
+                    if key_first {
+                        3
+                    } else {
+                        1
+                    },
+                    nested_column,
+                );
+                let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = columns.into_iter().unzip();
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+            };
+            let schema = rows([0; 4]).schema();
+
+            let source = make(Some(0)).await;
+            crate::inlining_abstraction_tests::create_with(
+                &source,
+                "t",
+                &schema
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().as_str(), field.data_type().clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            source
+                .sql("ALTER TABLE lake.main.t SET PARTITIONED BY (day, n)")
+                .await
+                .unwrap();
+            source.append_parquet("t", &rows([1, 2, 3, 4])).await;
+            source.append_parquet("t", &rows([5, 6, 7, 8])).await;
+            assert_eq!(source.data_files("t"), 4, "{case}: two files per partition");
+
+            // A promoted file whose `n` value is not an INTEGER is refused,
+            // naming the key's own type. `day = '40'` would cast to the
+            // column after `day`, so only a check of `n` itself refuses it.
+            // A table this test created numbers its catalog columns in
+            // depth-first order, so `column_id` order is the order
+            // `register_existing_data_file` takes.
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), true).unwrap())
+                .collect::<Vec<_>>();
+            let column_ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL
+                 ORDER BY column_id",
+            )
+            .bind(source.table_id("t"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let spec = source
+                .provider
+                .get_partition_spec(source.table_id("t"), source.head())
+                .unwrap()
+                .unwrap();
+            let promote = |columns: &[ColumnDef], column_ids: &[i64]| {
+                let file = DataFileInfo::new("day=40/n=x/f.parquet", 256, 1).with_partition(
+                    spec.partition_id,
+                    vec![(0, Some("40".to_string())), (1, Some("x".to_string()))],
+                );
+                source.writer.register_existing_data_file(
+                    "main",
+                    "t",
+                    columns,
+                    column_ids,
+                    &file,
+                    datafusion_ducklake::WriteMode::Append,
+                )
+            };
+            let error = promote(&columns, &column_ids)
+                .expect_err(&format!("{case}: a non-integer value for `n` is refused"))
+                .to_string();
+            assert!(
+                error.contains("for key 1") && error.contains("Int32"),
+                "{case}: the refusal names `n` and its type: {error}"
+            );
+
+            // Promoted columns that do not carry a partition key's column are
+            // refused rather than registered with that key unchecked.
+            let n_id: i64 = sqlx::query_scalar(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL AND column_name = 'n'",
+            )
+            .bind(source.table_id("t"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let mut without_n = columns.clone();
+            without_n.remove(schema.index_of("n").unwrap());
+            let ids_without_n: Vec<i64> = column_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != n_id)
+                .collect();
+            let error = match promote(&without_n, &ids_without_n) {
+                Ok(_) => panic!("{case}: columns without the key `n` are refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("partition key 1") && error.contains(&format!("column_id {n_id}")),
+                "{case}: the refusal names the missing key column: {error}"
+            );
+            assert_eq!(
+                source.data_files("t"),
+                4,
+                "{case}: no refused file is registered"
+            );
+
+            let destination = make(None).await;
+            fork(&manager, &source, source.head(), &destination)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: the fork is refused: {error}"));
+            assert_eq!(
+                destination.rows("t").await,
+                source.rows("t").await,
+                "{case}: the fork reads the source's rows"
+            );
+
+            // Each file carries its partition values over unchanged.
+            let partition_values = |lake: &Lake| {
+                let mut values = lake
+                    .provider
+                    .get_table_files_for_select(lake.table_id("t"), lake.head())
+                    .unwrap()
+                    .into_iter()
+                    .map(|file| file.partition_values)
+                    .collect::<Vec<_>>();
+                values.sort();
+                values
+            };
+            let d040 = vec![(0, Some("d040".to_string())), (1, Some("7".to_string()))];
+            let d041 = vec![(0, Some("d041".to_string())), (1, Some("8".to_string()))];
+            assert_eq!(
+                partition_values(&source),
+                vec![d040.clone(), d040.clone(), d041.clone(), d041],
+                "{case}: the source's files are partitioned"
+            );
+            assert_eq!(
+                partition_values(&destination),
+                partition_values(&source),
+                "{case}: the fork keeps each file's partition values"
+            );
+
+            // A filter on a key reads, and keeps, only that partition's files.
+            let (ctx, table) = destination.table("t").await;
+            let frame = ctx
+                .sql("SELECT id FROM lake.main.t WHERE day = 'd040' ORDER BY id")
+                .await
+                .unwrap();
+            assert_eq!(
+                lines(&frame.collect().await.unwrap(), false),
+                ["1", "3", "5", "7"],
+                "{case}: a key filter reads that partition's rows"
+            );
+            let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(BinaryExpr::new(
+                    col("day", schema.as_ref()).unwrap(),
+                    Operator::Eq,
+                    lit("d040"),
+                ));
+            let matching = table
+                .files_matching(&predicate)
+                .unwrap()
+                .into_iter()
+                .map(|file| file.partition_values)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching,
+                vec![d040.clone(), d040],
+                "{case}: the key filter prunes to that partition's files"
+            );
+        }
+    }
+}
+
 /// Every fork scenario on one PostgreSQL store, a fresh pair of catalogs
 /// each.
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
@@ -2052,5 +2288,6 @@ async fn fork_table_scenarios() {
     cleanup_defers_files_forks_and_forks_of_forks_reference(pool.clone()).await;
     fork_replace_from_an_empty_source_records_the_removal(pool.clone()).await;
     fork_of_a_partitioned_source_emptied_by_a_replace(pool.clone()).await;
+    fork_of_a_table_partitioned_after_a_nested_column(pool.clone()).await;
     fork_fuzz(pool).await;
 }

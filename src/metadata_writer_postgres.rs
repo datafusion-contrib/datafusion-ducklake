@@ -1820,6 +1820,10 @@ impl PostgresMetadataWriter {
             .bind(table_id)
             .fetch_optional(&mut *tx)
             .await?;
+            // Every catalog column node's `(column_id, type)`, nested children
+            // included: `column_ids` is 1:1 with these nodes, not with the
+            // top-level `columns`.
+            let catalog_fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
             let mut transforms: Vec<String> = Vec::new();
             let mut key_column_types: Vec<Option<arrow::datatypes::DataType>> = Vec::new();
             if let Some(partition_id) = live_partition_id {
@@ -1832,21 +1836,28 @@ impl PostgresMetadataWriter {
                 .bind(partition_id)
                 .fetch_all(&mut *tx)
                 .await?;
-                for row in &key_rows {
+                for (key_index, row) in key_rows.iter().enumerate() {
                     transforms.push(row.try_get::<String, _>(0)?);
-                    // Resolve each key's column_id to the Arrow type of the matching
-                    // promoted column, so an `identity` value can be cast-checked the
-                    // way official's MapHiveColumn does.
+                    // Resolve each key's column_id to the Arrow type of the column
+                    // node with that field id, so an `identity` value can be
+                    // cast-checked the way official's MapHiveColumn does. Official
+                    // looks a partition field up by field id too
+                    // (`GetByFieldIndex`), among the table's own fields, so it
+                    // always finds the key's column: official refuses to drop a
+                    // partition key's column. Promoted columns without it are
+                    // refused for the same reason, rather than registered with
+                    // the key unchecked.
                     let column_id: i64 = row.try_get(1)?;
-                    key_column_types.push(
-                        column_ids
-                            .iter()
-                            .position(|id| *id == column_id)
-                            .and_then(|index| columns.get(index))
-                            .and_then(|column| {
-                                crate::types::ducklake_to_arrow_type(column.ducklake_type()).ok()
-                            }),
-                    );
+                    let Some((_, ducklake_type)) =
+                        catalog_fields.iter().find(|(id, _)| *id == column_id)
+                    else {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "cannot promote into table {table_id}: its live partition key \
+                             {key_index} is on column_id {column_id}, which the promoted \
+                             columns do not include"
+                        )));
+                    };
+                    key_column_types.push(crate::types::ducklake_to_arrow_type(ducklake_type).ok());
                 }
             }
 
@@ -2006,7 +2017,7 @@ impl PostgresMetadataWriter {
             merge_file_table_column_stats(
                 &mut tx,
                 table_id,
-                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &catalog_fields,
                 &crate::metadata_writer::file_column_stats(files.iter().map(|entry| &entry.file)),
             )
             .await?;
