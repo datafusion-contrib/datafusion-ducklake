@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
@@ -30,6 +31,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
 use datafusion::parquet::arrow::async_reader::AsyncFileReader;
 use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
@@ -133,6 +135,85 @@ impl AsyncFileReader for PageIndexReader {
     }
 }
 
+/// Options for [`DuckLakeTable::read_columns_by_rowid_with`].
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub struct RowIdReadOptions<'a> {
+    /// Memory the read charges what it holds to. Each batch read from a data
+    /// file is charged while it is held, the rows kept of it and of the
+    /// inlined rows until the result is built, and the result before it is
+    /// built. A charge the pool refuses fails the read with the pool's
+    /// [`DataFusionError::ResourcesExhausted`](datafusion::error::DataFusionError::ResourcesExhausted)
+    /// (as [`DuckLakeError::DataFusion`]), with nothing more allocated for
+    /// it, and the reservation back at its size before the call. A read that
+    /// returns leaves the reservation grown by the returned batch's memory
+    /// size, for the caller to shrink when it drops the batch. `None`
+    /// charges nothing.
+    ///
+    /// The catalog's listing of the table's files and inlined rows is not
+    /// charged: it is read before the lookup starts, as a scan reads it.
+    pub reservation: Option<&'a MemoryReservation>,
+}
+
+impl<'a> RowIdReadOptions<'a> {
+    /// Charge what the read holds to `reservation`
+    /// ([`Self::reservation`]).
+    #[must_use]
+    pub fn with_reservation(mut self, reservation: &'a MemoryReservation) -> Self {
+        self.reservation = Some(reservation);
+        self
+    }
+}
+
+/// What a lookup by `rowid` charged and decoded so far.
+pub(crate) struct RowIdReadAccounting<'a> {
+    reservation: Option<&'a MemoryReservation>,
+    /// Bytes this lookup grew `reservation` by and has not shrunk.
+    grown: AtomicUsize,
+    /// Rows decoded from data files.
+    decoded: AtomicUsize,
+}
+
+impl<'a> RowIdReadAccounting<'a> {
+    pub(crate) fn new(reservation: Option<&'a MemoryReservation>) -> Self {
+        Self {
+            reservation,
+            grown: AtomicUsize::new(0),
+            decoded: AtomicUsize::new(0),
+        }
+    }
+
+    /// Count `rows` decoded from a data file.
+    pub(crate) fn decoded(&self, rows: usize) {
+        self.decoded.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Charge `bytes`, or fail with the pool's error when it refuses them.
+    pub(crate) fn try_grow(&self, bytes: usize) -> datafusion::error::Result<()> {
+        if let Some(reservation) = self.reservation {
+            reservation.try_grow(bytes)?;
+            self.grown.fetch_add(bytes, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Release `bytes` this lookup charged.
+    pub(crate) fn shrink(&self, bytes: usize) {
+        if let Some(reservation) = self.reservation {
+            reservation.shrink(bytes);
+            self.grown.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Release every byte this lookup charged.
+    fn release(&self) {
+        let grown = self.grown.swap(0, Ordering::Relaxed);
+        if let Some(reservation) = self.reservation {
+            reservation.shrink(grown);
+        }
+    }
+}
+
 /// What [`DuckLakeTable::locate_rowids`] read: where each row is, and the
 /// inlined rows, the files and their inlined deletions it found them in.
 struct Located {
@@ -208,15 +289,20 @@ impl DuckLakeTable {
     ///
     /// Inlined rows come from the catalog. A Parquet file whose rows take
     /// their `rowid` from position ([`RowIdLayout::Positional`]) is located by
-    /// arithmetic and read only for its deletions; a file that embeds them
-    /// ([`RowIdLayout::Embedded`]) has its row id column read, once per call.
-    /// Each file's footer is read once per table to learn which it is.
+    /// arithmetic and read only for its deletions; of a file that embeds them
+    /// ([`RowIdLayout::Embedded`]), only the row groups and pages whose row id
+    /// statistics may hold a requested id are read, and none when its
+    /// footer's bounds hold none. Each file's footer is read once per table
+    /// to learn which it is.
     pub async fn locate_rowids(
         &self,
         state: &dyn Session,
         row_ids: &[i64],
     ) -> crate::Result<Vec<RowIdLocation>> {
-        Ok(self.locate(state, row_ids).await?.rows)
+        Ok(self
+            .locate(state, row_ids, &RowIdReadAccounting::new(None))
+            .await?
+            .rows)
     }
 
     /// [`Self::locate_rowids`], with what it read the rows from. The inlined
@@ -224,7 +310,12 @@ impl DuckLakeTable {
     /// order a scan reads them, so that a flush between the reads moves no
     /// row out of all of them or into two
     /// ([`DuckLakeTable::inlined_rows_then_files`]).
-    async fn locate(&self, state: &dyn Session, row_ids: &[i64]) -> crate::Result<Located> {
+    async fn locate(
+        &self,
+        state: &dyn Session,
+        row_ids: &[i64],
+        accounting: &RowIdReadAccounting<'_>,
+    ) -> crate::Result<Located> {
         let wanted: HashSet<i64> = row_ids.iter().copied().collect();
         if wanted.is_empty() {
             return Ok(Located {
@@ -262,7 +353,7 @@ impl DuckLakeTable {
             .map(|file| -> BoxFuture<'_, crate::Result<Vec<RowIdLocation>>> {
                 let inlined = inlined_deletes_ref.get(&file.data_file_id);
                 Box::pin(async move {
-                    self.locate_in_file(state, file, wanted, inlined, snapshot_id)
+                    self.locate_in_file(state, file, wanted, inlined, snapshot_id, accounting)
                         .await
                 })
             })
@@ -284,6 +375,7 @@ impl DuckLakeTable {
         wanted: &HashSet<i64>,
         inlined: Option<&HashSet<i64>>,
         snapshot_id: i64,
+        accounting: &RowIdReadAccounting<'_>,
     ) -> crate::Result<Vec<RowIdLocation>> {
         // A file's footer says which layout it has: an embedded row id column
         // may hold ids below the file's `row_id_start` (an `UPDATE`'s new row
@@ -319,8 +411,15 @@ impl DuckLakeTable {
                 if candidates.is_empty() {
                     candidates
                 } else {
+                    let positions: HashSet<i64> =
+                        candidates.iter().map(|(position, _)| *position).collect();
                     let later = self
-                        .positions_inserted_later(state, file)
+                        .positions_inserted_later_among(
+                            state,
+                            file,
+                            Some(&positions),
+                            Some(accounting),
+                        )
                         .await
                         .map_err(df_error)?;
                     candidates
@@ -331,7 +430,7 @@ impl DuckLakeTable {
             },
             Some(RowIdLayout::Embedded) => {
                 let partial = file.partial_max.is_some_and(|max| max > snapshot_id);
-                self.embedded_row_ids(state, file, partial)
+                self.embedded_rows_matching(state, file, wanted, partial, accounting)
                     .await
                     .map_err(df_error)?
                     .unwrap_or_default()
@@ -339,10 +438,8 @@ impl DuckLakeTable {
                     // Read at a snapshot before a partial file's last, a row
                     // shows when its snapshot is at most this one; a NULL one
                     // fails official's `<=` filter too.
-                    .filter(|(_, row_id, snapshot)| {
-                        wanted.contains(row_id)
-                            && (!partial
-                                || snapshot.is_some_and(|snapshot| snapshot <= snapshot_id))
+                    .filter(|(_, _, snapshot)| {
+                        !partial || snapshot.is_some_and(|snapshot| snapshot <= snapshot_id)
                     })
                     .map(|(position, row_id, _)| (position, row_id))
                     .collect()
@@ -388,7 +485,9 @@ impl DuckLakeTable {
         state: &dyn Session,
         row_ids: &[i64],
     ) -> crate::Result<Vec<arrow::record_batch::RecordBatch>> {
-        let located = self.locate(state, row_ids).await?;
+        let located = self
+            .locate(state, row_ids, &RowIdReadAccounting::new(None))
+            .await?;
         let mut inlined_ids = HashSet::new();
         let mut by_file: std::collections::HashMap<i64, HashSet<i64>> =
             std::collections::HashMap::new();
@@ -482,6 +581,13 @@ pub struct RowsByRowId {
     /// The requested columns of the rows found, under the table's names and
     /// types, in the order their `rowid`s were first requested.
     pub batch: RecordBatch,
+    /// The rows read out of data files to find and read these rows: of a
+    /// file that embeds `rowid`s, every row of the pages whose `rowid`
+    /// statistics may hold a requested id; of a merged file read at an
+    /// earlier snapshot, the requested rows' snapshots; and the requested
+    /// rows' columns. A measure of the read's work, not of its result: the
+    /// pages holding these rows are decoded whole.
+    pub rows_decoded: u64,
 }
 
 impl RowsByRowId {
@@ -539,11 +645,59 @@ impl DuckLakeTable {
     /// listing, the inlined rows and inlined deletions) are made on every
     /// call, unless the table's provider memoizes them
     /// ([`CatalogReadMemo`](crate::CatalogReadMemo)).
+    ///
+    /// A file that embeds its rows' `rowid`s (a merge's, a rewrite's or a
+    /// flush's) is skipped by the bounds its footer's `rowid` statistics
+    /// record, and of a file that may hold a requested row only the row
+    /// groups and pages whose `rowid` statistics may hold one are decoded. A
+    /// lookup in a file whose rows are ordered by `rowid` therefore decodes a
+    /// few pages; in one sorted by another column, whose pages each span most
+    /// ids, it decodes most of the `rowid` column.
+    ///
+    /// [`Self::read_columns_by_rowid_with`] charges what it holds to a memory
+    /// reservation.
     pub async fn read_columns_by_rowid(
         &self,
         state: &dyn Session,
         row_ids: &[i64],
         projection: Option<&[usize]>,
+    ) -> crate::Result<RowsByRowId> {
+        self.read_columns_by_rowid_with(state, row_ids, projection, RowIdReadOptions::default())
+            .await
+    }
+
+    /// [`Self::read_columns_by_rowid`] with `options`: with a
+    /// [`RowIdReadOptions::reservation`], the batches it reads and the result
+    /// it builds are charged to it before they are kept, and a charge the
+    /// pool refuses fails the read.
+    pub async fn read_columns_by_rowid_with(
+        &self,
+        state: &dyn Session,
+        row_ids: &[i64],
+        projection: Option<&[usize]>,
+        options: RowIdReadOptions<'_>,
+    ) -> crate::Result<RowsByRowId> {
+        let accounting = RowIdReadAccounting::new(options.reservation);
+        let read = self
+            .read_columns_by_rowid_accounted(state, row_ids, projection, &accounting)
+            .await;
+        // What the parts held is released whatever the outcome; a result
+        // keeps its own batch charged.
+        accounting.release();
+        let mut read = read?;
+        if let Some(reservation) = options.reservation {
+            reservation.grow(read.batch.get_array_memory_size());
+        }
+        read.rows_decoded = accounting.decoded.load(Ordering::Relaxed) as u64;
+        Ok(read)
+    }
+
+    async fn read_columns_by_rowid_accounted(
+        &self,
+        state: &dyn Session,
+        row_ids: &[i64],
+        projection: Option<&[usize]>,
+        accounting: &RowIdReadAccounting<'_>,
     ) -> crate::Result<RowsByRowId> {
         let schema = TableProvider::schema(self);
         let physical_len = self.physical_schema().fields().len();
@@ -572,7 +726,7 @@ impl DuckLakeTable {
             .into_iter()
             .collect();
 
-        let located = self.locate(state, row_ids).await?;
+        let located = self.locate(state, row_ids, accounting).await?;
         let mut parts: Vec<ReadPart> = Vec::new();
         let mut inlined_ids = HashSet::new();
         let mut by_file: HashMap<i64, HashMap<i64, i64>> = HashMap::new();
@@ -613,6 +767,22 @@ impl DuckLakeTable {
                     rows.batch.num_columns(),
                 )));
             }
+            // The kept rows' share of the inlined columns, charged before
+            // they are copied out.
+            let kept = keep.true_count();
+            let total = rows.batch.num_rows().max(1);
+            let estimate = read
+                .iter()
+                .map(|&index| {
+                    rows.batch
+                        .column(index)
+                        .get_array_memory_size()
+                        .saturating_mul(kept)
+                        .div_ceil(total)
+                })
+                .sum::<usize>()
+                + kept * std::mem::size_of::<i64>();
+            accounting.try_grow(estimate)?;
             let mut columns = Vec::with_capacity(read.len());
             for &index in &read {
                 let column = arrow::compute::filter(rows.batch.column(index), &keep)?;
@@ -621,12 +791,20 @@ impl DuckLakeTable {
                         .map_err(df_error)?,
                 );
             }
-            let row_ids = rows
+            let row_ids: Vec<i64> = rows
                 .row_ids
                 .iter()
                 .copied()
                 .filter(|row_id| inlined_ids.contains(row_id))
                 .collect();
+            // Trued up to what the copy holds.
+            let held = columns
+                .iter()
+                .map(|column| column.get_array_memory_size())
+                .sum::<usize>()
+                + row_ids.len() * std::mem::size_of::<i64>();
+            accounting.shrink(estimate);
+            accounting.try_grow(held)?;
             parts.push(ReadPart {
                 columns,
                 row_ids,
@@ -654,7 +832,7 @@ impl DuckLakeTable {
                     Some(Box::pin(async move {
                         let wanted: HashSet<i64> = positions.keys().copied().collect();
                         let batches = self
-                            .read_file_columns_at(state, file, &wanted, read)
+                            .read_file_columns_at(state, file, &wanted, read, accounting)
                             .await
                             .map_err(df_error)?;
                         Ok(batches
@@ -680,7 +858,14 @@ impl DuckLakeTable {
             parts.extend(files.into_iter().flatten());
         }
 
-        assemble(&output_schema, &projection, &read, row_ids, &parts)
+        assemble(
+            &output_schema,
+            &projection,
+            &read,
+            row_ids,
+            &parts,
+            accounting,
+        )
     }
 }
 
@@ -694,6 +879,7 @@ fn assemble(
     read: &[usize],
     requested: &[i64],
     parts: &[ReadPart],
+    accounting: &RowIdReadAccounting<'_>,
 ) -> crate::Result<RowsByRowId> {
     let mut at: HashMap<i64, (usize, usize)> = HashMap::new();
     for (part_index, part) in parts.iter().enumerate() {
@@ -716,8 +902,19 @@ fn assemble(
         return Ok(RowsByRowId {
             row_ids,
             batch: RecordBatch::new_empty(Arc::clone(output_schema)),
+            rows_decoded: 0,
         });
     }
+    // The result copies at most the rows the parts hold, once each: charged
+    // before it is built.
+    accounting.try_grow(
+        parts
+            .iter()
+            .flat_map(|part| part.columns.iter())
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>()
+            + row_ids.len() * std::mem::size_of::<i64>(),
+    )?;
     let mut read_columns: Vec<ArrayRef> = Vec::with_capacity(read.len());
     for column in 0..read.len() {
         let arrays: Vec<&dyn arrow::array::Array> = parts
@@ -742,6 +939,7 @@ fn assemble(
     Ok(RowsByRowId {
         row_ids,
         batch,
+        rows_decoded: 0,
     })
 }
 

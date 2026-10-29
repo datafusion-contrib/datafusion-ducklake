@@ -105,6 +105,7 @@ mod restore_rows_tests;
 mod retire_appends_inlined_tests;
 mod row_count_tests;
 mod row_id_tests;
+mod rowid_lookup_pruning_tests;
 mod rowid_physical_position_tests;
 mod scan_statistics_tests;
 mod scoped_settings_tests;
