@@ -86,6 +86,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
 use object_store::ObjectMeta;
@@ -1012,6 +1013,11 @@ struct FileReadConfig {
     drops_current_columns: bool,
     /// Number of rows the file's footer records.
     row_count: i64,
+    /// The smallest and largest embedded `rowid` the file's row-group
+    /// statistics record, when the file embeds row ids and every row group
+    /// records both bounds. A lookup of ids outside them skips the file
+    /// without reading it.
+    embedded_row_id_bounds: Option<(i64, i64)>,
 }
 
 /// What one file's parquet footer says: the field-id → physical-name map, the
@@ -1030,6 +1036,9 @@ pub(crate) struct ParquetFooterFacts {
     pub(crate) row_group_count: usize,
     /// Number of rows the footer records.
     pub(crate) row_count: i64,
+    /// The smallest and largest embedded `rowid` the file's row-group
+    /// statistics record ([`embedded_row_id_bounds`]).
+    pub(crate) embedded_row_id_bounds: Option<(i64, i64)>,
 }
 
 /// A file's footer resolved against a table's CURRENT columns: the schema to
@@ -1059,6 +1068,9 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) row_group_count: usize,
     /// Number of rows the footer records.
     pub(crate) row_count: i64,
+    /// The smallest and largest embedded `rowid` the file's row-group
+    /// statistics record ([`embedded_row_id_bounds`]).
+    pub(crate) embedded_row_id_bounds: Option<(i64, i64)>,
 }
 
 /// The parquet reader's metadata size hint for a file whose catalog records
@@ -1116,14 +1128,19 @@ fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
 /// decryption properties as uncacheable (see its `cache_metadata` gate) — so
 /// this saves nothing for that path beyond sharing one code path with the
 /// unencrypted one.
-pub(crate) async fn read_parquet_footer_facts(
+///
+/// `page_index_policy` overrides whether the page index is loaded with the
+/// footer; `None` leaves it to `DFParquetMetadata`, which loads it when the
+/// footer is cached.
+pub(crate) async fn fetch_parquet_metadata(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
     file_size_bytes: Option<i64>,
     footer_size: Option<i64>,
     encryption_key: Option<&str>,
-) -> DataFusionResult<ParquetFooterFacts> {
+    page_index_policy: Option<datafusion::parquet::file::metadata::PageIndexPolicy>,
+) -> DataFusionResult<Arc<ParquetMetaData>> {
     let object_store = state.runtime_env().object_store(object_store_url)?;
     let object_path = ObjectPath::from(resolved_path);
     let size = match file_size_bytes {
@@ -1167,8 +1184,232 @@ pub(crate) async fn read_parquet_footer_facts(
             state.runtime_env().cache_manager.get_file_metadata_cache(),
         ))
         .with_decryption_properties(decryption_properties)
+        .with_page_index_policy(page_index_policy)
         .fetch_metadata()
         .await?;
+    Ok(metadata)
+}
+
+/// `array` in buffers of its own size, when it holds less than half of the
+/// buffers it shares: a filter that keeps every row of a reader's batch
+/// returns it whole, buffers sized for a full batch included, so a few rows
+/// kept of a short batch would otherwise hold a full batch's memory.
+fn compact(array: ArrayRef) -> DataFusionResult<ArrayRef> {
+    if array.to_data().get_slice_memory_size()? * 2 >= array.get_array_memory_size() {
+        return Ok(array);
+    }
+    let data = array.to_data();
+    let mut copy = arrow::array::MutableArrayData::new(vec![&data], false, data.len());
+    copy.try_extend(0, 0, data.len())?;
+    Ok(arrow::array::make_array(copy.freeze()))
+}
+
+/// The leaf column of `metadata` holding the embedded `rowid` (tagged with
+/// [`ROW_ID_PARQUET_FIELD_ID`]), when it is a top-level `INT64`: the form
+/// whose statistics order as the ids do.
+fn embedded_row_id_leaf(metadata: &ParquetMetaData) -> Option<usize> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| {
+            let info = column.self_type().get_basic_info();
+            column.path().parts().len() == 1
+                && info.has_id()
+                && info.id() == ROW_ID_PARQUET_FIELD_ID
+                && column.physical_type() == datafusion::parquet::basic::Type::INT64
+        })
+}
+
+/// The `[min, max]` an `INT64` column chunk's statistics record, or `None`
+/// when they record no bounds.
+fn int64_chunk_bounds(
+    chunk: &datafusion::parquet::file::metadata::ColumnChunkMetaData,
+) -> Option<(i64, i64)> {
+    match chunk.statistics()? {
+        datafusion::parquet::file::statistics::Statistics::Int64(stats) => {
+            Some((*stats.min_opt()?, *stats.max_opt()?))
+        },
+        _ => None,
+    }
+}
+
+/// The smallest and largest embedded `rowid` of `metadata`'s row groups, or
+/// `None` when the file embeds none or a row group with rows records no
+/// bounds for them.
+pub(crate) fn embedded_row_id_bounds(metadata: &ParquetMetaData) -> Option<(i64, i64)> {
+    let leaf = embedded_row_id_leaf(metadata)?;
+    let mut bounds: Option<(i64, i64)> = None;
+    for row_group in metadata.row_groups() {
+        if row_group.num_rows() == 0 {
+            continue;
+        }
+        let (min, max) = int64_chunk_bounds(row_group.column(leaf))?;
+        bounds = Some(match bounds {
+            Some((low, high)) => (low.min(min), high.max(max)),
+            None => (min, max),
+        });
+    }
+    bounds
+}
+
+/// Whether some id of `sorted` (ascending) lies in `[min, max]`.
+pub(crate) fn any_id_within(sorted: &[i64], min: i64, max: i64) -> bool {
+    let first = sorted.partition_point(|id| *id < min);
+    sorted.get(first).is_some_and(|id| *id <= max)
+}
+
+/// The rows of a file that may hold an embedded `rowid` of `sorted`
+/// (ascending, distinct), by the `rowid` column's row-group statistics and,
+/// where the file has a page index for it, its page statistics. `None` when
+/// the file has no `INT64` embedded `rowid` column to prune by, so every row
+/// is a candidate.
+///
+/// A row group or page without bounds is a candidate, and a page of only
+/// NULLs is not, since a NULL `rowid` names no row. The selection only skips:
+/// the caller still compares each read id with `sorted`.
+pub(crate) fn embedded_row_id_selection(
+    metadata: &ParquetMetaData,
+    sorted: &[i64],
+) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
+    int64_leaf_selection(metadata, embedded_row_id_leaf(metadata)?, sorted)
+}
+
+/// The leaf column of a delete file's metadata holding its positions: the
+/// top-level `INT64` `pos` column, by its field id where the file records
+/// one, else by name.
+fn delete_pos_leaf(metadata: &ParquetMetaData) -> Option<usize> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| {
+            let info = column.self_type().get_basic_info();
+            column.path().parts().len() == 1
+                && column.physical_type() == datafusion::parquet::basic::Type::INT64
+                && if info.has_id() {
+                    info.id() == DELETE_POS_FIELD_ID
+                } else {
+                    column.name() == DELETE_POS_COL
+                }
+        })
+}
+
+/// The rows of a delete file that may delete one of the positions `sorted`
+/// (ascending, distinct), by its `pos` column's statistics, as
+/// [`embedded_row_id_selection`] selects by `rowid`. `None` when the file has
+/// no `INT64` `pos` column to prune by.
+pub(crate) fn delete_pos_selection(
+    metadata: &ParquetMetaData,
+    sorted: &[i64],
+) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
+    int64_leaf_selection(metadata, delete_pos_leaf(metadata)?, sorted)
+}
+
+/// The rows of `metadata`'s file whose `INT64` column `leaf` may hold a value
+/// of `sorted` (ascending, distinct), by the column's row-group statistics and,
+/// where the file has a page index for it, its page statistics. A row group or
+/// page without bounds is a candidate, a page of only NULLs is not. `None`
+/// when the page index does not describe the row groups consistently.
+fn int64_leaf_selection(
+    metadata: &ParquetMetaData,
+    leaf: usize,
+    sorted: &[i64],
+) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
+    use datafusion::parquet::arrow::arrow_reader::RowSelector;
+    use datafusion::parquet::file::page_index::column_index::ColumnIndexMetaData;
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut push = |select: bool, rows: usize| {
+        if rows == 0 {
+            return;
+        }
+        match selectors.last_mut() {
+            Some(last) if last.skip != select => last.row_count += rows,
+            _ => selectors.push(if select {
+                RowSelector::select(rows)
+            } else {
+                RowSelector::skip(rows)
+            }),
+        }
+    };
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        let rows = usize::try_from(row_group.num_rows()).ok()?;
+        if let Some((min, max)) = int64_chunk_bounds(row_group.column(leaf))
+            && !any_id_within(sorted, min, max)
+        {
+            push(false, rows);
+            continue;
+        }
+        let pages = metadata
+            .column_index()
+            .and_then(|index_of| index_of.get(index)?.get(leaf))
+            .zip(
+                metadata
+                    .offset_index()
+                    .and_then(|offsets| offsets.get(index)?.get(leaf)),
+            );
+        let Some((ColumnIndexMetaData::INT64(stats), offsets)) = pages else {
+            push(true, rows);
+            continue;
+        };
+        let locations = offsets.page_locations();
+        if locations.len() != stats.min_values().len() {
+            push(true, rows);
+            continue;
+        }
+        let starts: Vec<i64> = locations.iter().map(|page| page.first_row_index).collect();
+        let mut at = 0usize;
+        for (page, start) in starts.iter().enumerate() {
+            let end = starts
+                .get(page + 1)
+                .copied()
+                .unwrap_or_else(|| row_group.num_rows());
+            let (Ok(start), Ok(end)) = (usize::try_from(*start), usize::try_from(end)) else {
+                return None;
+            };
+            if start != at || end < start || end > rows {
+                return None;
+            }
+            let candidate = if stats.is_null_page(page) {
+                false
+            } else {
+                match (stats.min_value(page), stats.max_value(page)) {
+                    (Some(min), Some(max)) => any_id_within(sorted, *min, *max),
+                    _ => true,
+                }
+            };
+            push(candidate, end - start);
+            at = end;
+        }
+        if at != rows {
+            return None;
+        }
+    }
+    Some(selectors.into())
+}
+
+/// One file's footer facts, read through [`fetch_parquet_metadata`].
+pub(crate) async fn read_parquet_footer_facts(
+    state: &dyn Session,
+    object_store_url: &ObjectStoreUrl,
+    resolved_path: &str,
+    file_size_bytes: Option<i64>,
+    footer_size: Option<i64>,
+    encryption_key: Option<&str>,
+) -> DataFusionResult<ParquetFooterFacts> {
+    let metadata = fetch_parquet_metadata(
+        state,
+        object_store_url,
+        resolved_path,
+        file_size_bytes,
+        footer_size,
+        encryption_key,
+        None,
+    )
+    .await?;
 
     let field_ids = extract_parquet_field_ids(&metadata);
     let arrow_schema = Arc::new(
@@ -1184,6 +1425,7 @@ pub(crate) async fn read_parquet_footer_facts(
         arrow_schema,
         row_group_count: metadata.row_groups().len(),
         row_count: metadata.file_metadata().num_rows(),
+        embedded_row_id_bounds: embedded_row_id_bounds(&metadata),
     })
 }
 
@@ -1308,6 +1550,7 @@ pub(crate) async fn read_parquet_file_layout(
         drops_current_columns,
         row_group_count: facts.row_group_count,
         row_count: facts.row_count,
+        embedded_row_id_bounds: facts.embedded_row_id_bounds,
     }))
 }
 
@@ -3123,6 +3366,17 @@ impl DuckLakeTable {
         state: &dyn Session,
         delete_file: &DuckLakeFileData,
     ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
+        self.delete_file_scan_selecting(state, delete_file, None)
+    }
+
+    /// [`Self::delete_file_scan`] reading only the rows of `selection`, when
+    /// given, and of them only the pages that hold them.
+    fn delete_file_scan_selecting(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+        selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
+    ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
         let mut pf = PartitionedFile::new(
             &resolved_delete_path,
@@ -3133,12 +3387,26 @@ impl DuckLakeTable {
         }
         // DataSourceExec over our own ParquetSource, which carries the
         // encryption factory.
-        let file_scan_config = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(state, delete_file_read_schema())?),
-        )
-        .with_file_group(FileGroup::new(vec![pf]))
-        .build();
+        let mut source = self.create_parquet_source(state, delete_file_read_schema())?;
+        // A selective read takes only the positions and their snapshots: the
+        // `file_path` column names the one data file every row deletes from.
+        let projection = selection.as_ref().map(|_| vec![1, 2]);
+        if let Some(selection) = selection {
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+            pf = pf.with_extension(
+                datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
+            );
+        }
+        let file_scan_config =
+            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), Arc::new(source))
+                .with_file_group(FileGroup::new(vec![pf]))
+                .with_projection_indices(projection)?
+                .build();
         Ok((
             DataSourceExec::from_data_source(file_scan_config),
             resolved_delete_path,
@@ -3274,17 +3542,170 @@ impl DuckLakeTable {
             .await
     }
 
-    /// Every row of `table_file` as `(position, embedded rowid, embedded
-    /// snapshot)`, reading only those columns, or `None` when the file embeds
-    /// no row ids. With `with_snapshot` (a partial file read at a snapshot
-    /// before its last), the snapshot is read too, a NULL one as `None`; a
-    /// file without the column fails, as official's reader does. Delete files
-    /// are not applied.
-    pub(crate) async fn embedded_row_ids(
+    /// The positions of `candidates` that `table_file` has deleted at this
+    /// table's snapshot: by its live delete file, as of the snapshot, or by
+    /// `inlined`, its inlined deletions. The same positions as
+    /// [`Self::deleted_positions_at_snapshot`] keeps of `candidates`.
+    ///
+    /// With the table's delete memo ([`DuckLakeReadOptions`]) the delete
+    /// file's positions are taken from the memo, or read whole and kept in
+    /// it, as a scan keeps them. Without it, only the row groups and pages of
+    /// the delete file whose `pos` statistics may hold a candidate are read.
+    /// The rows read are counted in `accounting`.
+    pub(crate) async fn deleted_positions_among(
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        inlined: Option<&HashSet<i64>>,
+        candidates: &HashSet<i64>,
+        accounting: &crate::rowid_lookup::RowIdReadAccounting<'_>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        let mut deleted: HashSet<i64> = inlined
+            .map(|inlined| {
+                candidates
+                    .iter()
+                    .filter(|position| inlined.contains(position))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(delete_file) = &table_file.delete_file else {
+            return Ok(deleted);
+        };
+        let read_snapshot = Some(self.snapshot_id);
+        let resolved_path = self.resolve_file_path(delete_file)?;
+        let context = state.task_ctx();
+        #[cfg(feature = "encryption")]
+        let encryption_key = delete_file.encryption_key.as_deref();
+        #[cfg(not(feature = "encryption"))]
+        let encryption_key = None;
+        let metadata = match fetch_parquet_metadata(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved_path,
+            Some(delete_file.file_size_bytes),
+            delete_file.footer_size,
+            encryption_key,
+            Some(datafusion::parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(crate::lazy_delete_filter::classify_delete_file_read_error(
+                    &context,
+                    self.object_store_url.as_ref(),
+                    &resolved_path,
+                    error,
+                )
+                .await);
+            },
+        };
+        let rows = usize::try_from(metadata.file_metadata().num_rows()).unwrap_or(0);
+
+        // The memo serves a file it holds, and keeps one it can hold: such a
+        // file is read whole once. One it cannot hold is read as without a
+        // memo, so a memo over its budget costs no more than none.
+        if let Some(memo) = &self.delete_memo {
+            if let Some(positions) =
+                memo.get(table_file.data_file_id, &resolved_path, read_snapshot)
+            {
+                deleted.extend(
+                    candidates
+                        .iter()
+                        .filter(|position| positions.contains(position)),
+                );
+                return Ok(deleted);
+            }
+            if memo.fits(table_file.data_file_id, &resolved_path, rows) {
+                let (scan, path) = self.delete_file_scan(state, delete_file)?;
+                // What the read holds, charged before it starts: the entries
+                // it collects, a batch at a time, and the set it builds. The
+                // set is the memo's, within the memo's budget, once kept.
+                let entry = std::mem::size_of::<(i64, Option<i64>)>();
+                let batch = state.config().batch_size().saturating_mul(3 * entry);
+                let charge = crate::delete_memo::set_bytes_for(rows)
+                    .saturating_add(rows.saturating_mul(entry))
+                    .saturating_add(batch);
+                accounting.try_grow(charge)?;
+                let read = read_delete_positions(
+                    &scan,
+                    &context,
+                    self.object_store_url.as_ref(),
+                    &path,
+                    read_snapshot,
+                )
+                .await;
+                accounting.shrink(charge);
+                let mut positions = read?;
+                positions.shrink_to_fit();
+                let positions = Arc::new(positions);
+                accounting.decoded(rows);
+                memo.insert(table_file.data_file_id, &path, read_snapshot, &positions);
+                deleted.extend(
+                    candidates
+                        .iter()
+                        .filter(|position| positions.contains(position)),
+                );
+                return Ok(deleted);
+            }
+        }
+
+        let mut sorted: Vec<i64> = candidates.iter().copied().collect();
+        sorted.sort_unstable();
+        let selection = delete_pos_selection(&metadata, &sorted);
+        if selection
+            .as_ref()
+            .is_some_and(|selection| !selection.selects_any())
+        {
+            return Ok(deleted);
+        }
+        let (scan, path) = self.delete_file_scan_selecting(state, delete_file, selection)?;
+        crate::lazy_delete_filter::for_each_delete_batch(
+            &scan,
+            &context,
+            self.object_store_url.as_ref(),
+            &path,
+            |batch, entries| {
+                accounting.decoded(batch.num_rows());
+                // Charged while held; only the candidates' deletions are kept.
+                let held = batch.get_array_memory_size()
+                    + entries.capacity() * std::mem::size_of::<(i64, Option<i64>)>();
+                accounting.try_grow(held)?;
+                deleted.extend(
+                    entries
+                        .into_iter()
+                        .filter(|(position, snapshot)| {
+                            candidates.contains(position)
+                                && snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id)
+                        })
+                        .map(|(position, _)| position),
+                );
+                accounting.shrink(held);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(deleted)
+    }
+
+    /// The rows of `table_file` whose embedded rowid is one of `wanted`, as
+    /// `(position, embedded rowid, embedded snapshot)`, or `None` when the
+    /// file embeds no row ids. With `with_snapshot` (a partial file read at a
+    /// snapshot before its last), the snapshot is read too, a NULL one as
+    /// `None`; a file without the column fails, as official's reader does.
+    /// Delete files are not applied.
+    ///
+    /// Reads only the row groups and pages whose `rowid` statistics may hold
+    /// one of `wanted` ([`embedded_row_id_selection`]), as official's reader
+    /// skips row groups by them, and keeps only the matching rows.
+    pub(crate) async fn embedded_rows_matching(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        wanted: &HashSet<i64>,
         with_snapshot: bool,
+        accounting: &crate::rowid_lookup::RowIdReadAccounting<'_>,
     ) -> DataFusionResult<Option<Vec<(i64, i64, Option<i64>)>>> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         if file_cfg.embedded_rowid_parquet_name.is_none() {
@@ -3292,6 +3713,22 @@ impl DuckLakeTable {
         }
         if with_snapshot && file_cfg.embedded_snapshot_parquet_name.is_none() {
             return Err(missing_snapshot_column(table_file, self.snapshot_id));
+        }
+        let mut sorted: Vec<i64> = wanted.iter().copied().collect();
+        sorted.sort_unstable();
+        if let Some((min, max)) = file_cfg.embedded_row_id_bounds
+            && !any_id_within(&sorted, min, max)
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let selection = self
+            .embedded_row_id_candidates(state, &table_file.file, &sorted)
+            .await?;
+        if selection
+            .as_ref()
+            .is_some_and(|selection| !selection.selects_any())
+        {
+            return Ok(Some(Vec::new()));
         }
         let snapshot_name = file_cfg
             .embedded_snapshot_parquet_name
@@ -3318,16 +3755,27 @@ impl DuckLakeTable {
             proj.push(read_schema.fields().len() - 1);
         }
         proj.push(pos_table_idx);
-        let source = self.create_parquet_source(state, table_schema)?;
+        let mut file = self.partitioned_file(&table_file.file)?;
+        let mut source = self.create_parquet_source(state, table_schema)?;
+        if let Some(selection) = selection {
+            // The offset index tells the reader which pages hold the selected
+            // rows, so only those are fetched and decoded.
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+            file = file.with_extension(
+                datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
+            );
+        }
         let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
             self.scan_config_builder(Arc::new(source))
-                .with_file_group(FileGroup::new(vec![
-                    self.partitioned_file(&table_file.file)?,
-                ]))
+                .with_file_group(FileGroup::new(vec![file]))
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
         let int64 = |batch: &RecordBatch, index: usize| -> DataFusionResult<Int64Array> {
             let column = arrow::compute::cast(batch.column(index), &DataType::Int64)?;
             Ok(column
@@ -3337,15 +3785,22 @@ impl DuckLakeTable {
                 .clone())
         };
         let mut rows = Vec::new();
-        for batch in &batches {
-            let row_ids = int64(batch, 0)?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            accounting.decoded(batch.num_rows());
+            // Charged while held; the rows kept of it are charged below.
+            let held = batch.get_array_memory_size();
+            accounting.try_grow(held)?;
+            let before = rows.len();
+            let row_ids = int64(&batch, 0)?;
             let snapshots = snapshot_name
                 .is_some()
-                .then(|| int64(batch, 1))
+                .then(|| int64(&batch, 1))
                 .transpose()?;
-            let positions = int64(batch, batch.num_columns() - 1)?;
+            let positions = int64(&batch, batch.num_columns() - 1)?;
             for row in 0..batch.num_rows() {
-                if row_ids.is_null(row) {
+                if row_ids.is_null(row) || !wanted.contains(&row_ids.value(row)) {
                     continue;
                 }
                 let snapshot = snapshots
@@ -3353,8 +3808,39 @@ impl DuckLakeTable {
                     .and_then(|snapshots| snapshots.is_valid(row).then(|| snapshots.value(row)));
                 rows.push((positions.value(row), row_ids.value(row), snapshot));
             }
+            accounting.shrink(held);
+            accounting
+                .try_grow((rows.len() - before) * std::mem::size_of::<(i64, i64, Option<i64>)>())?;
         }
         Ok(Some(rows))
+    }
+
+    /// The rows of `file` whose embedded `rowid` statistics may hold one of
+    /// `sorted` ([`embedded_row_id_selection`]), from its footer and page
+    /// index, kept in the session's file-metadata cache. `None` when the
+    /// file has nothing to prune by.
+    async fn embedded_row_id_candidates(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+        sorted: &[i64],
+    ) -> DataFusionResult<Option<datafusion::parquet::arrow::arrow_reader::RowSelection>> {
+        let resolved_path = self.resolve_file_path(file)?;
+        #[cfg(feature = "encryption")]
+        let encryption_key = file.encryption_key.as_deref();
+        #[cfg(not(feature = "encryption"))]
+        let encryption_key = None;
+        let metadata = fetch_parquet_metadata(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved_path,
+            Some(file.file_size_bytes),
+            file.footer_size,
+            encryption_key,
+            Some(datafusion::parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .await?;
+        Ok(embedded_row_id_selection(&metadata, sorted))
     }
 
     /// The positions of `table_file` holding a row not visible at this
@@ -3367,6 +3853,20 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+    ) -> DataFusionResult<HashSet<i64>> {
+        self.positions_inserted_later_among(state, table_file, None, None)
+            .await
+    }
+
+    /// [`Self::positions_inserted_later`] among `among` alone, when given:
+    /// only the pages holding those positions are read. The rows read are
+    /// counted in `accounting`.
+    pub(crate) async fn positions_inserted_later_among(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        among: Option<&HashSet<i64>>,
+        accounting: Option<&crate::rowid_lookup::RowIdReadAccounting<'_>>,
     ) -> DataFusionResult<HashSet<i64>> {
         if table_file
             .partial_max
@@ -3388,18 +3888,41 @@ impl DuckLakeTable {
                 .iter()
                 .map(|field| field.name().as_str()),
         );
-        let source = self.create_parquet_source(state, table_schema)?;
+        let mut source = self.create_parquet_source(state, table_schema)?;
+        let mut file = self.partitioned_file(&table_file.file)?;
+        if let Some(among) = among {
+            // Sized from the footer, so the selection covers exactly the
+            // file's physical rows.
+            let rows = file_cfg.row_count;
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+            file = file.with_extension(
+                datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(
+                    crate::rowid_lookup::positions_selection(among, rows),
+                ),
+            );
+        }
         let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
             self.scan_config_builder(Arc::new(source))
-                .with_file_group(FileGroup::new(vec![
-                    self.partitioned_file(&table_file.file)?,
-                ]))
+                .with_file_group(FileGroup::new(vec![file]))
                 .with_projection_indices(Some(vec![read_schema.fields().len() - 1, pos_table_idx]))?
                 .build(),
         );
-        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
         let mut later = HashSet::new();
-        for batch in &batches {
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            let held = batch.get_array_memory_size();
+            if let Some(accounting) = accounting {
+                accounting.decoded(batch.num_rows());
+                // Charged while held.
+                accounting.try_grow(held)?;
+            }
+            let batch = &batch;
             let snapshots = arrow::compute::cast(batch.column(0), &DataType::Int64)?;
             let snapshots = snapshots
                 .as_any()
@@ -3414,6 +3937,9 @@ impl DuckLakeTable {
                 if snapshots.is_null(row) || snapshots.value(row) > self.snapshot_id {
                     later.insert(positions.value(row));
                 }
+            }
+            if let Some(accounting) = accounting {
+                accounting.shrink(held);
             }
         }
         Ok(later)
@@ -3431,7 +3957,9 @@ impl DuckLakeTable {
         positions: &HashSet<i64>,
         inlined: Option<&HashSet<i64>>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
-        let later = self.positions_inserted_later(state, table_file).await?;
+        let later = self
+            .positions_inserted_later_among(state, table_file, Some(positions), None)
+            .await?;
         // Read only the pages that hold `positions`: a lookup of a few rows
         // should not decode the whole file. The selection must cover exactly
         // the file's physical rows, so it is sized from the footer (cached
@@ -3484,6 +4012,7 @@ impl DuckLakeTable {
         table_file: &DuckLakeTableFile,
         positions: &HashSet<i64>,
         columns: &[usize],
+        accounting: &crate::rowid_lookup::RowIdReadAccounting<'_>,
     ) -> DataFusionResult<Vec<(Vec<ArrayRef>, Int64Array)>> {
         // The selection must cover exactly the file's physical rows, so it is
         // sized from the footer (kept by the table after the first read), not
@@ -3554,48 +4083,76 @@ impl DuckLakeTable {
                     .with_defaults(defaults),
             );
         }
-        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
-        let mut out = Vec::with_capacity(batches.len());
-        for batch in &batches {
-            let read_positions =
-                arrow::compute::cast(batch.column(columns.len()), &DataType::Int64)?;
-            let read_positions = read_positions
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("physical-position column is not Int64".into())
-                })?;
-            // The selection names exactly `positions`; the filter keeps that
-            // true whatever rows the reader returns around them.
-            let keep = BooleanArray::from(
-                read_positions
-                    .values()
-                    .iter()
-                    .map(|position| positions.contains(position))
-                    .collect::<Vec<_>>(),
-            );
-            if keep.true_count() == 0 {
-                continue;
+        let mut out = Vec::new();
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            let batch = batch?;
+            accounting.decoded(batch.num_rows());
+            // Charged while the batch is held; what it keeps is charged
+            // below, once filtered.
+            let held = batch.get_array_memory_size();
+            accounting.try_grow(held)?;
+            let kept = self.keep_read_positions(&batch, positions, columns);
+            accounting.shrink(held);
+            if let Some((values, kept)) = kept? {
+                accounting.try_grow(
+                    values
+                        .iter()
+                        .map(|column| column.get_array_memory_size())
+                        .sum::<usize>()
+                        + kept.get_array_memory_size(),
+                )?;
+                out.push((values, kept));
             }
-            let mut values = Vec::with_capacity(columns.len());
-            for (output, &index) in columns.iter().enumerate() {
-                let column = arrow::compute::filter(batch.column(output), &keep)?;
-                values.push(crate::column_rename::coerce_column(
-                    &column,
-                    self.physical_schema.field(index).data_type(),
-                )?);
-            }
-            let kept = arrow::compute::filter(read_positions, &keep)?;
-            let kept = kept
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("physical-position column is not Int64".into())
-                })?
-                .clone();
-            out.push((values, kept));
         }
         Ok(out)
+    }
+
+    /// The rows of `batch` (read columns `columns`, then the position) at one
+    /// of `positions`, under the table's types, with their positions; `None`
+    /// when it holds none.
+    fn keep_read_positions(
+        &self,
+        batch: &RecordBatch,
+        positions: &HashSet<i64>,
+        columns: &[usize],
+    ) -> DataFusionResult<Option<(Vec<ArrayRef>, Int64Array)>> {
+        let read_positions = arrow::compute::cast(batch.column(columns.len()), &DataType::Int64)?;
+        let read_positions = read_positions
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("physical-position column is not Int64".into())
+            })?;
+        // The selection names exactly `positions`; the filter keeps that
+        // true whatever rows the reader returns around them.
+        let keep = BooleanArray::from(
+            read_positions
+                .values()
+                .iter()
+                .map(|position| positions.contains(position))
+                .collect::<Vec<_>>(),
+        );
+        if keep.true_count() == 0 {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(columns.len());
+        for (output, &index) in columns.iter().enumerate() {
+            let column = arrow::compute::filter(batch.column(output), &keep)?;
+            values.push(compact(crate::column_rename::coerce_column(
+                &column,
+                self.physical_schema.field(index).data_type(),
+            )?)?);
+        }
+        let kept = compact(arrow::compute::filter(read_positions, &keep)?)?;
+        let kept = kept
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("physical-position column is not Int64".into())
+            })?
+            .clone();
+        Ok(Some((values, kept)))
     }
 
     /// Roll one scan group's per-file catalog statistics up into the group- and
@@ -4499,6 +5056,7 @@ impl DuckLakeTable {
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
             drops_current_columns: layout.drops_current_columns,
             row_count: layout.row_count,
+            embedded_row_id_bounds: layout.embedded_row_id_bounds,
         });
 
         {
@@ -7922,6 +8480,7 @@ mod tests {
             embedded_snapshot_parquet_name: None,
             drops_current_columns: false,
             row_count: 0,
+            embedded_row_id_bounds: None,
         };
         let id_index = table.physical_schema.index_of("id").unwrap();
 

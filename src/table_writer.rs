@@ -30,7 +30,7 @@ use crate::metadata_writer::{
 };
 use crate::path_resolver::{join_paths, parse_object_store_url};
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
-use crate::table::delete_file_schema;
+use crate::table::{DELETE_POS_COL, delete_file_schema};
 use crate::write_encoding::{DataFileProperties, RowGroupSampledWriter};
 
 // The partition-group shape is shared with the split logic in `partition`.
@@ -2048,9 +2048,16 @@ impl DuckLakeTableWriter {
 
         // Stream to a local staging file, then multipart-upload it — the same
         // bounded-memory path `finish()` uses for data files.
+        // Positions are distinct, so a dictionary of them only grows the file,
+        // and a reader must fetch that dictionary whole to decode any page of
+        // them, which defeats reading the few pages a lookup needs.
         let props = WriterProperties::builder()
             .set_writer_version(self.writer_version)
             .set_compression(self.compression)
+            .set_column_dictionary_enabled(
+                parquet::schema::types::ColumnPath::from(DELETE_POS_COL),
+                false,
+            )
             .build();
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);

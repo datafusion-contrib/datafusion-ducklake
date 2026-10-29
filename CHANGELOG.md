@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `read_columns_by_rowid_with` and `RowIdReadOptions`: a rowid read that charges the batches it
+  holds and its result to a DataFusion `MemoryReservation`; `RowsByRowId::rows_decoded`.
 - `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`,
   and per-column `column_options` (`ColumnWriteOptions`: page size, codec, dictionary, encoding):
   Parquet writer settings for every data file a write produces. A library extension.
@@ -97,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `read_columns_by_rowid` and `locate_rowids` skip row groups and pages of a merged or rewritten
+  file by its `rowid` statistics instead of decoding its whole `rowid` column on every call.
+- A rowid lookup reads only the delete-file pages that may hold its rows' positions, or takes them
+  from the table's delete memo; delete files are written without a dictionary on `pos`, as official.
 - `read_rows_by_rowid` reads only the pages holding the requested rows instead of decoding
   each file that holds one; results are unchanged.
 - **BREAKING**: opening or initializing a writer never migrates; one an earlier release created
