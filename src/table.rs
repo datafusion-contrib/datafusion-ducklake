@@ -1273,10 +1273,54 @@ pub(crate) fn embedded_row_id_selection(
     metadata: &ParquetMetaData,
     sorted: &[i64],
 ) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
+    int64_leaf_selection(metadata, embedded_row_id_leaf(metadata)?, sorted)
+}
+
+/// The leaf column of a delete file's metadata holding its positions: the
+/// top-level `INT64` `pos` column, by its field id where the file records
+/// one, else by name.
+fn delete_pos_leaf(metadata: &ParquetMetaData) -> Option<usize> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| {
+            let info = column.self_type().get_basic_info();
+            column.path().parts().len() == 1
+                && column.physical_type() == datafusion::parquet::basic::Type::INT64
+                && if info.has_id() {
+                    info.id() == DELETE_POS_FIELD_ID
+                } else {
+                    column.name() == DELETE_POS_COL
+                }
+        })
+}
+
+/// The rows of a delete file that may delete one of the positions `sorted`
+/// (ascending, distinct), by its `pos` column's statistics, as
+/// [`embedded_row_id_selection`] selects by `rowid`. `None` when the file has
+/// no `INT64` `pos` column to prune by.
+pub(crate) fn delete_pos_selection(
+    metadata: &ParquetMetaData,
+    sorted: &[i64],
+) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
+    int64_leaf_selection(metadata, delete_pos_leaf(metadata)?, sorted)
+}
+
+/// The rows of `metadata`'s file whose `INT64` column `leaf` may hold a value
+/// of `sorted` (ascending, distinct), by the column's row-group statistics and,
+/// where the file has a page index for it, its page statistics. A row group or
+/// page without bounds is a candidate, a page of only NULLs is not. `None`
+/// when the page index does not describe the row groups consistently.
+fn int64_leaf_selection(
+    metadata: &ParquetMetaData,
+    leaf: usize,
+    sorted: &[i64],
+) -> Option<datafusion::parquet::arrow::arrow_reader::RowSelection> {
     use datafusion::parquet::arrow::arrow_reader::RowSelector;
     use datafusion::parquet::file::page_index::column_index::ColumnIndexMetaData;
 
-    let leaf = embedded_row_id_leaf(metadata)?;
     let mut selectors: Vec<RowSelector> = Vec::new();
     let mut push = |select: bool, rows: usize| {
         if rows == 0 {
@@ -3322,6 +3366,17 @@ impl DuckLakeTable {
         state: &dyn Session,
         delete_file: &DuckLakeFileData,
     ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
+        self.delete_file_scan_selecting(state, delete_file, None)
+    }
+
+    /// [`Self::delete_file_scan`] reading only the rows of `selection`, when
+    /// given, and of them only the pages that hold them.
+    fn delete_file_scan_selecting(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+        selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
+    ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
         let mut pf = PartitionedFile::new(
             &resolved_delete_path,
@@ -3332,12 +3387,26 @@ impl DuckLakeTable {
         }
         // DataSourceExec over our own ParquetSource, which carries the
         // encryption factory.
-        let file_scan_config = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(state, delete_file_read_schema())?),
-        )
-        .with_file_group(FileGroup::new(vec![pf]))
-        .build();
+        let mut source = self.create_parquet_source(state, delete_file_read_schema())?;
+        // A selective read takes only the positions and their snapshots: the
+        // `file_path` column names the one data file every row deletes from.
+        let projection = selection.as_ref().map(|_| vec![1, 2]);
+        if let Some(selection) = selection {
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                crate::rowid_lookup::PageIndexReaderFactory(cached_parquet_reader_factory(
+                    state,
+                    self.object_store_url.as_ref(),
+                )?),
+            ));
+            pf = pf.with_extension(
+                datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection),
+            );
+        }
+        let file_scan_config =
+            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), Arc::new(source))
+                .with_file_group(FileGroup::new(vec![pf]))
+                .with_projection_indices(projection)?
+                .build();
         Ok((
             DataSourceExec::from_data_source(file_scan_config),
             resolved_delete_path,
@@ -3471,6 +3540,110 @@ impl DuckLakeTable {
     ) -> DataFusionResult<HashSet<i64>> {
         self.deleted_positions_for_file(state, table_file, inlined)
             .await
+    }
+
+    /// The positions of `candidates` that `table_file` has deleted at this
+    /// table's snapshot: by its live delete file, as of the snapshot, or by
+    /// `inlined`, its inlined deletions. The same positions as
+    /// [`Self::deleted_positions_at_snapshot`] keeps of `candidates`.
+    ///
+    /// With the table's delete memo ([`DuckLakeReadOptions`]) the delete
+    /// file's positions are taken from the memo, or read whole and kept in
+    /// it, as a scan keeps them. Without it, only the row groups and pages of
+    /// the delete file whose `pos` statistics may hold a candidate are read.
+    /// The rows read are counted in `accounting`.
+    pub(crate) async fn deleted_positions_among(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        inlined: Option<&HashSet<i64>>,
+        candidates: &HashSet<i64>,
+        accounting: &crate::rowid_lookup::RowIdReadAccounting<'_>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        let mut deleted: HashSet<i64> = inlined
+            .map(|inlined| {
+                candidates
+                    .iter()
+                    .filter(|position| inlined.contains(position))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(delete_file) = &table_file.delete_file else {
+            return Ok(deleted);
+        };
+        let read_snapshot = Some(self.snapshot_id);
+        if let Some(memo) = &self.delete_memo {
+            let (scan, path) = self.delete_file_scan(state, delete_file)?;
+            let positions = match memo.get(table_file.data_file_id, &path, read_snapshot) {
+                Some(positions) => positions,
+                None => {
+                    let positions = Arc::new(
+                        read_delete_positions(
+                            &scan,
+                            &state.task_ctx(),
+                            self.object_store_url.as_ref(),
+                            &path,
+                            read_snapshot,
+                        )
+                        .await?,
+                    );
+                    accounting.decoded(positions.len());
+                    memo.insert(table_file.data_file_id, &path, read_snapshot, &positions);
+                    positions
+                },
+            };
+            deleted.extend(
+                candidates
+                    .iter()
+                    .filter(|position| positions.contains(position)),
+            );
+            return Ok(deleted);
+        }
+
+        let mut sorted: Vec<i64> = candidates.iter().copied().collect();
+        sorted.sort_unstable();
+        let resolved_path = self.resolve_file_path(delete_file)?;
+        #[cfg(feature = "encryption")]
+        let encryption_key = delete_file.encryption_key.as_deref();
+        #[cfg(not(feature = "encryption"))]
+        let encryption_key = None;
+        let metadata = fetch_parquet_metadata(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved_path,
+            Some(delete_file.file_size_bytes),
+            delete_file.footer_size,
+            encryption_key,
+            Some(datafusion::parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .await?;
+        let selection = delete_pos_selection(&metadata, &sorted);
+        if selection
+            .as_ref()
+            .is_some_and(|selection| !selection.selects_any())
+        {
+            return Ok(deleted);
+        }
+        let (scan, path) = self.delete_file_scan_selecting(state, delete_file, selection)?;
+        let entries = read_delete_entries(
+            &scan,
+            &state.task_ctx(),
+            self.object_store_url.as_ref(),
+            &path,
+        )
+        .await?;
+        accounting.decoded(entries.len());
+        deleted.extend(
+            entries
+                .into_iter()
+                .filter(|(position, snapshot)| {
+                    candidates.contains(position)
+                        && snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id)
+                })
+                .map(|(position, _)| position),
+        );
+        Ok(deleted)
     }
 
     /// The rows of `table_file` whose embedded rowid is one of `wanted`, as

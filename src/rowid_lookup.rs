@@ -455,8 +455,9 @@ impl DuckLakeTable {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        let positions: HashSet<i64> = candidates.iter().map(|(position, _)| *position).collect();
         let deleted = self
-            .deleted_positions_at_snapshot(state, file, inlined)
+            .deleted_positions_among(state, file, inlined, &positions, accounting)
             .await
             .map_err(df_error)?;
         Ok(candidates
@@ -581,11 +582,13 @@ pub struct RowsByRowId {
     /// The requested columns of the rows found, under the table's names and
     /// types, in the order their `rowid`s were first requested.
     pub batch: RecordBatch,
-    /// The rows read out of data files to find and read these rows: of a
-    /// file that embeds `rowid`s, every row of the pages whose `rowid`
-    /// statistics may hold a requested id; of a merged file read at an
-    /// earlier snapshot, the requested rows' snapshots; and the requested
-    /// rows' columns. A measure of the read's work, not of its result: the
+    /// The rows read out of data and delete files to find and read these
+    /// rows: of a file that embeds `rowid`s, every row of the pages whose
+    /// `rowid` statistics may hold a requested id; of a merged file read at an
+    /// earlier snapshot, the requested rows' snapshots; of a delete file, the
+    /// rows of the pages whose `pos` statistics may hold a requested row's
+    /// position, or every row when the table's delete memo first reads it;
+    /// and the requested rows' columns. A measure of the read's work, not of its result: the
     /// pages holding these rows are decoded whole.
     pub rows_decoded: u64,
 }

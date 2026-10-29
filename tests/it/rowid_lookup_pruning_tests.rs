@@ -21,9 +21,9 @@ use datafusion::execution::memory_pool::{
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeError, DuckLakeTable, DuckLakeWriteOptions, MergeOptions,
-    MetadataProvider, MetadataWriter, RewriteOptions, RowIdReadOptions, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode, execute_ducklake_sql,
+    DuckLakeCatalog, DuckLakeError, DuckLakeReadOptions, DuckLakeTable, DuckLakeWriteOptions,
+    MergeOptions, MetadataProvider, MetadataWriter, RewriteOptions, RowIdReadOptions,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode, execute_ducklake_sql,
 };
 use tempfile::TempDir;
 
@@ -198,6 +198,15 @@ impl Lake {
 /// A session reading `provider`'s catalog at `snapshot` through a
 /// byte-counting store, and the table `main.t` with its `rowid`.
 async fn reader(provider: &Arc<dyn MetadataProvider>, snapshot: i64) -> Reader {
+    reader_with(provider, snapshot, DuckLakeReadOptions::default()).await
+}
+
+/// [`reader`] with `options` on the catalog.
+async fn reader_with(
+    provider: &Arc<dyn MetadataProvider>,
+    snapshot: i64,
+    options: DuckLakeReadOptions,
+) -> Reader {
     {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
         let store = Arc::new(ByteCountingStore::new());
@@ -207,7 +216,8 @@ async fn reader(provider: &Arc<dyn MetadataProvider>, snapshot: i64) -> Reader {
         );
         let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(provider), snapshot)
             .unwrap()
-            .with_row_lineage(true);
+            .with_row_lineage(true)
+            .with_read_options(options);
         ctx.register_catalog("lake", Arc::new(catalog));
         let table = downcast(&ctx).await;
         Reader {
@@ -716,6 +726,92 @@ mod official_history {
     }
 }
 
+/// A merged file with 100,000 of its 200,000 rows deleted, its delete file
+/// several pages long: a lookup of two rows near the start reads the delete
+/// file's first page, not all of it, and with the table's delete memo a
+/// second lookup reads no delete row at all. Both find the same rows, the
+/// deleted ones missing. Guards against a lookup whose delete-file read grows
+/// with the table's deletions rather than with the rows asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lookup_reads_only_the_deletes_it_needs() {
+    let lake = Lake::new(0).await;
+    for insert in 0..10 {
+        lake.insert(insert * INSERT_ROWS, INSERT_ROWS).await;
+    }
+    lake.merge().await;
+    // About half the rows, scattered: `k` scatters the ids.
+    lake.sql("DELETE FROM lake.main.t WHERE k % 2 = 0").await;
+    let reader = lake.reader(lake.head()).await;
+    let truth = reader.truth().await;
+    let deleted = 200_000 - truth.len() as u64;
+    assert!(deleted > 90_000, "{deleted} rows deleted");
+    // Two live rows and one deleted one, all among the file's first rows.
+    let live: Vec<i64> = truth.keys().copied().take(2).collect();
+    let gone = (0..).find(|id| !truth.contains_key(id)).unwrap();
+    let wanted = [live[0], gone, live[1]];
+    let delete_file_bytes = reader.table.files().unwrap()[0]
+        .delete_file
+        .as_ref()
+        .expect("the merged file has a delete file")
+        .file_size_bytes as u64;
+    let state = reader.ctx.state();
+    // The first read takes the footers, which later reads keep.
+    reader
+        .table
+        .read_columns_by_rowid(&state, &wanted, None)
+        .await
+        .unwrap();
+    reader.store.take();
+    let read = reader
+        .table
+        .read_columns_by_rowid(&state, &wanted, None)
+        .await
+        .unwrap();
+    let bytes = reader.store.take();
+    let pruned_bytes = bytes;
+    assert_eq!(read.row_ids, live);
+    assert!(
+        bytes * 2 < delete_file_bytes,
+        "read {bytes} bytes, the delete file is {delete_file_bytes}"
+    );
+    assert!(
+        read.rows_decoded * 3 < deleted,
+        "decoded {} rows, the delete file holds {deleted}",
+        read.rows_decoded
+    );
+
+    let memoized = reader_with(&lake.provider, lake.head(), DuckLakeReadOptions::memoized()).await;
+    let state = memoized.ctx.state();
+    let first = memoized
+        .table
+        .read_columns_by_rowid(&state, &wanted, None)
+        .await
+        .unwrap();
+    assert_eq!(first.row_ids, live);
+    assert!(
+        first.rows_decoded >= deleted,
+        "the memo reads the file whole"
+    );
+    memoized.store.take();
+    let again = memoized
+        .table
+        .read_columns_by_rowid(&state, &wanted, None)
+        .await
+        .unwrap();
+    let bytes = memoized.store.take();
+    assert_eq!(again.row_ids, live);
+    assert_eq!(again.batch, first.batch);
+    assert!(
+        bytes < pruned_bytes,
+        "read {bytes} bytes with the positions kept, {pruned_bytes} without"
+    );
+    assert!(
+        again.rows_decoded <= (wanted.len() * (PAGE_ROWS + 1)) as u64,
+        "decoded {} rows with the positions kept",
+        again.rows_decoded
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
@@ -821,9 +917,26 @@ async fn measure_rowid_lookup_on_a_merged_file() {
         lake.insert(insert * rows / inserts, rows / inserts).await;
     }
     lake.merge().await;
-    let reader = lake.reader(lake.head()).await;
+    // `ROWIDS_MEASURE_DELETES=1` deletes every third row first, and
+    // `ROWIDS_MEASURE_MEMO=1` reads with a 64 MiB delete memo.
+    let deletes = std::env::var("ROWIDS_MEASURE_DELETES").is_ok();
+    if deletes {
+        lake.sql("DELETE FROM lake.main.t WHERE id % 3 = 0").await;
+    }
+    let options = if std::env::var("ROWIDS_MEASURE_MEMO").is_ok() {
+        DuckLakeReadOptions::default().with_delete_memo(64 << 20)
+    } else {
+        DuckLakeReadOptions::default()
+    };
+    let reader = reader_with(&lake.provider, lake.head(), options).await;
     let file = reader.table.files().unwrap()[0].file.file_size_bytes;
-    let wanted: Vec<i64> = (0..10).map(|i| 1_234 + i * (rows / 10)).collect();
+    let wanted: Vec<i64> = if deletes {
+        let truth = reader.truth().await;
+        let ids: Vec<i64> = truth.keys().copied().collect();
+        (0..10).map(|i| ids[1_234 + i * (ids.len() / 10)]).collect()
+    } else {
+        (0..10).map(|i| 1_234 + i * (rows / 10)).collect()
+    };
     let state = reader.ctx.state();
     let first = reader
         .table
