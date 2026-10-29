@@ -1711,3 +1711,79 @@ async fn sql_create_table_as_select_commits_rows_in_one_snapshot() {
         vec![Some("one"), Some("three")]
     );
 }
+
+/// Building a table reads no file's column statistics: a roll-up of
+/// `ducklake_file_column_stats` grows with every file the table holds (#404).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn building_a_table_reads_no_file_column_stats() {
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::common::stats::Precision;
+    use testcontainers::ImageExt;
+
+    let container = Postgres::default()
+        .with_cmd(["-c", "fsync=off", "-c", "shared_preload_libraries=pg_stat_statements"])
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let conn_str = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool = PgPool::connect(&conn_str).await.unwrap();
+    sqlx::query("CREATE EXTENSION pg_stat_statements")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let writer = PostgresSingleCatalogMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap()
+        .with_data_inlining_row_limit(0);
+    let tmp = TempDir::new().unwrap();
+    let data_path = tmp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer), object_store()).unwrap();
+    tw.write_table("main", "t", &[batch(vec![1, 2], vec![Some("a"), None])])
+        .await
+        .unwrap();
+    for id in 3..6 {
+        tw.append_table("main", "t", &[batch(vec![id], vec![Some("b")])])
+            .await
+            .unwrap();
+    }
+
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let schema = catalog.schema("main").unwrap();
+    sqlx::query("SELECT pg_stat_statements_reset()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let table = schema.table("t").await.unwrap().unwrap();
+    let file_column_stats_reads: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(calls), 0)::BIGINT FROM pg_stat_statements
+         WHERE query LIKE '%ducklake_file_column_stats%'
+           AND query NOT LIKE '%pg_stat_statements%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        file_column_stats_reads, 0,
+        "building a table must not read ducklake_file_column_stats"
+    );
+
+    // The table's size comes from `ducklake_table_stats`; no per-column size
+    // is summed over its files.
+    let statistics = table.statistics().expect("table statistics");
+    assert!(matches!(
+        statistics.total_byte_size,
+        Precision::Inexact(bytes) if bytes > 0
+    ));
+    assert!(
+        statistics
+            .column_statistics
+            .iter()
+            .all(|column| column.byte_size == Precision::Absent)
+    );
+}

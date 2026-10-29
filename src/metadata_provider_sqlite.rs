@@ -2040,47 +2040,6 @@ impl MetadataProvider for SqliteMetadataProvider {
                 Err(error) if is_missing_statistics_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
-            let column_sizes = match sqlx::query(
-                "SELECT stats.column_id,
-                        CASE
-                          WHEN COUNT(*) = COUNT(stats.column_size_bytes)
-                           AND COUNT(*) = (
-                             SELECT COUNT(*) FROM ducklake_data_file visible
-                             WHERE visible.table_id = ?
-                               AND ? >= visible.begin_snapshot
-                               AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
-                           )
-                          THEN CAST(SUM(stats.column_size_bytes) AS INTEGER)
-                        END
-                 FROM ducklake_file_column_stats stats
-                 INNER JOIN ducklake_data_file data
-                   ON data.data_file_id = stats.data_file_id
-                  AND data.table_id = stats.table_id
-                 WHERE stats.table_id = ?
-                   AND ? >= data.begin_snapshot
-                   AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
-                 GROUP BY stats.column_id",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *self.connection().await?)
-            .await
-            {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter_map(|row| match row.try_get::<Option<i64>, _>(1) {
-                        Ok(Some(size)) => Some(row.try_get(0).map(|column_id| (column_id, size))),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error)),
-                    })
-                    .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
-                Err(error) => return Err(error.into()),
-            };
             let bounds_are_exact: bool = sqlx::query_scalar(
                 "SELECT NOT EXISTS (
                      SELECT 1 FROM ducklake_delete_file
@@ -2112,7 +2071,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
                             contains_nan: row.try_get(4)?,
-                            column_size_bytes: column_sizes.get(&column_id).copied(),
+                            column_size_bytes: None,
                             bounds_are_exact,
                         })
                     })

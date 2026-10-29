@@ -425,9 +425,9 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     )"#,
     // Postgres needs an index here that the DuckLake spec does not define. Every
     // planning read of this table filters `table_id` for equality and then walks
-    // `data_file_id` as a range — the statistics page query and the column-size
-    // roll-up in `MulticatalogProvider`, and the per-commit recomputation in this
-    // writer — so without one a catalog pays a sequential scan of the whole table
+    // `data_file_id` as a range — the statistics page query in
+    // `MulticatalogProvider` and the per-commit recomputation in this writer — so
+    // without one a catalog pays a sequential scan of the whole table
     // on the planning path of every query, growing with the number of data files
     // ever written. The official extension leaves this to the operator on Postgres:
     // duckdb/ducklake#1147 taught its filter pushdown to use such an index but
@@ -437,8 +437,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // Column order follows the predicates rather than convention: `table_id` is the
     // only equality, `data_file_id` is the only range (and the join key), and
     // `column_id` costs 8 bytes and lets the planner satisfy the `ORDER BY` without
-    // a sort. `column_size_bytes` rides in INCLUDE so the roll-up query, which
-    // projects nothing else from this table, can be served index-only.
+    // a sort. `column_size_bytes` rides in INCLUDE for a column-size roll-up that
+    // building a table no longer runs (#404); dropping it changes the layout.
     // `min_value` / `max_value` stay out on purpose: other clients writing the
     // same catalog bound their length by their own rules, and an INCLUDE payload
     // can be compressed but never moved out of line, so a wide pair would exceed

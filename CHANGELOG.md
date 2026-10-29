@@ -99,6 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Building a table no longer sums every file's column sizes; table-level column `byte_size` in
+  `statistics()` is now absent on built-in providers (#404).
 - `read_columns_by_rowid` and `locate_rowids` skip row groups and pages of a merged or rewritten
   file by its `rowid` statistics instead of decoding its whole `rowid` column on every call.
 - A rowid lookup reads only the delete-file pages that may hold its rows' positions, or takes them
