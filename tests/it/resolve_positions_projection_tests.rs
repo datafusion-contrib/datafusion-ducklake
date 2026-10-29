@@ -81,20 +81,20 @@ const NARROW_FRACTION: u64 = 20;
 /// (column chunks) and `get_opts` (single ranges, and `get_range`, whose
 /// default implementation goes through it).
 #[derive(Debug)]
-struct ByteCountingStore {
+pub(crate) struct ByteCountingStore {
     inner: Arc<dyn object_store::ObjectStore>,
     bytes: AtomicU64,
 }
 
 impl ByteCountingStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(LocalFileSystem::new()),
             bytes: AtomicU64::new(0),
         }
     }
 
-    fn take(&self) -> u64 {
+    pub(crate) fn take(&self) -> u64 {
         self.bytes.swap(0, Ordering::SeqCst)
     }
 }

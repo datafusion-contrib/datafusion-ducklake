@@ -26,9 +26,12 @@
 //! Only top-level columns are tuned. Nested columns, booleans, intervals and
 //! dictionary-typed arrays keep arrow-rs's defaults, as do fixed-length byte
 //! array columns under Parquet V1, where arrow-rs writes no dictionary for them.
+//! A column whose dictionary the caller set ([`DataFileProperties::dictionary_set`])
+//! is not tuned either: it keeps the caller's setting and gets no bloom filter.
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::{DataType, SchemaRef};
@@ -156,6 +159,23 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
     Ok(distinct.len())
 }
 
+/// The writer properties a data file starts from, and the top-level columns
+/// whose dictionary the caller set, which [`props_for_row_group`] leaves alone.
+#[derive(Clone, Debug)]
+pub(crate) struct DataFileProperties {
+    pub(crate) props: WriterProperties,
+    pub(crate) dictionary_set: Arc<HashSet<String>>,
+}
+
+impl From<WriterProperties> for DataFileProperties {
+    fn from(props: WriterProperties) -> Self {
+        Self {
+            props,
+            dictionary_set: Arc::default(),
+        }
+    }
+}
+
 /// The rows `base` puts in a full row group.
 fn row_group_rows(base: &WriterProperties) -> usize {
     base.max_row_group_row_count()
@@ -167,9 +187,11 @@ fn row_group_rows(base: &WriterProperties) -> usize {
 /// all of them when there are fewer. Columns are matched by position; the batches
 /// carry the file's full parquet schema.
 pub(crate) fn props_for_row_group(
-    base: &WriterProperties,
+    base: &DataFileProperties,
     buffered: &[RecordBatch],
 ) -> Result<WriterProperties> {
+    let dictionary_set = &base.dictionary_set;
+    let base = &base.props;
     let full_rows = row_group_rows(base);
     let mut row_group = Vec::with_capacity(buffered.len());
     let mut rows = 0;
@@ -192,6 +214,9 @@ pub(crate) fn props_for_row_group(
     let schema = first.schema();
     let mut builder = base.clone().into_builder();
     for (index, field) in schema.fields().iter().enumerate() {
+        if dictionary_set.contains(field.name()) {
+            continue;
+        }
         let columns: Vec<&ArrayRef> = row_group.iter().map(|batch| batch.column(index)).collect();
         let Some(width) = dictionary_entry_width(field.data_type(), &columns, writer_version)
         else {
@@ -252,7 +277,7 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
 /// is still a valid parquet file).
 #[derive(Debug)]
 pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
-    pending: Option<(W, SchemaRef, WriterProperties)>,
+    pending: Option<(W, SchemaRef, DataFileProperties)>,
     buffered: Vec<RecordBatch>,
     buffered_rows: usize,
     buffered_bytes: usize,
@@ -260,9 +285,9 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
-    pub(crate) fn new(sink: W, schema: SchemaRef, base: WriterProperties) -> Self {
+    pub(crate) fn new(sink: W, schema: SchemaRef, base: impl Into<DataFileProperties>) -> Self {
         Self {
-            pending: Some((sink, schema, base)),
+            pending: Some((sink, schema, base.into())),
             buffered: Vec::new(),
             buffered_rows: 0,
             buffered_bytes: 0,
@@ -283,8 +308,8 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         let Some((_, _, base)) = &self.pending else {
             return Err(closed());
         };
-        let full_rows = row_group_rows(base);
-        let full_bytes = base.max_row_group_bytes();
+        let full_rows = row_group_rows(&base.props);
+        let full_bytes = base.props.max_row_group_bytes();
         self.buffered_rows += batch.num_rows();
         self.buffered_bytes += sliced_memory_size(batch);
         self.buffered.push(batch.clone());

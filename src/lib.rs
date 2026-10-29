@@ -195,7 +195,7 @@ pub use metadata_provider::{
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use partition_counts::{PartitionCountUnknown, PartitionRowCount};
-pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation, RowsByRowId};
+pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowIdReadOptions, RowLocation, RowsByRowId};
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
@@ -257,8 +257,8 @@ pub use restore::RestoreResult;
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, InlinedFlushPolicy,
-    TableWriteOptions, TableWriteSession,
+    ColumnWriteOptions, DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction,
+    InlinedFlushPolicy, TableWriteOptions, TableWriteSession,
 };
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;

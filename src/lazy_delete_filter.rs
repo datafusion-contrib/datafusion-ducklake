@@ -40,7 +40,7 @@ use datafusion::physical_plan::{
     ChildStats, ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan,
     ExecutionPlanProperties, Partitioning, PlanProperties, Statistics, StatisticsArgs,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use tokio::sync::OnceCell;
@@ -614,13 +614,36 @@ pub(crate) async fn read_delete_entries(
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
 ) -> DataFusionResult<Vec<(i64, Option<i64>)>> {
+    let mut entries = Vec::new();
+    for_each_delete_batch(
+        scan,
+        context,
+        object_store_url,
+        resolved_path,
+        |_, batch| {
+            entries.extend(batch);
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(entries)
+}
+
+/// Stream the scan of one delete file, handing `on_batch` each batch read and
+/// its `(position, snapshot)` entries, as [`read_delete_entries`] collects
+/// them, one batch at a time. A failed read is classified as
+/// [`read_delete_entries`] classifies it; an error from `on_batch` stops the
+/// read and is returned as it is.
+pub(crate) async fn for_each_delete_batch(
+    scan: &Arc<dyn ExecutionPlan>,
+    context: &Arc<TaskContext>,
+    object_store_url: &ObjectStoreUrl,
+    resolved_path: &str,
+    mut on_batch: impl FnMut(&RecordBatch, Vec<(i64, Option<i64>)>) -> DataFusionResult<()>,
+) -> DataFusionResult<()> {
     let scan = reset_plan_states(Arc::clone(scan))?;
-    let batches = match scan.execute(0, Arc::clone(context)) {
-        Ok(stream) => stream.try_collect::<Vec<_>>().await,
-        Err(error) => Err(error),
-    };
-    let batches = match batches {
-        Ok(batches) => batches,
+    let mut stream = match scan.execute(0, Arc::clone(context)) {
+        Ok(stream) => stream,
         Err(error) => {
             return Err(classify_delete_file_read_error(
                 context,
@@ -631,14 +654,26 @@ pub(crate) async fn read_delete_entries(
             .await);
         },
     };
-    let mut entries = Vec::new();
-    for batch in &batches {
+    while let Some(batch) = stream.next().await {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                return Err(classify_delete_file_read_error(
+                    context,
+                    object_store_url,
+                    resolved_path,
+                    error,
+                )
+                .await);
+            },
+        };
         let pos_index = batch.schema().index_of(DELETE_POS_COL)?;
-        let pos = int64_column(batch, pos_index, DELETE_POS_COL)?;
+        let pos = int64_column(&batch, pos_index, DELETE_POS_COL)?;
         let snapshots = match batch.schema().index_of(DELETE_SNAPSHOT_COL) {
-            Ok(index) => Some(int64_column(batch, index, DELETE_SNAPSHOT_COL)?),
+            Ok(index) => Some(int64_column(&batch, index, DELETE_SNAPSHOT_COL)?),
             Err(_) => None,
         };
+        let mut entries = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             if pos.is_null(row) {
                 continue;
@@ -648,8 +683,9 @@ pub(crate) async fn read_delete_entries(
                 .map(|snapshots| snapshots.value(row));
             entries.push((pos.value(row), snapshot));
         }
+        on_batch(&batch, entries)?;
     }
-    Ok(entries)
+    Ok(())
 }
 
 /// Turn a failed delete-file read into a caller-facing error, replacing the raw
