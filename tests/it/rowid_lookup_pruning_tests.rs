@@ -946,6 +946,170 @@ async fn a_missing_delete_file_is_named() {
 }
 
 // ---------------------------------------------------------------------------
+// Read ahead
+// ---------------------------------------------------------------------------
+
+/// Two inserts of 512 rows merged under a sort order that scatters the ids:
+/// the merged file is one page holding ids 0..1023 out of order. Its bounds
+/// span exactly its rows, so the read ahead guesses each id at `id`, and
+/// nearly every guess misses. Every row still reads right, and the read
+/// leaves only its batch charged. Guards against a read ahead served on its
+/// page statistics, which cannot show the rows are in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permuted_page_misguesses_and_reads_right() {
+    let lake = Lake::new(0).await;
+    lake.sql("ALTER TABLE lake.main.t SET SORTED BY (k)").await;
+    lake.insert(0, 512).await;
+    lake.insert(512, 512).await;
+    lake.merge().await;
+    assert_eq!(files(&lake, lake.head()).await, (1, 1));
+    let reader = lake.reader(lake.head()).await;
+    let in_file_order: Vec<i64> = by_rowid_order(&reader).await;
+    assert_eq!(in_file_order.len(), 1024);
+    assert_ne!(
+        in_file_order,
+        (0..1024).collect::<Vec<_>>(),
+        "the merged file holds its ids out of order"
+    );
+    reader.check("one permuted page").await;
+
+    let state = reader.ctx.state();
+    let all: Vec<i64> = (0..1024).collect();
+    let (pool, held) = reservation(1 << 30);
+    let read = reader
+        .table
+        .read_columns_by_rowid_with(
+            &state,
+            &all,
+            None,
+            RowIdReadOptions::default().with_reservation(&held),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.row_ids, all);
+    assert_eq!(held.size(), read.batch.get_array_memory_size());
+    assert_eq!(pool.reserved(), held.size());
+}
+
+/// The `rowid`s of `reader`'s table in the order a scan returns them.
+async fn by_rowid_order(reader: &Reader) -> Vec<i64> {
+    let batches = reader
+        .ctx
+        .sql("SELECT rowid FROM lake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// A merged file in insert order, so every guess holds, with rows deleted
+/// from the page a lookup reads ahead: the deleted rows the read ahead read
+/// are not returned at the head, and are at the snapshot before the delete.
+/// Guards against a read ahead that returns every row it read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_ahead_returns_only_located_rows() {
+    let lake = Lake::new(0).await;
+    lake.insert(0, INSERT_ROWS).await;
+    lake.insert(INSERT_ROWS, INSERT_ROWS).await;
+    lake.merge().await;
+    let merged = lake.head();
+    // An insert need not write its rows in `id` order, so the rows to delete
+    // are named by the `id` each of `rowid`s 1000..=1010 holds.
+    let truth = lake.reader(merged).await.truth().await;
+    let ids: Vec<String> = (1000..=1010)
+        .map(|rowid| truth[&rowid][0].clone())
+        .collect();
+    lake.sql(&format!(
+        "DELETE FROM lake.main.t WHERE id IN ({})",
+        ids.join(", ")
+    ))
+    .await;
+    let wanted = [1000, 1005, 1011, 1500, 30_000];
+    for (snapshot, found) in [(lake.head(), vec![1011, 1500, 30_000]), (merged, wanted.to_vec())] {
+        let reader = lake.reader(snapshot).await;
+        let truth = reader.truth().await;
+        let state = reader.ctx.state();
+        let (pool, held) = reservation(1 << 30);
+        let read = reader
+            .table
+            .read_columns_by_rowid_with(
+                &state,
+                &wanted,
+                None,
+                RowIdReadOptions::default().with_reservation(&held),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.row_ids, found, "at snapshot {snapshot}");
+        for (row, id) in found.iter().enumerate() {
+            let cells: Vec<String> = (0..4)
+                .map(|column| cell(read.batch.column(column), row))
+                .collect();
+            assert_eq!(cells, truth[id], "rowid {id} at snapshot {snapshot}");
+        }
+        assert_eq!(held.size(), read.batch.get_array_memory_size());
+        assert_eq!(pool.reserved(), held.size());
+    }
+}
+
+/// A cold lookup of a merged file reads its footer and page index once: the
+/// bytes a first read costs over a second are the same for a read of the
+/// rows, which reads ahead, as for only locating them, which does not.
+/// Guards against the read ahead and the locate each fetching the footer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_lookup_reads_each_footer_once() {
+    let lake = Lake::new(0).await;
+    lake.insert(0, INSERT_ROWS).await;
+    lake.insert(INSERT_ROWS, INSERT_ROWS).await;
+    lake.merge().await;
+    assert_eq!(files(&lake, lake.head()).await, (1, 1));
+    let wanted = [5, 25_000];
+
+    let reading = lake.reader(lake.head()).await;
+    let state = reading.ctx.state();
+    reading.store.take();
+    let mut read_bytes = Vec::new();
+    for _ in 0..2 {
+        let read = reading
+            .table
+            .read_columns_by_rowid(&state, &wanted, None)
+            .await
+            .unwrap();
+        assert_eq!(read.row_ids, wanted.to_vec());
+        read_bytes.push(reading.store.take());
+    }
+
+    let locating = lake.reader(lake.head()).await;
+    let state = locating.ctx.state();
+    locating.store.take();
+    let mut locate_bytes = Vec::new();
+    for _ in 0..2 {
+        let found = locating.table.locate_rowids(&state, &wanted).await.unwrap();
+        assert_eq!(found.len(), wanted.len());
+        locate_bytes.push(locating.store.take());
+    }
+
+    assert_eq!(
+        read_bytes[0] - read_bytes[1],
+        locate_bytes[0] - locate_bytes[1],
+        "footer bytes: reading {read_bytes:?}, locating {locate_bytes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
 
