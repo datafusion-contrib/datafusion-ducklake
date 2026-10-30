@@ -1276,6 +1276,63 @@ pub(crate) fn embedded_row_id_selection(
     int64_leaf_selection(metadata, embedded_row_id_leaf(metadata)?, sorted)
 }
 
+/// For each id of `sorted` (ascending, distinct) that a page of the embedded
+/// `rowid` column may hold, the position it has if that page numbers its rows
+/// in `rowid` order without gaps: a page whose bounds span exactly as many ids
+/// as it has rows, none NULL. An id in no such page has no guess.
+///
+/// Statistics cannot prove a page is in order (its ids may be permuted), so a
+/// guess is only where to read ahead: the caller keeps what it read at a
+/// guessed position only once the row located there carries that id.
+pub(crate) fn embedded_row_id_guesses(
+    metadata: &ParquetMetaData,
+    sorted: &[i64],
+) -> HashMap<i64, i64> {
+    use datafusion::parquet::file::page_index::column_index::ColumnIndexMetaData;
+
+    let mut guesses = HashMap::new();
+    let Some(leaf) = embedded_row_id_leaf(metadata) else {
+        return guesses;
+    };
+    let mut row_group_start = 0i64;
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        let rows = row_group.num_rows();
+        let pages = metadata
+            .column_index()
+            .and_then(|index_of| index_of.get(index)?.get(leaf))
+            .zip(
+                metadata
+                    .offset_index()
+                    .and_then(|offsets| offsets.get(index)?.get(leaf)),
+            );
+        if let Some((ColumnIndexMetaData::INT64(stats), offsets)) = pages {
+            let locations = offsets.page_locations();
+            for (page, location) in locations.iter().enumerate() {
+                let start = location.first_row_index;
+                let end = locations
+                    .get(page + 1)
+                    .map_or(rows, |next| next.first_row_index);
+                let (Some(min), Some(max)) = (stats.min_value(page), stats.max_value(page)) else {
+                    continue;
+                };
+                if stats.is_null_page(page)
+                    || stats.null_count(page) != Some(0)
+                    || max.checked_sub(*min).and_then(|span| span.checked_add(1))
+                        != Some(end - start)
+                {
+                    continue;
+                }
+                let first = sorted.partition_point(|id| id < min);
+                for id in sorted[first..].iter().take_while(|id| *id <= max) {
+                    guesses.insert(*id, row_group_start + start + (id - min));
+                }
+            }
+        }
+        row_group_start += rows;
+    }
+    guesses
+}
+
 /// The leaf column of a delete file's metadata holding its positions: the
 /// top-level `INT64` `pos` column, by its field id where the file records
 /// one, else by name.
@@ -3841,6 +3898,32 @@ impl DuckLakeTable {
         )
         .await?;
         Ok(embedded_row_id_selection(&metadata, sorted))
+    }
+
+    /// [`embedded_row_id_guesses`] of `file`, from its footer and page index,
+    /// kept in the session's file-metadata cache.
+    pub(crate) async fn embedded_row_id_guesses(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+        sorted: &[i64],
+    ) -> DataFusionResult<HashMap<i64, i64>> {
+        let resolved_path = self.resolve_file_path(file)?;
+        #[cfg(feature = "encryption")]
+        let encryption_key = file.encryption_key.as_deref();
+        #[cfg(not(feature = "encryption"))]
+        let encryption_key = None;
+        let metadata = fetch_parquet_metadata(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved_path,
+            Some(file.file_size_bytes),
+            file.footer_size,
+            encryption_key,
+            Some(datafusion::parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .await?;
+        Ok(embedded_row_id_guesses(&metadata, sorted))
     }
 
     /// The positions of `table_file` holding a row not visible at this
@@ -9891,5 +9974,101 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // --- embedded `rowid` position guesses ---
+
+    /// Parquet metadata, page index included, of a file whose only column is
+    /// the embedded `rowid`, written as `row_groups`, each `pages` of
+    /// `PAGE` rows.
+    fn embedded_row_id_metadata(row_groups: &[&[&[Option<i64>]]]) -> ParquetMetaData {
+        use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+        use datafusion::parquet::file::properties::WriterProperties;
+        const PAGE: usize = 4;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_ducklake_internal_row_id", DataType::Int64, true)
+                .with_metadata(parquet_field_id_metadata(ROW_ID_PARQUET_FIELD_ID)),
+        ]));
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(PAGE)
+            .set_write_batch_size(PAGE)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props))
+                    .expect("open writer");
+            for pages in row_groups {
+                for page in *pages {
+                    assert_eq!(page.len(), PAGE);
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(page.to_vec())) as ArrayRef],
+                    )
+                    .expect("build batch");
+                    writer.write(&batch).expect("write batch");
+                }
+                writer.flush().expect("end row group");
+            }
+            writer.close().expect("close writer");
+        }
+        ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&bytes::Bytes::from(buf))
+            .expect("read metadata")
+    }
+
+    /// A page guesses each id's position from its bounds only when they span
+    /// exactly its rows and it holds no NULL, counting rows from the file's
+    /// start across row groups. A page whose ids are permuted still guesses:
+    /// its statistics cannot show the order, which is why a guess is only
+    /// checked against where the row is found. Guards against a guess from a
+    /// page with gaps or NULLs, and against positions counted from the row
+    /// group's start.
+    #[test]
+    fn embedded_row_id_guesses_follow_gapless_pages() {
+        let metadata = embedded_row_id_metadata(&[
+            &[&[Some(10), Some(11), Some(12), Some(13)], &[Some(20), Some(22), Some(23), Some(24)]],
+            &[&[Some(33), Some(32), Some(31), Some(30)], &[Some(40), None, Some(42), Some(43)]],
+        ]);
+        let pages = metadata.offset_index().expect("an offset index");
+        assert_eq!(pages.len(), 2, "two row groups");
+        assert!(
+            pages
+                .iter()
+                .all(|row_group| row_group[0].page_locations().len() == 2)
+        );
+
+        let guesses = embedded_row_id_guesses(&metadata, &[9, 10, 13, 14, 20, 22, 30, 33, 42]);
+
+        assert_eq!(
+            guesses,
+            HashMap::from([(10, 0), (13, 3), (30, 8), (33, 11)])
+        );
+    }
+
+    /// A file without a page index, or without an embedded `rowid` column,
+    /// guesses nothing.
+    #[test]
+    fn embedded_row_id_guesses_need_a_page_index() {
+        use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+        let bytes = bytes::Bytes::from(footer_cache_fixture_bytes());
+        let no_rowid = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&bytes)
+            .expect("read metadata");
+        assert!(embedded_row_id_guesses(&no_rowid, &[0, 1, 2]).is_empty());
+
+        let with_index = embedded_row_id_metadata(&[&[&[Some(0), Some(1), Some(2), Some(3)]]]);
+        let without_index = ParquetMetaData::new(
+            with_index.file_metadata().clone(),
+            with_index.row_groups().to_vec(),
+        );
+        assert_eq!(
+            embedded_row_id_guesses(&with_index, &[1]),
+            HashMap::from([(1, 1)])
+        );
+        assert!(embedded_row_id_guesses(&without_index, &[1]).is_empty());
     }
 }

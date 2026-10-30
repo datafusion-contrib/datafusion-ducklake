@@ -103,6 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `statistics()` is now absent on built-in providers (#404).
 - `read_columns_by_rowid` and `locate_rowids` skip row groups and pages of a merged or rewritten
   file by its `rowid` statistics instead of decoding its whole `rowid` column on every call.
+- `read_columns_by_rowid` reads a merged or rewritten file's rows alongside locating them, where
+  its page index places each id, instead of one read after the other.
 - A rowid lookup reads only the delete-file pages that may hold its rows' positions, or takes them
   from the table's delete memo; delete files are written without a dictionary on `pos`, as official.
 - `read_rows_by_rowid` reads only the pages holding the requested rows instead of decoding

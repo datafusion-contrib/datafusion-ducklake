@@ -225,6 +225,19 @@ impl<'a> RowIdReadAccounting<'a> {
             reservation.shrink(grown);
         }
     }
+
+    /// An accounting charging the same reservation, so that a read whose
+    /// failure the lookup survives can release what it charged, and only that.
+    fn child(&self) -> RowIdReadAccounting<'a> {
+        RowIdReadAccounting::new(self.reservation)
+    }
+
+    /// Keep what `child` charged and decoded as this lookup's.
+    fn absorb(&self, child: RowIdReadAccounting<'_>) {
+        self.grown
+            .fetch_add(child.grown.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        self.decoded(child.decoded.load(Ordering::Relaxed));
+    }
 }
 
 impl Drop for RowIdReadAccounting<'_> {
@@ -243,6 +256,33 @@ struct Located {
     files: Vec<DuckLakeTableFile>,
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     inlined_deletes: std::collections::HashMap<i64, HashSet<i64>>,
+    /// What [`DuckLakeTable::read_ahead`] read of each file, by data file id.
+    read_ahead: HashMap<i64, ReadAhead>,
+}
+
+/// One file's rows read at guessed positions while it was being located.
+struct ReadAhead {
+    /// The position guessed for each requested `rowid`.
+    guesses: HashMap<i64, i64>,
+    /// The rows read at the guessed positions, as `read_file_columns_at`
+    /// returns them; charged to the read's accounting.
+    parts: Vec<(Vec<ArrayRef>, arrow::array::Int64Array)>,
+}
+
+impl ReadAhead {
+    /// The bytes [`Self::parts`] hold, as their read charged them.
+    fn held(&self) -> usize {
+        self.parts
+            .iter()
+            .map(|(columns, positions)| {
+                columns
+                    .iter()
+                    .map(|c| c.get_array_memory_size())
+                    .sum::<usize>()
+                    + arrow::array::Array::get_array_memory_size(positions)
+            })
+            .sum()
+    }
 }
 
 /// Where a Parquet file's rows take their `rowid` from
@@ -321,7 +361,7 @@ impl DuckLakeTable {
         row_ids: &[i64],
     ) -> crate::Result<Vec<RowIdLocation>> {
         Ok(self
-            .locate(state, row_ids, &RowIdReadAccounting::new(None))
+            .locate(state, row_ids, None, &RowIdReadAccounting::new(None))
             .await?
             .rows)
     }
@@ -331,10 +371,14 @@ impl DuckLakeTable {
     /// order a scan reads them, so that a flush between the reads moves no
     /// row out of all of them or into two
     /// ([`DuckLakeTable::inlined_rows_then_files`]).
+    /// With `read_ahead`, each file that embeds its `rowid`s is also read, for
+    /// those columns, at the positions its page index guesses
+    /// ([`Self::read_ahead`]), alongside locating its rows.
     async fn locate(
         &self,
         state: &dyn Session,
         row_ids: &[i64],
+        read_ahead: Option<&[usize]>,
         accounting: &RowIdReadAccounting<'_>,
     ) -> crate::Result<Located> {
         let wanted: HashSet<i64> = row_ids.iter().copied().collect();
@@ -344,6 +388,7 @@ impl DuckLakeTable {
                 inlined: Vec::new(),
                 files: Vec::new(),
                 inlined_deletes: std::collections::HashMap::new(),
+                read_ahead: HashMap::new(),
             });
         }
         let (inlined_deletes, (inlined, files)) = self.read_consistently(|table| {
@@ -367,26 +412,104 @@ impl DuckLakeTable {
         }
         let snapshot_id = self.snapshot_id();
         let wanted = &wanted;
+        let sorted: Vec<i64> = {
+            let mut sorted: Vec<i64> = wanted.iter().copied().collect();
+            sorted.sort_unstable();
+            sorted
+        };
+        let sorted = &sorted;
         let inlined_deletes_ref = &inlined_deletes;
         let concurrency = state.config().target_partitions().max(1);
-        let pending: Vec<BoxFuture<'_, crate::Result<Vec<RowIdLocation>>>> = files
+        type InFile = (Vec<RowIdLocation>, Option<(i64, ReadAhead)>);
+        let pending: Vec<BoxFuture<'_, crate::Result<InFile>>> = files
             .iter()
-            .map(|file| -> BoxFuture<'_, crate::Result<Vec<RowIdLocation>>> {
+            .map(|file| -> BoxFuture<'_, crate::Result<InFile>> {
                 let inlined = inlined_deletes_ref.get(&file.data_file_id);
                 Box::pin(async move {
-                    self.locate_in_file(state, file, wanted, inlined, snapshot_id, accounting)
-                        .await
+                    // The guesses come from the file's footer and page index,
+                    // read here before either read starts: the two reads then
+                    // find them cached instead of each fetching them.
+                    let guesses = match read_ahead {
+                        Some(_) => self.read_ahead_guesses(state, file, sorted).await,
+                        None => None,
+                    };
+                    let locating =
+                        self.locate_in_file(state, file, wanted, inlined, snapshot_id, accounting);
+                    let (Some(columns), Some(guesses)) = (read_ahead, guesses) else {
+                        return Ok((locating.await?, None));
+                    };
+                    let reading = self.read_ahead(state, file, guesses, columns, accounting);
+                    let (rows, ahead) = futures::join!(locating, reading);
+                    Ok((rows?, ahead.map(|ahead| (file.data_file_id, ahead))))
                 })
             })
             .collect();
-        let in_files = bounded(pending, concurrency).await?;
-        located.extend(in_files.into_iter().flatten());
+        let mut ahead_by_file = HashMap::new();
+        for (rows, ahead) in bounded(pending, concurrency).await? {
+            located.extend(rows);
+            ahead_by_file.extend(ahead);
+        }
         Ok(Located {
             rows: located,
             inlined,
             files,
             inlined_deletes,
+            read_ahead: ahead_by_file,
         })
+    }
+
+    /// The position `file`'s embedded `rowid` page index guesses for each id
+    /// of `sorted` ([`crate::table::embedded_row_id_guesses`]); `None` when
+    /// the file embeds no `rowid`s or has no guess.
+    async fn read_ahead_guesses(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeTableFile,
+        sorted: &[i64],
+    ) -> Option<HashMap<i64, i64>> {
+        let layout = self.file_row_id_layout(state, file).await.ok()?;
+        if layout != Some(RowIdLayout::Embedded) {
+            return None;
+        }
+        let guesses = self
+            .embedded_row_id_guesses(state, &file.file, sorted)
+            .await
+            .ok()?;
+        (!guesses.is_empty()).then_some(guesses)
+    }
+
+    /// The columns `columns` of `file`'s rows at the positions `guesses`
+    /// names, read while the file is being located so that a guess that
+    /// holds costs no second round trip. `None` when the read fails: what it
+    /// charged is released, and the caller reads the located rows as without
+    /// it.
+    async fn read_ahead(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeTableFile,
+        guesses: HashMap<i64, i64>,
+        columns: &[usize],
+        accounting: &RowIdReadAccounting<'_>,
+    ) -> Option<ReadAhead> {
+        let positions: HashSet<i64> = guesses.values().copied().collect();
+        let own = accounting.child();
+        let parts = self
+            .read_file_columns_at(state, file, &positions, columns, &own)
+            .await;
+        match parts {
+            Ok(parts) => {
+                accounting.absorb(own);
+                Some(ReadAhead {
+                    guesses,
+                    parts,
+                })
+            },
+            Err(error) => {
+                accounting.decoded(own.decoded.load(Ordering::Relaxed));
+                tracing::debug!(%error, path = %file.file.path, "rowid read-ahead failed");
+                None
+            },
+        }
     }
 
     async fn locate_in_file(
@@ -508,7 +631,7 @@ impl DuckLakeTable {
         row_ids: &[i64],
     ) -> crate::Result<Vec<arrow::record_batch::RecordBatch>> {
         let located = self
-            .locate(state, row_ids, &RowIdReadAccounting::new(None))
+            .locate(state, row_ids, None, &RowIdReadAccounting::new(None))
             .await?;
         let mut inlined_ids = HashSet::new();
         let mut by_file: std::collections::HashMap<i64, HashSet<i64>> =
@@ -752,7 +875,14 @@ impl DuckLakeTable {
             .into_iter()
             .collect();
 
-        let located = self.locate(state, row_ids, accounting).await?;
+        let mut located = self
+            .locate(
+                state,
+                row_ids,
+                (!read.is_empty()).then_some(&read[..]),
+                accounting,
+            )
+            .await?;
         let mut parts: Vec<ReadPart> = Vec::new();
         let mut inlined_ids = HashSet::new();
         let mut by_file: HashMap<i64, HashMap<i64, i64>> = HashMap::new();
@@ -847,6 +977,25 @@ impl DuckLakeTable {
                 });
             }
         } else if !by_file.is_empty() {
+            // A file read ahead serves each located row of it that sits at the
+            // position guessed for its id, and the file is read for the
+            // others; a read ahead that serves none is dropped.
+            let mut ahead: HashMap<i64, (ReadAhead, HashSet<i64>)> = HashMap::new();
+            for (data_file_id, read_ahead) in std::mem::take(&mut located.read_ahead) {
+                let served: HashSet<i64> = by_file
+                    .get(&data_file_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(position, row_id)| read_ahead.guesses.get(row_id) == Some(position))
+                    .map(|(position, _)| *position)
+                    .collect();
+                if served.is_empty() {
+                    accounting.shrink(read_ahead.held());
+                } else {
+                    ahead.insert(data_file_id, (read_ahead, served));
+                }
+            }
+            let ahead = &ahead;
             let by_file = &by_file;
             let read = &read;
             let concurrency = state.config().target_partitions().max(1);
@@ -856,11 +1005,19 @@ impl DuckLakeTable {
                 .filter_map(|file| {
                     let positions = by_file.get(&file.data_file_id)?;
                     Some(Box::pin(async move {
-                        let wanted: HashSet<i64> = positions.keys().copied().collect();
-                        let batches = self
-                            .read_file_columns_at(state, file, &wanted, read, accounting)
-                            .await
-                            .map_err(df_error)?;
+                        let mut wanted: HashSet<i64> = positions.keys().copied().collect();
+                        let mut batches = Vec::new();
+                        if let Some((read_ahead, served)) = ahead.get(&file.data_file_id) {
+                            batches = keep_positions(&read_ahead.parts, served)?;
+                            wanted.retain(|position| !served.contains(position));
+                        }
+                        if !wanted.is_empty() {
+                            batches.extend(
+                                self.read_file_columns_at(state, file, &wanted, read, accounting)
+                                    .await
+                                    .map_err(df_error)?,
+                            );
+                        }
                         Ok(batches
                             .into_iter()
                             .map(|(columns, read_positions)| ReadPart {
@@ -893,6 +1050,39 @@ impl DuckLakeTable {
             accounting,
         )
     }
+}
+
+/// The rows of `parts` (columns, then each row's position) at one of
+/// `positions`: a read ahead's rows, less those not located there (deleted, or
+/// not visible at the table's snapshot).
+fn keep_positions(
+    parts: &[(Vec<ArrayRef>, arrow::array::Int64Array)],
+    positions: &HashSet<i64>,
+) -> crate::Result<Vec<(Vec<ArrayRef>, arrow::array::Int64Array)>> {
+    let mut out = Vec::new();
+    for (columns, read_positions) in parts {
+        let keep = arrow::array::BooleanArray::from(
+            read_positions
+                .values()
+                .iter()
+                .map(|position| positions.contains(position))
+                .collect::<Vec<_>>(),
+        );
+        if keep.true_count() == 0 {
+            continue;
+        }
+        let columns = columns
+            .iter()
+            .map(|column| arrow::compute::filter(column, &keep))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kept = arrow::compute::filter(read_positions, &keep)?
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("positions are Int64")
+            .clone();
+        out.push((columns, kept));
+    }
+    Ok(out)
 }
 
 /// The rows of `parts` with one of `requested`, one per id in the order the
