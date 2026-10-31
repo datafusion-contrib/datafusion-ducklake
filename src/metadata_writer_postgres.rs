@@ -3265,27 +3265,40 @@ pub(crate) async fn merge_file_table_column_stats(
 /// NULLs or only NaN is dropped here, so the merge leaves the field with no row
 /// (unknown) instead of narrowing it to the new values. The commit's own
 /// snapshot is the newest, so its new files are not counted.
+///
+/// This runs on every commit, so it reads the table's live files and their
+/// statistics once each: per column, it counts the live files known to hold
+/// only NULLs or only NaN and compares that with the number of live files.
+/// Checking each live file of each such column against the statistics instead
+/// costs files × statistics rows, which grows with the square of the table's
+/// file count (#297).
 async fn load_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
 ) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
     let mut existing = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
+        "WITH live AS (
+             SELECT data_file_id FROM ducklake_data_file
+             WHERE table_id = $1 AND end_snapshot IS NULL
+               AND begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+         ), known AS (
+             SELECT f.column_id, COUNT(DISTINCT f.data_file_id) AS files
+             FROM ducklake_file_column_stats f
+             JOIN live ON live.data_file_id = f.data_file_id
+             WHERE f.table_id = $1
+               AND ((f.null_count IS NOT NULL AND f.value_count = 0)
+                    OR (f.contains_nan AND f.min_value IS NULL AND f.max_value IS NULL))
+             GROUP BY f.column_id
+         )
+         SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
          FROM ducklake_table_column_stats s
+         LEFT JOIN known k ON k.column_id = s.column_id
          WHERE s.table_id = $1
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
                     AND (s.contains_nan IS NULL OR NOT s.contains_nan)
-                    AND s.extra_stats IS NULL AND EXISTS (
-               SELECT 1 FROM ducklake_data_file d
-               WHERE d.table_id = s.table_id AND d.end_snapshot IS NULL
-                 AND d.begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM ducklake_file_column_stats f
-                     WHERE f.data_file_id = d.data_file_id AND f.column_id = s.column_id
-                       AND ((f.null_count IS NOT NULL AND f.value_count = 0)
-                            OR (f.contains_nan AND f.min_value IS NULL
-                                AND f.max_value IS NULL)))))",
+                    AND s.extra_stats IS NULL
+                    AND COALESCE(k.files, 0) < (SELECT COUNT(*) FROM live))",
     )
     .bind(table_id)
     .fetch_all(&mut **tx)

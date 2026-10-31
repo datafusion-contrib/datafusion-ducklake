@@ -99,6 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A PostgreSQL commit reads a table's file statistics in one pass. Its cost no longer grows with
+  the square of the table's file count (#297).
 - Building a table no longer sums every file's column sizes; table-level column `byte_size` in
   `statistics()` is now absent on built-in providers (#404).
 - `read_columns_by_rowid` and `locate_rowids` skip row groups and pages of a merged or rewritten
