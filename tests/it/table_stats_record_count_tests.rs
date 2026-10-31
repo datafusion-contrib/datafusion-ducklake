@@ -181,6 +181,44 @@ fn scenarios() -> Vec<Scenario> {
             limit: 0,
             ops: &[Op::AppendNull, Op::AppendNull, Op::Append(&[5])],
         },
+        // The same two rules over more files, where a single file decides:
+        // one file with values among NULL-only files keeps the legacy roll-up
+        // unknown; every file NULL-only lets the next write take its bounds,
+        // whether the roll-up is the legacy shape or official's.
+        Scenario {
+            name: "legacy unknown bounds over several files then append",
+            limit: 0,
+            ops: &[
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::Append(&[50, 60]),
+                Op::AppendNull,
+                Op::LegacyNullBounds,
+                Op::Append(&[5]),
+            ],
+        },
+        Scenario {
+            name: "legacy unknown bounds over NULL-only files then append",
+            limit: 0,
+            ops: &[
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::LegacyNullBounds,
+                Op::Append(&[5]),
+            ],
+        },
+        Scenario {
+            name: "several all-NULL files then append",
+            limit: 0,
+            ops: &[
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::AppendNull,
+                Op::Append(&[5]),
+            ],
+        },
     ]
 }
 
