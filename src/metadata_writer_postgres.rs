@@ -3268,7 +3268,8 @@ pub(crate) async fn merge_file_table_column_stats(
 ///
 /// This runs on every commit, so it reads the table's live files and their
 /// statistics once each: per column, it counts the live files known to hold
-/// only NULLs or only NaN and compares that with the number of live files.
+/// only NULLs or only NaN and compares that with the number of live files. A
+/// table with no row of neither bound reads no file or statistic at all.
 /// Checking each live file of each such column against the statistics instead
 /// costs files × statistics rows, which grows with the square of the table's
 /// file count (#297).
@@ -3278,10 +3279,15 @@ async fn load_table_column_stats(
 ) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
     let mut existing = Vec::new();
     for row in sqlx::query(
-        "WITH live AS (
+        "WITH unbounded AS (
+             SELECT column_id FROM ducklake_table_column_stats
+             WHERE table_id = $1 AND min_value IS NULL AND max_value IS NULL
+               AND (contains_nan IS NULL OR NOT contains_nan) AND extra_stats IS NULL
+         ), live AS (
              SELECT data_file_id FROM ducklake_data_file
              WHERE table_id = $1 AND end_snapshot IS NULL
                AND begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+               AND EXISTS (SELECT 1 FROM unbounded)
          ), known AS (
              SELECT f.column_id, COUNT(DISTINCT f.data_file_id) AS files
              FROM ducklake_file_column_stats f
