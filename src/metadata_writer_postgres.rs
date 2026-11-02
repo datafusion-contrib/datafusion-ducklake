@@ -6884,7 +6884,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     &write.column_ids,
                     write.mode,
                     write.base_snapshot_id,
-                    !matches!(write.data, StagedTableData::None),
+                    write.inserts_rows(),
                     &mut tx,
                 )
                 .await?;
@@ -6908,6 +6908,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                         commit_inlined_at_snapshot(&mut tx, snapshot_id, write, batches).await?;
                     },
                     StagedTableData::None => {},
+                }
+                if !write.inserted_files.is_empty() {
+                    commit_files_at_snapshot(&mut tx, snapshot_id, write, &write.inserted_files)
+                        .await?;
                 }
                 apply_positional_deletes_at_snapshot(
                     &mut tx,

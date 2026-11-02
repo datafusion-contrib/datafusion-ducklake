@@ -96,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cleanup_old_files_mysql` and `delete_orphaned_files_mysql` clean up MySQL catalogs.
 - `CREATE TABLE [IF NOT EXISTS] t [(columns)] AS SELECT` through `execute_ducklake_sql`: rows and
   table metadata commit in one snapshot, with columns named and nullable as in DuckDB (#308).
+- `MERGE INTO` through `execute_ducklake_sql`, as official DuckLake runs it: matched,
+  not-matched, and by-source clauses commit in one snapshot on any table layout.
 
 ### Changed
 
