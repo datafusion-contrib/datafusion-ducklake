@@ -3269,7 +3269,9 @@ pub(crate) async fn merge_file_table_column_stats(
 /// This runs on every commit, so it reads the table's live files and their
 /// statistics once each: per column, it counts the live files known to hold
 /// only NULLs or only NaN and compares that with the number of live files. A
-/// table with no row of neither bound reads no file or statistic at all.
+/// table with no row of neither bound reads no file or statistic at all. Both
+/// `live` and `known` test for such a row: Postgres can scan the statistics
+/// before `live`, and an empty `live` does not stop that scan.
 /// Checking each live file of each such column against the statistics instead
 /// costs files × statistics rows, which grows with the square of the table's
 /// file count (#297).
@@ -3292,7 +3294,7 @@ async fn load_table_column_stats(
              SELECT f.column_id, COUNT(DISTINCT f.data_file_id) AS files
              FROM ducklake_file_column_stats f
              JOIN live ON live.data_file_id = f.data_file_id
-             WHERE f.table_id = $1
+             WHERE f.table_id = $1 AND EXISTS (SELECT 1 FROM unbounded)
                AND ((f.null_count IS NOT NULL AND f.value_count = 0)
                     OR (f.contains_nan AND f.min_value IS NULL AND f.max_value IS NULL))
              GROUP BY f.column_id
