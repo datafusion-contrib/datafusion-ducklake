@@ -240,10 +240,13 @@ impl DuckLakeTable {
     /// Refused with [`DuckLakeError::InvalidConfig`] before anything is
     /// written: a missing or extra column, a value whose type does not widen
     /// to its column's without loss, a `rowid` column that is not `Int64`
-    /// (each checked in empty batches too), a NULL `rowid`, and a `rowid`
-    /// given twice across all batches. A NULL in a `NOT NULL` column of a row
-    /// that replaces a live row fails with the `NOT NULL constraint failed`
-    /// error, also before anything is written.
+    /// (each checked in empty batches too), and a NULL `rowid`. A NULL in a
+    /// `NOT NULL` column of a row that replaces a live row fails with the
+    /// `NOT NULL constraint failed` error, also before anything is written.
+    ///
+    /// A `rowid` given more than once takes its first staged row, in batch
+    /// order, and the others are ignored. Official's `UPDATE ... FROM` applies
+    /// one of a row's matches and ignores the others.
     ///
     /// A `rowid` no live row has at this table's snapshot (deleted, never
     /// assigned, or a row of a merged file inserted after the snapshot) is
@@ -303,17 +306,12 @@ impl DuckLakeTable {
         let all: Vec<usize> = (0..width).collect();
         let staged = context.conform(&values, &all, true)?;
 
-        // Each rowid's staged row, as (batch, row in batch).
+        // Each rowid's first staged row, as (batch, row in batch). Later rows
+        // of the same rowid are ignored.
         let mut source: HashMap<i64, (usize, usize)> = HashMap::new();
         for (batch, ids) in row_ids.iter().enumerate() {
             for (row, row_id) in ids.values().iter().enumerate() {
-                // A repeated rowid is refused. Official's `UPDATE` keeps the
-                // first source row.
-                if source.insert(*row_id, (batch, row)).is_some() {
-                    return Err(DuckLakeError::InvalidConfig(format!(
-                        "rowid {row_id} appears more than once in the staged rows"
-                    )));
-                }
+                source.entry(*row_id).or_insert((batch, row));
             }
         }
         let wanted: Vec<i64> = source.keys().copied().collect();

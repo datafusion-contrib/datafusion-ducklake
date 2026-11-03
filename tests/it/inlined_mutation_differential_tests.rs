@@ -1265,6 +1265,14 @@ pub(crate) fn scenario_update_rowids() -> Scenario {
                 .to_string(),
             update("'many'", "12, 13, 14, 15, 16, 17, 18, 19"),
             update("'again'", "13, 14"),
+            // A join that matches rowid 20 twice updates it once.
+            "/* api update_rowids SELECT t.id, src.v AS v, t.rowid FROM lake.main.t t \
+             JOIN (VALUES (20, 'dup'), (20, 'dup'), (21, 'dup')) AS src(rid, v) \
+             ON t.rowid = src.rid */ \
+             UPDATE lake.main.t SET v = src.v \
+             FROM (VALUES (20, 'dup'), (20, 'dup'), (21, 'dup')) AS src(rid, v) \
+             WHERE t.rowid = src.rid"
+                .to_string(),
             "CALL ducklake_flush_inlined_data('lake')".to_string(),
             update("'flushed'", "0, 3, 20"),
             update("'after flush'", "1, 2, 4, 5, 12, 15, 21, 22"),

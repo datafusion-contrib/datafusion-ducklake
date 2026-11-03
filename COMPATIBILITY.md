@@ -1084,9 +1084,10 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   each live row named by a staged `rowid` takes that staged row's values and keeps its `rowid`,
   in one snapshot. Official's `UPDATE ... WHERE rowid IN (...)` does the same. A staged batch
   holds the table's columns, found by name and typed as for keyed mutations. Its last column is
-  the `rowid`, taken by position. A `rowid` that no live row has is ignored. A NULL or repeated
-  `rowid` is refused before anything is written. Official's `UPDATE ... FROM`, whose join can
-  match one row to several source rows, keeps the first source row and ignores the others. The
+  the `rowid`, taken by position. A `rowid` that no live row has is ignored. A NULL `rowid` is
+  refused before anything is written. A `rowid` given more than once takes its first staged row,
+  in batch order, and the others are ignored. Official's `UPDATE ... FROM`, whose join can match
+  one row to several source rows, applies one of the matches, without a defined choice. The
   old and new versions are recorded as `update_by_keys` records them. New versions that number at
   most the table's limit are inlined, so with inlining enabled a 1-row update writes no data file.
   Official reads the data files before the inlined rows, and its new versions follow its scan

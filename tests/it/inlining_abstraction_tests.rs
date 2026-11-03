@@ -1527,8 +1527,9 @@ fn rowid_rows(
 
 /// `update_rowids` gives each live row named by `rowid` its staged values and
 /// keeps its `rowid`, in Parquet files and inlined rows, in one snapshot;
-/// ignores dead and unknown rowids; commits nothing when none matches; and
-/// refuses malformed input before anything is written.
+/// ignores dead and unknown rowids; takes a repeated rowid's first staged
+/// row; commits nothing when none matches; and refuses malformed input before
+/// anything is written.
 pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
     let lake = keyed_table(&make).await;
     let before = lake.rows("t").await;
@@ -1537,22 +1538,6 @@ pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
     let head = lake.head();
 
     let refusals: Vec<(&str, Vec<RecordBatch>)> = vec![
-        (
-            "a rowid twice in one batch",
-            vec![rowid_rows(
-                &[6, 6],
-                &["x", "y"],
-                vec![Some(parquet), Some(parquet)],
-                "rowid",
-            )],
-        ),
-        (
-            "a rowid twice across batches",
-            vec![
-                rowid_rows(&[6], &["x"], vec![Some(parquet)], "rowid"),
-                rowid_rows(&[6], &["y"], vec![Some(parquet)], "rowid"),
-            ],
-        ),
         (
             "a NULL rowid",
             vec![rowid_rows(&[6], &["x"], vec![None], "rowid")],
@@ -1770,6 +1755,31 @@ pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
     let rows = lake.rows("t").await;
     assert_eq!(row_ids(&rows)[&8], ids[&8]);
     assert_eq!(values(&rows)[&8], vec!["u8".to_string()]);
+
+    // A rowid given more than once, in one batch and across batches, takes
+    // its first staged row.
+    let (ctx, table) = lake.table("t").await;
+    let repeated = table
+        .update_rowids(
+            &ctx.state(),
+            vec![
+                rowid_rows(
+                    &[11, 102, 11],
+                    &["first", "first", "second"],
+                    vec![Some(ids[&11]), Some(ids[&102]), Some(ids[&11])],
+                    "rowid",
+                ),
+                rowid_rows(&[102], &["second"], vec![Some(ids[&102])], "rowid"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.rows_updated, 2);
+    let rows = lake.rows("t").await;
+    for id in [11, 102] {
+        assert_eq!(row_ids(&rows)[&id], ids[&id], "{id}");
+        assert_eq!(values(&rows)[&id], vec!["first".to_string()], "{id}");
+    }
 }
 
 /// `update_rowids` on a table read before another commit deleted one of its
