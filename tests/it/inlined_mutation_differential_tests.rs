@@ -1268,9 +1268,7 @@ pub(crate) fn scenario_update_rowids() -> Scenario {
             "CALL ducklake_flush_inlined_data('lake')".to_string(),
             update("'flushed'", "0, 3, 20"),
             update("'after flush'", "1, 2, 4, 5, 12, 15, 21, 22"),
-            // Last: official orders the new versions of inlined and Parquet
-            // rows as its parallel scan returns them, so no later statement
-            // reads this file's positions.
+            // Last: the rows come from inlined rows and several files.
             update("'mixed'", "0, 3, 20, 16, 17, 18"),
         ],
         limit: LIMIT,
@@ -1304,6 +1302,33 @@ pub(crate) fn scenario_update_rowids_partitioned() -> Scenario {
     }
 }
 
+/// [`scenario_schema_evolution`]'s table, updated by rowid: inlined rows of
+/// the table's first schema and of its second, and Parquet rows.
+pub(crate) fn scenario_update_rowids_schema_evolution() -> Scenario {
+    let base = scenario_schema_evolution();
+    let update = |v: &str, w: &str, predicate: &str| {
+        format!(
+            "/* api update_rowids SELECT id, {v} AS v, {w} AS w, rowid FROM lake.main.t \
+             WHERE {predicate} */ UPDATE lake.main.t SET v = {v}, w = {w} WHERE {predicate}"
+        )
+    };
+    Scenario {
+        name: "update_rowids_schema_evolution",
+        official_setup: base.official_setup,
+        crate_setup: base.crate_setup,
+        statements: vec![
+            update("v", "CAST(id * 10 AS INTEGER)", "id IN (1, 3, 11)"),
+            update("'y'", "w", "id = 2"),
+            "CALL ducklake_flush_inlined_data('lake')".to_string(),
+            update("'z'", "w", "id IN (1, 2)"),
+            // Last: the rows come from several files.
+            update("'last'", "CAST(id AS INTEGER)", "w IS NULL OR id = 3"),
+        ],
+        limit: LIMIT,
+        known_differences: base.known_differences,
+    }
+}
+
 pub(crate) fn scenarios() -> Vec<Scenario> {
     vec![
         scenario_basic(),
@@ -1315,6 +1340,7 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
         scenario_row_apis(),
         scenario_update_rowids(),
         scenario_update_rowids_partitioned(),
+        scenario_update_rowids_schema_evolution(),
     ]
 }
 
@@ -1427,6 +1453,11 @@ mod sqlite {
     #[tokio::test(flavor = "multi_thread")]
     async fn update_rowids_partitioned() {
         run(scenario_update_rowids_partitioned()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_schema_evolution() {
+        run(scenario_update_rowids_schema_evolution()).await;
     }
 }
 
@@ -3564,6 +3595,11 @@ mod duckdb_backend {
     #[tokio::test(flavor = "multi_thread")]
     async fn update_rowids_partitioned() {
         run(scenario_update_rowids_partitioned()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_schema_evolution() {
+        run(scenario_update_rowids_schema_evolution()).await;
     }
 }
 

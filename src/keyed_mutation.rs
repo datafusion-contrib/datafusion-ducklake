@@ -123,7 +123,8 @@ pub struct KeyedMutationResult {
     /// Rows deleted: by [`KeyedMutation::delete_by_keys`], or replaced by
     /// [`KeyedMutation::upsert_by_keys`].
     pub rows_deleted: u64,
-    /// Rows [`KeyedMutation::update_by_keys`] gave new values.
+    /// Rows [`KeyedMutation::update_by_keys`] or
+    /// [`DuckLakeTable::update_rowids`] gave new values.
     pub rows_updated: u64,
     /// Rows [`KeyedMutation::upsert_by_keys`] appended.
     pub rows_inserted: u64,
@@ -143,8 +144,9 @@ pub struct KeyedMutation<'a> {
     table: &'a DuckLakeTable,
     key_columns: Vec<String>,
     concurrency: Option<usize>,
-    /// Set for [`DuckLakeTable::delete_positions`] and
-    /// [`DuckLakeTable::delete_rowids`], which name rows without keys.
+    /// Set for [`DuckLakeTable::delete_positions`],
+    /// [`DuckLakeTable::delete_rowids`] and [`DuckLakeTable::update_rowids`],
+    /// which name rows without keys.
     by_position: bool,
 }
 
@@ -237,10 +239,11 @@ impl DuckLakeTable {
     ///
     /// Refused with [`DuckLakeError::InvalidConfig`] before anything is
     /// written: a missing or extra column, a value whose type does not widen
-    /// to its column's without loss, a `rowid` column that is not `Int64`, a
-    /// NULL `rowid`, and a `rowid` given twice across all batches. A NULL in a
-    /// `NOT NULL` column fails with the `NOT NULL constraint failed` error,
-    /// also before anything is written.
+    /// to its column's without loss, a `rowid` column that is not `Int64`
+    /// (each checked in empty batches too), a NULL `rowid`, and a `rowid`
+    /// given twice across all batches. A NULL in a `NOT NULL` column of a row
+    /// that replaces a live row fails with the `NOT NULL constraint failed`
+    /// error, also before anything is written.
     ///
     /// A `rowid` no live row has at this table's snapshot (deleted, never
     /// assigned, or a row of a merged file inserted after the snapshot) is
@@ -264,10 +267,6 @@ impl DuckLakeTable {
         };
         let context = mutation.context(state)?;
         let width = context.physical_schema.fields().len();
-        let rows: Vec<RecordBatch> = rows
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .collect();
         let mut values = Vec::with_capacity(rows.len());
         let mut row_ids: Vec<arrow::array::Int64Array> = Vec::with_capacity(rows.len());
         for batch in &rows {
@@ -295,7 +294,10 @@ impl DuckLakeTable {
                     "the trailing rowid column holds a NULL".to_string(),
                 ));
             }
-            row_ids.push(ids.clone());
+            // The rowids of the non-empty batches, as `conform` returns them.
+            if batch.num_rows() > 0 {
+                row_ids.push(ids.clone());
+            }
             values.push(batch.project(&(0..width).collect::<Vec<_>>())?);
         }
         let all: Vec<usize> = (0..width).collect();
@@ -337,12 +339,15 @@ impl DuckLakeTable {
                     .push((position, row.row_id)),
             }
         }
-        superseded_inlined.sort_by_key(|row| row.row_id);
-        let mut order: Vec<i64> = superseded_inlined.iter().map(|row| row.row_id).collect();
+        // The new versions: each file's rows by position, files by id, then
+        // the inlined rows by rowid.
+        let mut order: Vec<i64> = Vec::new();
         for rows in by_file.values_mut() {
             rows.sort_unstable();
             order.extend(rows.iter().map(|(_, row_id)| *row_id));
         }
+        superseded_inlined.sort_by_key(|row| row.row_id);
+        order.extend(superseded_inlined.iter().map(|row| row.row_id));
         let rows_updated = order.len() as u64;
         if rows_updated == 0 {
             return Ok(KeyedMutationResult::default());

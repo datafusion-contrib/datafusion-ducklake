@@ -1115,3 +1115,33 @@ async fn update_rowids_refuses_null_in_a_not_null_column() {
     );
     assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
 }
+
+/// `update_rowids` on a table read before a merge replaced the files its rows
+/// are in fails with a conflict and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_conflicts_with_a_later_merge() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+    let (ctx, stale) = writable_table(&temp).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    let p = pool(&temp).await;
+    let head = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+
+    let error = stale
+        .update_rowids(&ctx.state(), vec![rowid_batch(vec![1], vec![11], vec![0])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "got {error}"
+    );
+    assert_eq!(
+        scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await,
+        head
+    );
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+    );
+}

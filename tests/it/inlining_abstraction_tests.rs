@@ -1610,6 +1610,39 @@ pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
             ],
         ),
     ];
+    let refusals: Vec<(&str, Vec<RecordBatch>)> = refusals
+        .into_iter()
+        .chain([
+            (
+                "a wrong column name",
+                vec![
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("id", DataType::Int64, true),
+                            Field::new("w", DataType::Utf8, true),
+                            Field::new("rowid", DataType::Int64, true),
+                        ])),
+                        vec![
+                            Arc::new(Int64Array::from(vec![6])),
+                            Arc::new(StringArray::from(vec!["x"])),
+                            Arc::new(Int64Array::from(vec![parquet])),
+                        ],
+                    )
+                    .unwrap(),
+                ],
+            ),
+            (
+                "an empty batch with a missing column",
+                vec![
+                    rowid_rows(&[6], &["x"], vec![Some(parquet)], "rowid"),
+                    RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, true),
+                        Field::new("rowid", DataType::Int64, true),
+                    ]))),
+                ],
+            ),
+        ])
+        .collect();
     for (case, rows) in refusals {
         let (ctx, table) = lake.table("t").await;
         let refused = table.update_rowids(&ctx.state(), rows).await;
@@ -1685,6 +1718,30 @@ pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
         after, want,
         "each row keeps its rowid, every other row unchanged"
     );
+
+    // Columns are found by name, in any order, and a narrower type widens.
+    let (ctx, table) = lake.table("t").await;
+    let reordered = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true),
+            Field::new("rowid", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["u9"])),
+            Arc::new(arrow::array::Int32Array::from(vec![9])),
+            Arc::new(Int64Array::from(vec![ids[&9]])),
+        ],
+    )
+    .unwrap();
+    let result = table
+        .update_rowids(&ctx.state(), vec![reordered])
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 1);
+    let rows = lake.rows("t").await;
+    assert_eq!(row_ids(&rows)[&9], ids[&9]);
+    assert_eq!(values(&rows)[&9], vec!["u9".to_string()]);
 
     // A 1-row update of a Parquet row under the limit stays inlined.
     let inlined_before = lake.inlined_rows("t");

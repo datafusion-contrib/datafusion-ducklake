@@ -1085,11 +1085,12 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   in one snapshot. Official's `UPDATE ... WHERE rowid IN (...)` does the same. A staged batch
   holds the table's columns, found by name and typed as for keyed mutations. Its last column is
   the `rowid`, taken by position. A `rowid` that no live row has is ignored. A NULL or repeated
-  `rowid` is refused before anything is written. The old and new versions are recorded as
-  `update_by_keys` records them. At most the limit's new versions are inlined, so a 1-row update
-  writes no data file. An update over the limit can mix inlined and Parquet rows. Official then
-  orders the new versions as its parallel scan returns them. This crate writes the inlined rows
-  first, then each file's rows by position.
+  `rowid` is refused before anything is written. Official's `UPDATE` keeps the first source row
+  for a repeated row and ignores the others. The old and new versions are recorded as
+  `update_by_keys` records them. New versions that number at most the table's limit are inlined,
+  so with inlining enabled a 1-row update writes no data file. Official lists the data files
+  before the inlined rows, and its new versions follow its scan order. This crate writes each
+  file's rows by position, files by id, then the inlined rows by `rowid`.
 - **Row lookup by `rowid`** (`DuckLakeTable::locate_rowids`, `read_rows_by_rowid`,
   `read_columns_by_rowid`): where each live row is (inlined, or a data file and position) and the
   rows themselves, reading only the files that hold them. `read_columns_by_rowid` reads only the
