@@ -601,16 +601,33 @@ jobs:
           path: /mnt/cargo-target
           key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
 
+  # Four shards split the suite between them, and one more runs the
+  # `pushdown_row_preservation_*` tests. Each of those runs one long loop of
+  # scenarios on one backend, 282–395 s on a CI runner, and was the slowest test
+  # in whichever shard it landed in; the shard holding the MySQL one finished
+  # four minutes after the rest (run 41725526057). Together they still fit in
+  # one shard's time on a runner of their own.
+  #
+  # Both sides use `SLOW_TESTS`, one as `not`, so every test runs exactly once.
+  # `--partition` applies after `-E`, so the four slices split only what the
+  # filter keeps.
   test-full-shard:
-    name: Test shard ${{ matrix.shard }}/4
+    name: ${{ matrix.name }}
     needs: test-full-build
     if: needs.test-full-build.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      SLOW_TESTS: test(/^pushdown_row_preservation_tests::/)
     strategy:
       # Every shard runs to the end, so one run reports every failing test.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        include:
+          - { id: "1", name: "Tests 1/4", partition: "slice:1/4" }
+          - { id: "2", name: "Tests 2/4", partition: "slice:2/4" }
+          - { id: "3", name: "Tests 3/4", partition: "slice:3/4" }
+          - { id: "4", name: "Tests 4/4", partition: "slice:4/4" }
+          - { id: "pushdown", name: "Tests (pushdown parity)", partition: "" }
     steps:
       # Source files are needed at run time: fixtures and
       # `tests/sqllogictests/` are read from the checkout.
@@ -648,22 +665,29 @@ jobs:
       # `slice` deals tests out in turn, so a module's slow tests (the fuzz
       # seeds sit next to each other) are spread across shards rather than
       # landing together as they can with `hash`.
-      - name: Run test shard
+      - name: Run tests
+        env:
+          PARTITION: ${{ matrix.partition }}
         run: |
           sudo mkdir -p /mnt/nextest
           sudo chown "$(id -un)" /mnt/nextest
+          if [[ -n "$PARTITION" ]]; then
+            selection=(--partition "$PARTITION" -E "not $SLOW_TESTS")
+          else
+            selection=(-E "$SLOW_TESTS")
+          fi
           cargo-nextest nextest run \
             --profile ci \
             --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
             --workspace-remap . \
             --extract-to /mnt/nextest \
-            --partition slice:${{ matrix.shard }}/4
+            "${selection[@]}"
 
       - name: Upload test timings
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: junit-shard-${{ matrix.shard }}
+          name: junit-${{ matrix.id }}
           # Reports go under the checkout's `target/`, not the extracted one.
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
