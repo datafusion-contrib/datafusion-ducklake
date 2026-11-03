@@ -403,7 +403,12 @@ impl DuckLakeTable {
             .map_err(from_df)?;
         let superseded_positions = scans
             .iter()
-            .map(|(scan, positions)| (scan, positions.clone()))
+            .map(|(scan, positions)| {
+                (
+                    crate::delete_exec::DeletionTarget::of_scan(scan),
+                    positions.clone(),
+                )
+            })
             .collect();
 
         let snapshot_id = crate::update_exec::commit_row_versions(
@@ -418,10 +423,10 @@ impl DuckLakeTable {
                 inline_limit: context.inline_limit,
             },
             vec![updated],
+            Vec::new(),
             superseded_positions,
             Vec::new(),
             superseded_inlined,
-            rows_updated,
         )
         .await
         .map_err(from_df)?;
