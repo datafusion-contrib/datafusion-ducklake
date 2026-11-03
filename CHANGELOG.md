@@ -257,6 +257,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A merge of rowid-adjacent files reads its sources' partitions one after another instead of
+  merging them by source order. The merge held one decoded batch of every partition in memory it
+  could not spill, so wide rows failed with "Resources exhausted" under a pool that holds a few
+  batches; the output order is unchanged.
 - A data file's first row group counts the values of `Utf8View` and `BinaryView` columns, at any
   depth, toward `max_row_group_bytes`. Only their 16-byte views were counted, so a write of wide
   text never reached the byte cap and held every batch of the file in memory until it closed.

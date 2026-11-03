@@ -44,7 +44,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
-use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -52,16 +51,14 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::{
-    EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
-};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    sorts::sort::SortExec, sorts::sort_preserving_merge::SortPreservingMergeExec,
+    sorts::sort::SortExec,
 };
 use futures::{StreamExt, TryStreamExt};
 
@@ -237,25 +234,6 @@ fn resolve_origin_column(
     Ok(Arc::clone(carried))
 }
 
-/// Append `origins` to a `[data columns..., rowid]` batch, yielding the
-/// `[data columns..., rowid, snapshot_id]` `schema` of a merged partial file.
-/// The two trailing columns a rowid-adjacent merge's sources carry:
-/// `(source ordinal, physical position)`, the order the merge writes rows in.
-fn source_order_fields() -> [Arc<Field>; 2] {
-    [
-        Arc::new(Field::new(
-            "__ducklake_merge_source",
-            DataType::Int64,
-            false,
-        )),
-        Arc::new(Field::new(
-            "__ducklake_merge_position",
-            DataType::Int64,
-            false,
-        )),
-    ]
-}
-
 /// One source file of a compaction, as a leaf of the compaction plan.
 ///
 /// Wraps that file's positional read plan and rewrites each batch it produces
@@ -283,8 +261,7 @@ struct CompactionSourceExec {
     /// `[physical columns..., rowid]` — what [`rewrite_scanned_batch`] emits.
     rewrite_schema: SchemaRef,
     /// This exec's output schema: [`Self::rewrite_schema`] plus the embedded
-    /// snapshot-id column when [`Self::origin`] is set, then the source-order
-    /// key columns when [`Self::source_ordinal`] is set.
+    /// snapshot-id column when [`Self::origin`] is set.
     schema: SchemaRef,
     /// Where this file's rows' origin snapshots come from, for a partial merge
     /// output; `None` leaves the batch at `[physical columns..., rowid]`.
@@ -301,12 +278,6 @@ struct CompactionSourceExec {
     /// `partial_max` — so rows would be served at snapshots before they
     /// existed, with the sources retired in the same commit.
     observed_max_origin: Arc<AtomicI64>,
-    /// This source's place in a rowid-adjacent merge's bin. When set, each
-    /// row also carries `(source ordinal, physical position)` as two trailing
-    /// columns, the key [`source_ordered_output`] writes the bin's rows in, so
-    /// the output holds them in source order as official's merge of adjacent
-    /// files does (`PRESERVE_ORDER` on its copy).
-    source_ordinal: Option<i64>,
     properties: Arc<PlanProperties>,
 }
 
@@ -316,17 +287,11 @@ impl CompactionSourceExec {
         physical_schema: SchemaRef,
         origin: Option<OriginSource>,
         observed_max_origin: Arc<AtomicI64>,
-        source_ordinal: Option<i64>,
     ) -> Self {
         let rewrite_schema = rewrite_output_schema(&physical_schema);
-        let schema = if origin.is_some() || source_ordinal.is_some() {
+        let schema = if origin.is_some() {
             let mut fields: Vec<Arc<Field>> = rewrite_schema.fields().iter().cloned().collect();
-            if origin.is_some() {
-                fields.push(Arc::new(snapshot_column_field()));
-            }
-            if source_ordinal.is_some() {
-                fields.extend(source_order_fields());
-            }
+            fields.push(Arc::new(snapshot_column_field()));
             Arc::new(Schema::new(fields))
         } else {
             Arc::clone(&rewrite_schema)
@@ -345,7 +310,6 @@ impl CompactionSourceExec {
             schema,
             origin,
             observed_max_origin,
-            source_ordinal,
             properties,
         }
     }
@@ -405,7 +369,6 @@ impl ExecutionPlan for CompactionSourceExec {
             Arc::clone(&self.physical_schema),
             self.origin,
             Arc::clone(&self.observed_max_origin),
-            self.source_ordinal,
         )))
     }
 
@@ -421,7 +384,6 @@ impl ExecutionPlan for CompactionSourceExec {
         let schema = Arc::clone(&self.schema);
         let origin = self.origin;
         let observed_max_origin = Arc::clone(&self.observed_max_origin);
-        let source_ordinal = self.source_ordinal;
         let stream = input
             .map(move |batch| -> DataFusionResult<Option<RecordBatch>> {
                 let batch = batch?;
@@ -429,8 +391,8 @@ impl ExecutionPlan for CompactionSourceExec {
                 // to select with, no assignments to apply.
                 let Some(RewrittenBatch {
                     batch,
-                    positions,
                     origin_snapshots,
+                    ..
                 }) = rewrite_scanned_batch(
                     &physical_schema,
                     &rewrite_schema,
@@ -444,7 +406,6 @@ impl ExecutionPlan for CompactionSourceExec {
                     // pass it on, so the parquet writer only ever sees rows.
                     return Ok(None);
                 };
-                let rows = batch.num_rows();
                 let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
                 if let Some(origin) = origin {
                     let origins = resolve_origin_column(
@@ -473,10 +434,6 @@ impl ExecutionPlan for CompactionSourceExec {
                         observed_max_origin.fetch_max(batch_max, Ordering::Relaxed);
                     }
                     columns.push(origins);
-                }
-                if let Some(ordinal) = source_ordinal {
-                    columns.push(Arc::new(Int64Array::from(vec![ordinal; rows])));
-                    columns.push(Arc::new(Int64Array::from(positions)));
                 }
                 Ok(Some(RecordBatch::try_new(Arc::clone(&schema), columns)?))
             })
@@ -697,54 +654,40 @@ fn adjacent_row_id_start(bin: &[&DuckLakeTableFile]) -> Option<i64> {
 }
 
 /// Stream a rowid-adjacent merge's rows in source order, as official writes
-/// them (`PRESERVE_ORDER` on its copy of adjacent files), without the
-/// source-order key.
+/// them (`PRESERVE_ORDER` on its copy of adjacent files).
 ///
-/// `input` carries `[data columns..., rowid, (snapshot id), source ordinal,
-/// position]`, the key at `key_index` and `key_index + 1`
-/// (`CompactionSourceExec::source_ordinal`). Each partition of it reads one
-/// byte range of one source in file order, so each is already in key order and
-/// a sort-preserving merge on the key restores the sources' order across
-/// partitions.
+/// Each partition of `input` reads one byte range of one source in file order,
+/// and the partitions are numbered in that same order: the union lists the
+/// bin's sources in order and the byte-range split numbers a file's ranges
+/// ascending. Reading the partitions one after another is therefore the source
+/// order, with nothing to merge.
+///
+/// Only one partition is open at a time, so the rows in flight are one
+/// partition's batch and its reader's buffers, however many partitions the
+/// bin's sources split into. A sort-preserving merge on a source-order key gave
+/// the same order but held one decoded batch per partition in a reservation
+/// that cannot spill, which failed for wide rows against a pool that holds a
+/// few batches but not one per partition.
+///
+/// Reading the sources one at a time rather than concurrently costs no
+/// throughput, because the merge is bound by the single writer this stream
+/// feeds. The sort-preserving merge used about one core on a 1 GiB merge of 12
+/// partitions. Merging three 448 MiB files of wide text, or three 224 MiB files
+/// of numeric columns, took no longer in sequence than through that merge.
+/// Prefetching the next one or two partitions was about 5% faster and took up
+/// to a third more peak memory.
 fn source_ordered_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,
-    key_index: usize,
 ) -> Result<SendableRecordBatchStream> {
     let schema = input.schema();
-    let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
-        let ascending = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let ordering = LexOrdering::new((key_index..key_index + 2).map(|index| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(schema.field(index).name(), index)),
-                ascending,
-            )
-        }))
-        .ok_or_else(|| DuckLakeError::Internal("source ordering is empty".to_string()))?;
-        Arc::new(SortPreservingMergeExec::new(ordering, input))
-    } else {
-        input
-    };
-    leading_columns(input.execute(0, context)?, key_index)
-}
-
-/// `stream` with only its first `count` columns: a rowid-adjacent merge's
-/// rows without their source-order key.
-fn leading_columns(
-    stream: SendableRecordBatchStream,
-    count: usize,
-) -> Result<SendableRecordBatchStream> {
-    let kept: Vec<usize> = (0..count).collect();
-    let output_schema = Arc::new(stream.schema().project(&kept)?);
-    let stream =
-        stream.map(move |batch| -> DataFusionResult<RecordBatch> { Ok(batch?.project(&kept)?) });
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        output_schema,
-        stream,
-    )))
+    let partitions = input.output_partitioning().partition_count();
+    // `execute` runs as each partition's turn comes, so no later partition
+    // opens a reader, or fetches a footer, before the earlier ones are drained.
+    let stream = futures::stream::iter(0..partitions)
+        .map(move |partition| input.execute(partition, Arc::clone(&context)))
+        .try_flatten();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
 impl DuckLakeTable {
@@ -1138,7 +1081,7 @@ impl DuckLakeTable {
             // is what makes the single scan possible — the same shape official
             // DuckLake compaction uses.
             let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(bin.len());
-            for (ordinal, (tf, begin)) in (0i64..).zip(bin.iter().zip(&range_mins)) {
+            for (tf, begin) in bin.iter().zip(&range_mins) {
                 // One fact — does this file physically carry the embedded column
                 // — decides both the scan's projection and where the exec reads
                 // origins from, so the two can never disagree and stamp a
@@ -1165,7 +1108,6 @@ impl DuckLakeTable {
                     Arc::clone(&physical_schema),
                     origin,
                     Arc::clone(&observed_max_origin),
-                    carried_row_id_start.map(|_| ordinal),
                 )));
                 sources.push(CompactionSourceFile {
                     data_file_id: tf.data_file_id,
@@ -1174,16 +1116,13 @@ impl DuckLakeTable {
                 files_processed += 1;
             }
 
-            // Where an adjacent bin's source-order key starts: after the data
-            // columns, the rowid and, for a partial merge, the snapshot id.
-            let key_index = physical_schema.fields().len() + 1 + usize::from(partial);
             // Fresh plan state each time: a scan executed once hands its
             // files out from a shared queue, which a second execution of the
             // same plan finds drained.
             let unsorted = || -> Result<SendableRecordBatchStream> {
                 let input = reset_plan_states(UnionExec::try_new(leaves.clone())?)?;
                 match carried_row_id_start {
-                    Some(_) => source_ordered_output(state.task_ctx(), input, key_index),
+                    Some(_) => source_ordered_output(state.task_ctx(), input),
                     None => sorted_rewrite_output(state.task_ctx(), input, None),
                 }
             };
@@ -1196,10 +1135,6 @@ impl DuckLakeTable {
                         .map_err(DuckLakeError::from)
                         .and_then(|input| {
                             sorted_rewrite_output(state.task_ctx(), input, Some(ordering))
-                        })
-                        .and_then(|sorted| match carried_row_id_start {
-                            Some(_) => leading_columns(sorted, key_index),
-                            None => Ok(sorted),
                         });
                     first_nonempty_sorted(sorted, unsorted).await?
                 },
@@ -1577,9 +1512,6 @@ impl DuckLakeTable {
                 // this and nothing reads it.
                 None,
                 Arc::new(AtomicI64::new(i64::MIN)),
-                // A rewrite writes its rows in any order: its output records
-                // no `row_id_start`.
-                None,
             ));
             // Fresh plan state, as for a merge: the sorted run drained the
             // scan's shared file queue.
