@@ -3070,6 +3070,165 @@ async fn merge_keeps_row_id_start_only_for_adjacent_bins() {
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
 }
 
+/// `main.t(id, val, payload)` as `files` appended data files of
+/// `row_groups_per_file × rows_per_group` rows each, every row carrying a
+/// `payload_bytes`-wide string that does not compress, so a file is as wide
+/// on disk as it is decoded and a byte-range split gives each row group its
+/// own partition.
+async fn seed_wide(
+    temp: &TempDir,
+    files: i32,
+    row_groups_per_file: i32,
+    rows_per_group: i32,
+    payload_bytes: usize,
+) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let rows_per_file = row_groups_per_file * rows_per_group;
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    for file in 0..files {
+        let ids: Vec<i32> = (file * rows_per_file..(file + 1) * rows_per_file).collect();
+        let payloads: Vec<String> = ids
+            .iter()
+            .map(|_| {
+                (0..payload_bytes)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        char::from(b'!' + (state % 94) as u8)
+                    })
+                    .collect()
+            })
+            .collect();
+        let b = batch(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(arrow::array::StringArray::from(payloads)),
+            ],
+        );
+        let writer = if file == 0 {
+            make_writer(temp).await
+        } else {
+            SqliteMetadataWriter::new(&db_url(temp))
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(0)
+        };
+        let writer = DuckLakeTableWriter::new(Arc::new(writer), object_store())
+            .unwrap()
+            .with_max_row_group_rows(usize::try_from(rows_per_group).unwrap());
+        if file == 0 {
+            writer.write_table("main", "t", &[b]).await.unwrap();
+        } else {
+            writer.append_table("main", "t", &[b]).await.unwrap();
+        }
+    }
+}
+
+/// A merge of rowid-adjacent sources streams them one partition after
+/// another, so its memory does not grow with the number of partitions the
+/// bin's sources are split into.
+///
+/// Each source is split into one partition per row group. Merging those
+/// partitions by their source-order key held a decoded batch of every one in
+/// a reservation that cannot spill: 12 partitions of 1 MiB batches against a
+/// 4 MiB pool failed with "Resources exhausted" although the partitions are
+/// disjoint and already in order. The output must still be written in source
+/// order, exactly as a run with an ample pool writes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn adjacent_merge_of_wide_rows_fits_a_pool_smaller_than_its_partitions() {
+    const FILES: i32 = 3;
+    const ROW_GROUPS_PER_FILE: i32 = 4;
+    const ROWS_PER_GROUP: i32 = 256;
+    const PAYLOAD_BYTES: usize = 4 * 1024;
+    const ROWS: i32 = FILES * ROW_GROUPS_PER_FILE * ROWS_PER_GROUP;
+    // One batch is a row group: 256 rows × 4 KiB = 1 MiB decoded. The pool
+    // holds a few of those, but not one per partition (12).
+    const MEMORY_LIMIT: usize = 4 << 20;
+    let batch_bytes = usize::try_from(ROWS_PER_GROUP).unwrap() * PAYLOAD_BYTES;
+    assert!(2 * batch_bytes < MEMORY_LIMIT);
+    assert!(usize::try_from(FILES * ROW_GROUPS_PER_FILE).unwrap() * batch_bytes > MEMORY_LIMIT);
+
+    async fn merge(temp: &TempDir, memory_limit: Option<usize>) -> (CompactionResult, String) {
+        let mut runtime = RuntimeEnvBuilder::new().with_temp_file_path(temp.path().join("spill"));
+        if let Some(limit) = memory_limit {
+            runtime = runtime.with_memory_limit(limit, 1.0);
+        }
+        let config = SessionConfig::new()
+            .with_batch_size(usize::try_from(ROWS_PER_GROUP).unwrap())
+            .with_target_partitions(usize::try_from(ROW_GROUPS_PER_FILE).unwrap())
+            .with_repartition_file_min_size(0);
+        let ctx = SessionContext::new_with_config_rt(config, runtime.build_arc().unwrap());
+        let result = with_writable_table_context(temp, ctx, |table, state| async move {
+            table
+                .merge_adjacent_files(&state, MergeOptions::default())
+                .await
+                .expect("the merge fits the pool")
+        })
+        .await;
+        (result, live_file(&pool(temp).await).await.0)
+    }
+
+    let control = TempDir::new().unwrap();
+    seed_wide(
+        &control,
+        FILES,
+        ROW_GROUPS_PER_FILE,
+        ROWS_PER_GROUP,
+        PAYLOAD_BYTES,
+    )
+    .await;
+    let (_, control_path) = merge(&control, None).await;
+
+    let temp = TempDir::new().unwrap();
+    seed_wide(
+        &temp,
+        FILES,
+        ROW_GROUPS_PER_FILE,
+        ROWS_PER_GROUP,
+        PAYLOAD_BYTES,
+    )
+    .await;
+    let rowids_before = read_id_rowid(&temp).await;
+    let (result, path) = merge(&temp, Some(MEMORY_LIMIT)).await;
+
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: usize::try_from(FILES).unwrap(),
+            files_created: 1,
+            rows_written: i64::from(ROWS),
+            inlined_flush_snapshot: None,
+        },
+    );
+    let (_, row_id_start, record_count) = live_file(&pool(&temp).await).await;
+    assert_eq!((row_id_start, record_count), (Some(0), i64::from(ROWS)));
+    // Written in source order, row for row as the ample-pool run writes it.
+    assert_eq!(file_values(&temp, &path), (0..ROWS).collect::<Vec<_>>());
+    assert_eq!(
+        file_values(&temp, &path),
+        file_values(&control, &control_path)
+    );
+    assert_eq!(
+        file_lineage(&temp, &path),
+        file_lineage(&control, &control_path)
+    );
+    assert_eq!(
+        file_lineage(&temp, &path)
+            .into_iter()
+            .map(|(rowid, _)| rowid)
+            .collect::<Vec<_>>(),
+        (0..i64::from(ROWS)).map(Some).collect::<Vec<_>>(),
+    );
+    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+}
+
 /// A sorted merge of rowid-adjacent files keeps the first source's
 /// `row_id_start` and writes the rows in sorted order, each with its rowid, as
 /// official DuckLake's does since duckdb/ducklake#1611. Every row keeps its

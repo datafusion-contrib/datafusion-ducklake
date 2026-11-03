@@ -255,6 +255,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A merge of rowid-adjacent files reads its sources' partitions one after another instead of
+  merging them by source order. The merge held one decoded batch of every partition in memory it
+  could not spill, so wide rows failed with "Resources exhausted" under a pool that holds a few
+  batches; the output order is unchanged.
 - PostgreSQL: `register_existing_data_files` and `MulticatalogManager::fork_table` resolve a
   partition key's column by its field id. A nested column (a list, a struct) before the key
   made them check the key's value against another column's type, refusing a valid fork
