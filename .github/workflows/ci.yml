@@ -281,6 +281,7 @@ jobs:
           path: ${{ runner.os == 'Linux' && '/mnt/cargo-target' || 'target' }}
           key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
 
+
   # Every other job builds with `--all-features` or `write-sqlite`, which only
   # proves the union of features compiles. It cannot catch a module that
   # accidentally depends on a sibling feature, because a stronger feature set
@@ -292,10 +293,54 @@ jobs:
   # Runs on one OS by design: this checks `#[cfg(feature = ...)]` resolution, which
   # is platform-independent (the crate has no `target_os`/`target_arch` cfgs and no
   # platform-conditional dependencies), so a second OS would only duplicate compute.
-  # Its own job so it runs concurrently with `check` instead of doubling that job.
+  #
+  # Split across runners. Each feature set changes the features of a shared
+  # dependency, so cargo re-checks DataFusion and ~30 other crates for every one
+  # of them: ~2.5 minutes each, 17–30 minutes for the loop on one runner
+  # (runs 41641637676, 41646183059). The groups below put feature sets that share
+  # a dependency graph together, so the later sets in a group reuse the first's
+  # work (`restore` after `write` took 52 s, `multicatalog-postgres` after
+  # `metadata-postgres` 43 s).
+  #
+  # Deliberately NOT target-cached. This is not a required status check, and the
+  # repository's 10 GB cache budget is already ~9.5 GB full, most of it the
+  # `test-full` entry every required run restores.
+  #
+  # No `-D warnings`: a read-only build legitimately reports dead_code for the
+  # write-only helpers, and `#[cfg]`-gating struct fields to silence that would
+  # be worse than the warning.
   feature-check:
-    name: Check feature combinations
+    name: Check features (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Isolate each independently-supported feature axis once. `""` is the
+          # library with no features at all.
+          #
+          # `tests` also checks the test targets on default features. Every
+          # other job names its features, so nothing else compiles the test
+          # targets on bare defaults. That is how two unit tests calling a
+          # `write`-gated method sat broken: `cargo check --tests` failed on
+          # default features and no job ran it.
+          - group: base
+            features: ["", "write", "restore"]
+            tests: true
+          - group: duckdb
+            features: ["metadata-duckdb", "write-duckdb", "metadata-duckdb,encryption"]
+          - group: sqlite
+            features: ["metadata-sqlite", "write-sqlite", "write-sqlite,restore"]
+          - group: postgres, mysql
+            features: ["metadata-postgres", "multicatalog-postgres", "write-postgres", "metadata-mysql", "write-mysql"]
+          # `rust-toolchain.toml` pins a newer compiler than `rust-version`,
+          # because the in-process S3 test server (a dev-dependency) needs it. So
+          # no other job builds on the declared minimum, and a lockfile bump could
+          # raise it silently. Check the library alone on that version: without
+          # and with every library feature, against the committed lockfile.
+          - group: rust-version
+            features: []
+            msrv: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -362,71 +407,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-home-
 
-      # Deliberately NOT target-cached, even though this job recompiles its twelve
-      # feature graphs from scratch every run. Unlike `check` and `test-full`, this
-      # is not a required status check, so its duration never gates a merge — it
-      # costs runner minutes and delays the all-green tick, nothing else. Deleting
-      # the redundant `--workspace --all-targets` check below recovers most of the
-      # time without spending any of the repository's 10 GB cache budget.
-      #
-      # Adding one is now defensible if the runner minutes matter (the save-only-on-
-      # main split elsewhere keeps the budget bounded at roughly 7 GB rather than
-      # letting pull requests fill it), and the entry would be ~1.3 GB of
-      # check-only rmeta. It just has to be worth a third of the budget.
-      #
-      # Isolate each independently-supported feature axis once.
-      #
-      # This used to be preceded by `cargo check --workspace --all-targets`,
-      # which was 496s of the step's 1189s — ~427s of it compiling DuckDB's C++
-      # via `libduckdb-sys`, since `--workspace` picks up the default features and
-      # those include `duckdb-bundled`. It was redundant: `check`'s
-      # `cargo clippy --all-targets --all-features` already covers a superset of
-      # those features and the same targets, and it target-caches that C++ compile.
-      # The one thing it did contribute was workspace scope (the `benchmark`
-      # package), so `--workspace` moved onto that clippy invocation.
-      #
-      # No `-D warnings`: a read-only build legitimately reports dead_code for the
-      # write-only helpers, and `#[cfg]`-gating struct fields to silence that would
-      # be worse than the warning.
       - name: Check feature combinations
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && !matrix.msrv
+        env:
+          FEATURE_SETS: ${{ toJSON(matrix.features) }}
         run: |
-          for features in \
-            "" \
-            metadata-duckdb \
-            metadata-sqlite \
-            metadata-postgres \
-            metadata-mysql \
-            multicatalog-postgres \
-            write \
-            write-duckdb \
-            write-sqlite \
-            write-postgres \
-            write-mysql \
-            restore \
-            write-sqlite,restore \
-            metadata-duckdb,encryption
-          do
+          while IFS= read -r features; do
             echo "::group::cargo check --no-default-features --features '$features'"
             cargo check --no-default-features --features "$features"
             echo "::endgroup::"
-          done
+          done < <(jq -r '.[]' <<<"$FEATURE_SETS")
 
-      # The loop above checks the library only, and every other job names its
-      # features, so nothing else compiles the test targets on bare defaults.
-      # That is how two unit tests calling a `write`-gated method sat broken:
-      # `cargo check --tests` failed on default features and no job ran it.
       - name: Check test targets on default features
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && matrix.tests
         run: cargo check --tests
 
-      # `rust-toolchain.toml` pins a newer compiler than `rust-version`, because
-      # the in-process S3 test server (a dev-dependency) needs it. So no other job
-      # builds on the declared minimum, and a lockfile bump could raise it
-      # silently. Check the library alone on that version: without and with every
-      # library feature, against the committed lockfile.
       - name: Read rust-version
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && matrix.msrv
         id: msrv
         run: |
           msrv=$(cargo metadata --no-deps --format-version 1 \
@@ -434,13 +431,13 @@ jobs:
           echo "version=$msrv" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && matrix.msrv
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Check the library on rust-version
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' && matrix.msrv
         env:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: |
