@@ -257,6 +257,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A data file's first row group counts the values of `Utf8View` and `BinaryView` columns, at any
+  depth, toward `max_row_group_bytes`. Only their 16-byte views were counted, so a write of wide
+  text never reached the byte cap and held every batch of the file in memory until it closed.
+  Counting a column's distinct values in that row group also stops converting its batches to
+  rows once the column is over the dictionary limit.
 - PostgreSQL: `register_existing_data_files` and `MulticatalogManager::fork_table` resolve a
   partition key's column by its field id. A nested column (a list, a struct) before the key
   made them check the key's value against another column's type, refusing a valid fork
