@@ -307,6 +307,8 @@ impl DuckLakeTable {
         let mut source: HashMap<i64, (usize, usize)> = HashMap::new();
         for (batch, ids) in row_ids.iter().enumerate() {
             for (row, row_id) in ids.values().iter().enumerate() {
+                // A repeated rowid is refused. Official's `UPDATE` keeps the
+                // first source row.
                 if source.insert(*row_id, (batch, row)).is_some() {
                     return Err(DuckLakeError::InvalidConfig(format!(
                         "rowid {row_id} appears more than once in the staged rows"
@@ -340,13 +342,15 @@ impl DuckLakeTable {
             }
         }
         // The new versions: each file's rows by position, files by id, then
-        // the inlined rows by rowid.
+        // each inlined table's rows by rowid, tables in the order they are read.
         let mut order: Vec<i64> = Vec::new();
         for rows in by_file.values_mut() {
             rows.sort_unstable();
             order.extend(rows.iter().map(|(_, row_id)| *row_id));
         }
-        superseded_inlined.sort_by_key(|row| row.row_id);
+        for run in superseded_inlined.chunk_by_mut(|a, b| a.table_name == b.table_name) {
+            run.sort_unstable_by_key(|row| row.row_id);
+        }
         order.extend(superseded_inlined.iter().map(|row| row.row_id));
         let rows_updated = order.len() as u64;
         if rows_updated == 0 {

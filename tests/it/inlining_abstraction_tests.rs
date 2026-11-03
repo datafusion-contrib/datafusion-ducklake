@@ -1799,6 +1799,86 @@ pub(crate) async fn update_rowids_conflicts_with_a_later_delete(make: MakeLake) 
     assert_eq!(lake.rows("t").await, before);
 }
 
+/// An `update_rowids` of inlined rows in two schema-version tables, whose
+/// rowids interleave, that writes a data file puts the rows in the order
+/// official's `UPDATE` writes them: one inlined table after another, each by
+/// `rowid`. The values are those of SQL `UPDATE`.
+pub(crate) async fn update_rowids_writes_inlined_tables_in_order(make: MakeLake) {
+    let wide = |ids: &[i64], v: &str, row_ids: Option<&[i64]>| {
+        let mut fields = vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, true),
+            Field::new("w", DataType::Int64, true),
+        ];
+        let mut columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(vec![v; ids.len()])),
+            Arc::new(Int64Array::from(
+                ids.iter().map(|id| id * 10).collect::<Vec<_>>(),
+            )),
+        ];
+        if let Some(row_ids) = row_ids {
+            fields.push(Field::new("rowid", DataType::Int64, true));
+            columns.push(Arc::new(Int64Array::from(row_ids.to_vec())));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    };
+    // Rowids 1 and 2 in the first inlined table, 0 and 3 in the second.
+    let setup = || async {
+        let lake = make(Some(3)).await;
+        create(&lake, "t").await;
+        lake.append("t", &batch([1, 2, 3], "a")).await;
+        lake.append("t", &wide(&[4], "b", None)).await;
+        let (ctx, table) = lake.table("t").await;
+        table
+            .update_rowids(&ctx.state(), vec![wide(&[1], "c", Some(&[0]))])
+            .await
+            .unwrap();
+        lake
+    };
+    let positions = |lake: Lake| async move {
+        let (ctx, table) = lake.table("t").await;
+        let mut out = BTreeMap::new();
+        for row in table
+            .locate_rowids(&ctx.state(), &[0, 1, 2, 3])
+            .await
+            .unwrap()
+        {
+            match row.location {
+                RowLocation::File {
+                    position,
+                    ..
+                } => out.insert(row.row_id, position),
+                other => panic!("rowid {} is not in a file: {other:?}", row.row_id),
+            };
+        }
+        out
+    };
+
+    let by_sql = setup().await;
+    by_sql
+        .sql("UPDATE lake.main.t SET v = 'u', w = id * 10")
+        .await
+        .unwrap();
+    let by_rowid = setup().await;
+    let (ctx, table) = by_rowid.table("t").await;
+    let result = table
+        .update_rowids(
+            &ctx.state(),
+            vec![wide(&[2, 3, 1, 4], "u", Some(&[1, 2, 0, 3]))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 4);
+    assert_eq!(by_rowid.rows("t").await, by_sql.rows("t").await);
+    if by_rowid.inlines {
+        assert_eq!(
+            positions(by_rowid).await,
+            BTreeMap::from([(1, 0), (2, 1), (0, 2), (3, 3)])
+        );
+    }
+}
+
 /// Keys of several columns match on every column; a partitioned table's
 /// upsert writes its rows into their partitions.
 pub(crate) async fn keyed_composite_and_partitioned(make: MakeLake) {
@@ -3003,6 +3083,10 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
         &make,
     )))
     .await;
+    Box::pin(update_rowids_writes_inlined_tables_in_order(Arc::clone(
+        &make,
+    )))
+    .await;
     Box::pin(keyed_composite_and_partitioned(Arc::clone(&make))).await;
     Box::pin(change_detection_sees_inlined_changes(Arc::clone(&make))).await;
     Box::pin(rowid_lookup_everywhere(Arc::clone(&make))).await;
@@ -3051,6 +3135,7 @@ per_backend!(
     keyed_update_keeps_row_ids,
     update_rowids_keeps_row_ids,
     update_rowids_conflicts_with_a_later_delete,
+    update_rowids_writes_inlined_tables_in_order,
     keyed_composite_and_partitioned,
     change_detection_sees_inlined_changes,
     rowid_lookup_everywhere,
