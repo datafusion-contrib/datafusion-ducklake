@@ -284,6 +284,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional deletes, inlined deletions of Parquet rows under the scoped `data_inlining_row_limit`, and inlined-row deletes, mixed in one snapshot; metadata-only truncate; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                      | ✅        |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (Parquet and inlined rows; new versions keep their row ids, inlined under the scoped `data_inlining_row_limit`; one snapshot; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                                                        | ✅        |
+| SQL `MERGE INTO t USING s ON c` (`MATCHED`, `NOT MATCHED`, and `NOT MATCHED BY SOURCE` clauses; one `UPDATE` or `DELETE`, any `INSERT` and `DO NOTHING`; Parquet, inlined, and partitioned targets; one snapshot; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                               | ✅        |
 | Snapshot-based consistency (bound at catalog creation)                                                                                                                                                                                                                                                                           | ✅        |
 | Filter pushdown to Parquet (row-group / page pruning)                                                                                                                                                                                                                                                                            | ✅        |
 | Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file                                                                                                                                                    | ✅        |
@@ -457,6 +458,30 @@ in DataFusion's `information_schema.columns` until its definition becomes planna
 View planning uses a private, snapshot-pinned `SessionContext`, rejects DDL, DML, and statement
 commands, and propagates the catalog's row-lineage option. Caller-registered UDFs and caller session
 settings, including `execution.time_zone`, are not inherited.
+
+`execute_ducklake_sql` runs DuckLake `MERGE INTO` as official DuckLake runs it:
+
+- **Clauses**: `WHEN MATCHED`, `WHEN NOT MATCHED [BY TARGET]`, and `WHEN NOT
+  MATCHED BY SOURCE`, each with an optional `AND` condition; a row takes the
+  first clause of its kind whose condition holds.
+- **Actions**: at most one `UPDATE` or `DELETE` across the matched and
+  by‑source clauses, as official allows, plus any number of `INSERT` and `DO
+  NOTHING` actions. A bare `UPDATE` and a bare `INSERT` take the source
+  columns by position; an `INSERT` column list or `DEFAULT` fills a column
+  with its default.
+- **Duplicate matches**: a target row matched by several source rows takes
+  the first one's values in source order, or is deleted once; every matched
+  pair counts in the affected‑row count. Official keeps the first version to
+  reach its update, so its choice follows its join plan: the first source
+  row when the source is larger than the target, often the last otherwise.
+- **Storage**: everything commits in one snapshot. Updated rows keep their row
+  IDs and are inlined under the scoped `data_inlining_row_limit`; inserted
+  rows draw new row IDs and go to Parquet, one file set per `INSERT` action,
+  in the table's partition layout and in source order. Like official's
+  `MERGE`, it does not sort them by `SET SORTED BY`; official writes them in
+  its join's output order, so their row IDs can differ.
+- **Backends**: SQLite, DuckDB, MySQL, and multi‑catalog PostgreSQL. The
+  single‑catalog PostgreSQL writer runs a `MERGE` that only inserts.
 
 ---
 

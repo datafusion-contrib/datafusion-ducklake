@@ -1,4 +1,4 @@
-//! Postgres (multicatalog) coverage for SQL `UPDATE` end to end.
+//! Postgres (multicatalog) coverage for SQL row mutations end to end.
 //!
 //! The UPDATE commit reuses the append-with-deletes primitives (validated on
 //! Postgres by `append_with_deletes_postgres_tests.rs`); what these cover is the
@@ -19,9 +19,11 @@ use datafusion::prelude::*;
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, MulticatalogManager,
     MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection, SortField,
+    execute_ducklake_sql,
 };
 use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rstest::rstest;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
@@ -80,6 +82,31 @@ async fn writable_ctx(
     let ctx = SessionContext::new();
     ctx.register_catalog(cat_name, Arc::new(catalog));
     ctx
+}
+
+async fn writable_catalog(
+    pool: &PgPool,
+    cat_name: &str,
+    cat: i64,
+    data: &std::path::Path,
+    inline_limit: usize,
+) -> (SessionContext, Arc<DuckLakeCatalog>) {
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap()
+        .with_data_inlining_row_limit(inline_limit);
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let catalog =
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap());
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        cat_name,
+        Arc::clone(&catalog) as Arc<dyn datafusion::catalog::CatalogProvider>,
+    );
+    (ctx, catalog)
 }
 
 async fn read_rowid_rows(pool: &PgPool, cat_name: &str) -> Vec<(i64, i32, i32)> {
@@ -173,6 +200,101 @@ async fn update_where_end_to_end_postgres() {
         read_rowid_rows(&pool, cat_name).await,
         vec![(0, 1, 10), (1, 2, 200), (2, 3, 30), (3, 4, 400)],
         "values updated in place; rowids 1 and 3 preserved across the rewrite"
+    );
+}
+
+/// The updated row keeps its row id, inlined under the limit or in a file
+/// that embeds it; the inserted row goes to Parquet, as official's `MERGE`
+/// inserts, and draws the next row id after the updated row's file advanced
+/// the counter.
+#[rstest]
+#[case::inlined(10, vec![Some(2)], 3, 2)]
+#[case::parquet(0, vec![Some(2), Some(3)], 4, 3)]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn merge_upsert_end_to_end_postgres(
+    #[case] inline_limit: usize,
+    #[case] expected_row_id_starts: Vec<Option<i64>>,
+    #[case] expected_next_row_id: i64,
+    #[case] inserted_rowid: i64,
+) {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog_name = "cat";
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog(catalog_name)
+        .await
+        .unwrap();
+    let seed = RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let created = DuckLakeTableWriter::new(
+        writer_for(&pool, catalog_id, &data).await,
+        Arc::new(LocalFileSystem::new()),
+    )
+    .unwrap()
+    .write_table("public", "t", &[seed])
+    .await
+    .unwrap();
+    let provider = MulticatalogProvider::with_pool(pool.clone(), catalog_name)
+        .await
+        .unwrap();
+    let before = provider.get_current_snapshot().unwrap();
+    let (ctx, catalog) =
+        writable_catalog(&pool, catalog_name, catalog_id, &data, inline_limit).await;
+
+    let batches = execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "MERGE INTO cat.public.t AS target
+         USING (VALUES (2, 200), (3, 300)) AS source(id, val)
+         ON target.id = source.id
+         WHEN MATCHED THEN UPDATE
+         WHEN NOT MATCHED THEN INSERT",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    let next_row_id: i64 =
+        sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+            .bind(created.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let after = MulticatalogProvider::with_pool(pool.clone(), catalog_name)
+        .await
+        .unwrap()
+        .get_current_snapshot()
+        .unwrap();
+    let row_id_starts: Vec<Option<i64>> = sqlx::query_scalar(
+        "SELECT row_id_start FROM ducklake_data_file
+         WHERE table_id = $1 AND begin_snapshot = $2 ORDER BY data_file_id",
+    )
+    .bind(created.table_id)
+    .bind(after)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(after, before + 1);
+    assert_eq!(next_row_id, expected_next_row_id);
+    assert_eq!(row_id_starts, expected_row_id_starts);
+    assert_eq!(
+        read_rowid_rows(&pool, catalog_name).await,
+        vec![(0, 1, 10), (1, 2, 200), (inserted_rowid, 3, 300)]
     );
 }
 

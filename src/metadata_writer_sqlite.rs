@@ -6091,7 +6091,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     &write.column_ids,
                     write.mode,
                     write.base_snapshot_id,
-                    !matches!(write.data, StagedTableData::None),
+                    write.inserts_rows(),
                     self.reserved_tables.take(write.table_id),
                 )
                 .await?;
@@ -6107,6 +6107,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                         commit_inlined_at_snapshot(&mut tx, snapshot_id, write, batches).await?;
                     },
                     StagedTableData::None => {},
+                }
+                if !write.inserted_files.is_empty() {
+                    commit_files_at_snapshot(&mut tx, snapshot_id, write, &write.inserted_files)
+                        .await?;
                 }
                 apply_positional_deletes(
                     &mut tx,
@@ -8241,6 +8245,7 @@ mod tests {
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
                 inlined_row_ids: None,
+                inserted_files: Vec::new(),
                 inlined_file_deletes: Vec::new(),
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),

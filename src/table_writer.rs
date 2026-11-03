@@ -1312,6 +1312,34 @@ impl DuckLakeTableWriter {
         )
     }
 
+    /// Begin an append session that writes Parquet files as
+    /// [`Self::begin_write`] does but never inlines, for the rows a `MERGE`
+    /// inserts: official plans its `INSERT` action without inlining
+    /// (`ducklake_merge_into.cpp`).
+    pub(crate) fn begin_write_without_inlining(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+    ) -> Result<TableWriteSession> {
+        let table_key = self.table_key(schema_name, table_name)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            table_key,
+            file_name.clone(),
+            file_name,
+            true,
+            false,
+            WriteMode::Append,
+            StreamPartitionMode::Split,
+            true,
+            false,
+        )
+    }
+
     /// Begin a streaming write session that writes ONE data file, however large the
     /// input.
     ///
@@ -2910,6 +2938,7 @@ impl DuckLakeTableWriter {
                     positional_deletes: Vec::new(),
                     inlined_deletes: Vec::new(),
                     inlined_row_ids: None,
+                    inserted_files: Vec::new(),
                     inlined_file_deletes: Vec::new(),
                     rewritten_deletes: Vec::new(),
                     dropped_files: Vec::new(),
@@ -2980,6 +3009,7 @@ impl DuckLakeTableWriter {
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
                 inlined_row_ids: None,
+                inserted_files: Vec::new(),
                 inlined_file_deletes: Vec::new(),
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
@@ -3780,6 +3810,7 @@ impl DuckLakeWriteTransaction<'_> {
                 positional_deletes: positional_deletes.to_vec(),
                 inlined_deletes: inlined_deletes.to_vec(),
                 inlined_row_ids: None,
+                inserted_files: Vec::new(),
                 inlined_file_deletes: Vec::new(),
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
@@ -3794,10 +3825,11 @@ impl DuckLakeWriteTransaction<'_> {
         Ok(())
     }
 
-    /// Stages the changes one SQL `UPDATE` or `DELETE` makes to a table read at
-    /// `base_snapshot`: `data` holds the new row versions (Parquet files the
-    /// caller uploaded, or inlined rows that keep `inlined_row_ids`), followed by
-    /// the deletions of the rows they replace or remove. The transaction owns
+    /// Stages the changes one SQL `UPDATE`, `DELETE` or `MERGE` makes to a table
+    /// read at `base_snapshot`: `data` holds the new row versions (Parquet files
+    /// the caller uploaded, or inlined rows that keep `inlined_row_ids`),
+    /// `inserted_files` a `MERGE`'s inserted rows, which draw new row ids,
+    /// followed by the deletions of the rows they replace or remove. The transaction owns
     /// the uploaded data and delete files: they are removed when staging them
     /// fails validation or the commit is rejected. A database or transport
     /// error while staging leaves them, as it does at the commit, to
@@ -3818,6 +3850,7 @@ impl DuckLakeWriteTransaction<'_> {
         base_snapshot: i64,
         data: StagedTableData,
         inlined_row_ids: Option<Vec<i64>>,
+        inserted_files: Vec<DataFileInfo>,
         positional_deletes: Vec<DeleteFileEntry>,
         rewritten: Vec<RewrittenDelete>,
         inlined_deletes: Vec<InlinedRowRef>,
@@ -3840,6 +3873,7 @@ impl DuckLakeWriteTransaction<'_> {
             .chain(
                 data_files
                     .iter()
+                    .chain(&inserted_files)
                     .map(|file| (&file.path, file.path_is_relative)),
             )
             .filter_map(|(path, relative)| {
@@ -3857,6 +3891,7 @@ impl DuckLakeWriteTransaction<'_> {
             base_snapshot,
             data,
             inlined_row_ids,
+            inserted_files,
             positional_deletes,
             rewritten,
             inlined_deletes,
@@ -3886,6 +3921,7 @@ impl DuckLakeWriteTransaction<'_> {
         base_snapshot: i64,
         data: StagedTableData,
         inlined_row_ids: Option<Vec<i64>>,
+        inserted_files: Vec<DataFileInfo>,
         positional_deletes: Vec<DeleteFileEntry>,
         rewritten: Vec<RewrittenDelete>,
         inlined_deletes: Vec<InlinedRowRef>,
@@ -3942,6 +3978,20 @@ impl DuckLakeWriteTransaction<'_> {
             },
             StagedTableData::None => (0, 0),
         };
+        for file in &inserted_files {
+            object_paths.push(self.writer.staged_object_path(
+                schema_name,
+                table_name,
+                &file.path,
+                file.path_is_relative,
+            )?);
+        }
+        let files_written = files_written + inserted_files.len();
+        let records_written = records_written
+            + inserted_files
+                .iter()
+                .map(|file| file.record_count)
+                .sum::<i64>();
         self.writes.push(PreparedTableWrite {
             write: StagedTableWrite {
                 table_id,
@@ -3957,6 +4007,7 @@ impl DuckLakeWriteTransaction<'_> {
                 rewritten_deletes,
                 inlined_deletes,
                 inlined_row_ids,
+                inserted_files,
                 inlined_file_deletes,
                 dropped_files,
                 inlined_flush: false,
@@ -5668,6 +5719,7 @@ impl TableWriteSession {
             rewritten_deletes: Vec::new(),
             inlined_deletes: Vec::new(),
             inlined_row_ids: None,
+            inserted_files: Vec::new(),
             inlined_file_deletes: Vec::new(),
             dropped_files: Vec::new(),
             inlined_flush: false,
@@ -6248,6 +6300,7 @@ mod tests {
                 written.snapshot_id,
                 StagedTableData::None,
                 None,
+                Vec::new(),
                 vec![entry.clone(), entry],
                 Vec::new(),
                 Vec::new(),

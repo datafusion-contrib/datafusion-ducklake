@@ -4775,7 +4775,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 &write.column_ids,
                 write.mode,
                 write.base_snapshot_id,
-                !matches!(write.data, StagedTableData::None),
+                write.inserts_rows(),
             )?;
             tables.push(CommitIds {
                 snapshot_id,
@@ -4792,6 +4792,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     commit_staged_inline(&tx, snapshot_id, write, batches)?;
                 },
                 StagedTableData::None => {},
+            }
+            if !write.inserted_files.is_empty() {
+                commit_staged_files(&tx, snapshot_id, write, &write.inserted_files)?;
             }
             for entry in &write.positional_deletes {
                 apply_delete_entry(

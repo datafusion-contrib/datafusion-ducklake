@@ -606,6 +606,7 @@ impl<'a> RestoreContext<'a> {
                 base_snapshot,
                 data,
                 row_ids,
+                Vec::new(),
                 deletions.positional,
                 deletions.rewritten,
                 removed_inlined,
