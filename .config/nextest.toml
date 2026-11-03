@@ -1,0 +1,12 @@
+# Used by CI's sharded `test-full` job (`--profile ci`). Local `cargo nextest run`
+# uses the default profile; `cargo test` is unaffected.
+
+[profile.ci]
+# Run every test in the shard and report all failures, not just the first.
+fail-fast = false
+# Flag tests that run past a minute in the log, so slow tests are visible
+# without downloading the JUnit report.
+slow-timeout = { period = "60s" }
+failure-output = "immediate-final"
+# Per-test durations, uploaded as an artifact by each shard.
+junit = { path = "junit.xml" }

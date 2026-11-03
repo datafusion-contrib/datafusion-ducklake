@@ -449,15 +449,33 @@ jobs:
             "metadata-duckdb metadata-postgres metadata-mysql metadata-sqlite encryption write-sqlite write-postgres write-duckdb write-mysql"
 
 
-  test-full:
-    name: Test (single-catalog backends + encryption, Docker)
+  # The full suite is split across runners. Compiling it takes about 3 minutes
+  # with a warm target cache, but running the `it` binary took 51 minutes on one
+  # runner (run 41641637676), which put every CI run against the merge queue's
+  # 60-minute check timeout. So one job compiles the tests into a nextest
+  # archive, `test-full-shard` runs a slice of it on each of several runners,
+  # and `test-full` reports the result under the required check's name.
+  test-full-build:
+    name: Build test archive
     runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
     env:
       # Bundled-DuckDB debug binaries are huge and this job links ~25 of them
       # under the full feature set, which exhausts the runner's disk during
       # linking (lld dies with SIGBUS). Dropping debuginfo keeps them small.
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # Runs the suites across every metadata backend (Postgres/MySQL via
+      # testcontainers, SQLite, DuckDB) + encryption. `skip-tests-with-docker`
+      # is NOT set, so the container-backed suites run.
+      #
+      # The multicatalog suites run here too. Their files are gated on
+      # `write-postgres`, and that feature enables `multicatalog-postgres`
+      # (Cargo.toml), so this list pulls them in. Keep `write-postgres` in the
+      # list or `tests/it/multicatalog_postgres_tests.rs` and
+      # `tests/it/compaction_postgres_tests.rs` silently compile out.
+      TEST_FEATURES: "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite restore"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -513,6 +531,12 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
 
+      - name: Install cargo-nextest
+        if: steps.changes.outputs.code == 'true'
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest
+
       # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
       # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
       # cache is being saved" on every run — the crate has no git dependencies, so
@@ -543,19 +567,61 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-full-
 
-      # Runs the suites across every metadata backend (Postgres/MySQL via
-      # testcontainers, SQLite, DuckDB) + encryption. `skip-tests-with-docker` is
-      # NOT set, so the container-backed suites run.
-      #
-      # The multicatalog suites run here too. Their files are gated on
-      # `write-postgres`, and that feature enables `multicatalog-postgres`
-      # (Cargo.toml), so the feature list below pulls them in. An earlier version
-      # of this comment claimed they were excluded; that was read during review as
-      # "the file-ownership tests never run in CI", which was wrong. Keep
-      # `write-postgres` in the list or `tests/it/multicatalog_postgres_tests.rs`
-      # and `tests/it/compaction_postgres_tests.rs` silently compile out.
-      - name: Install DuckDB CLI
+      # The archive holds the test binaries and the libraries they load, and
+      # records the paths they were built at. Each shard checks out the same
+      # repository at the same path, so the paths compiled into the tests
+      # (`CARGO_MANIFEST_DIR`, fixture files) still resolve there.
+      - name: Build test archive
         if: steps.changes.outputs.code == 'true'
+        run: cargo nextest archive --features "$TEST_FEATURES" --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+
+      - name: Upload test archive
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          # Already zstd-compressed.
+          compression-level: 0
+
+      # nextest does not run doctests. They take seconds, and run after the
+      # upload so the shards are not waiting on them.
+      - name: Run doctests
+        if: steps.changes.outputs.code == 'true'
+        run: cargo test --doc --features "$TEST_FEATURES"
+
+      - name: Save target directory (main only)
+        if: |
+          steps.changes.outputs.code == 'true'
+          && github.ref == 'refs/heads/main'
+          && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: /mnt/cargo-target
+          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
+
+  test-full-shard:
+    name: Test shard ${{ matrix.shard }}/4
+    needs: test-full-build
+    if: needs.test-full-build.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Every shard runs to the end, so one run reports every failing test.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      # Source files are needed at run time: fixtures and
+      # `tests/sqllogictests/` are read from the checkout.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest
+
+      - name: Install DuckDB CLI
         shell: bash
         run: |
           duckdb_archive="$RUNNER_TEMP/duckdb.gz"
@@ -567,16 +633,60 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/duckdb" --version
 
-      - name: Run single-catalog test suite
-        if: steps.changes.outputs.code == 'true'
-        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite restore"
-
-      - name: Save target directory (main only)
-        if: |
-          steps.changes.outputs.code == 'true'
-          && github.ref == 'refs/heads/main'
-          && steps.target-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+      - name: Download test archive
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          path: /mnt/cargo-target
-          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
+          name: nextest-archive
+          path: ${{ runner.temp }}
+
+      # Extracted to the scratch disk: the unpacked binaries are several GB.
+      #
+      # `cargo-nextest nextest` rather than `cargo nextest`: going through
+      # cargo makes rustup install the toolchain `rust-toolchain.toml` pins,
+      # which running prebuilt binaries does not need.
+      #
+      # `slice` deals tests out in turn, so a module's slow tests (the fuzz
+      # seeds sit next to each other) are spread across shards rather than
+      # landing together as they can with `hash`.
+      - name: Run test shard
+        run: |
+          sudo mkdir -p /mnt/nextest
+          sudo chown "$(id -un)" /mnt/nextest
+          cargo-nextest nextest run \
+            --profile ci \
+            --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
+            --workspace-remap . \
+            --extract-to /mnt/nextest \
+            --partition slice:${{ matrix.shard }}/4
+
+      - name: Upload test timings
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: junit-shard-${{ matrix.shard }}
+          # Reports go under the checkout's `target/`, not the extracted one.
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The required status check. It keeps the name the single test job had, so
+  # branch protection and the merge queue need no change, and it passes only if
+  # the build and every shard did. A docs-only change skips the shards, which
+  # counts as passing.
+  test-full:
+    name: Test (single-catalog backends + encryption, Docker)
+    needs: [test-full-build, test-full-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check build and shard results
+        env:
+          BUILD: ${{ needs.test-full-build.result }}
+          CODE: ${{ needs.test-full-build.outputs.code }}
+          SHARDS: ${{ needs.test-full-shard.result }}
+        run: |
+          echo "build: $BUILD, code changed: $CODE, shards: $SHARDS"
+          [[ "$BUILD" == success ]] || exit 1
+          if [[ "$CODE" == true ]]; then
+            [[ "$SHARDS" == success ]] || exit 1
+          fi
