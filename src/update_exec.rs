@@ -272,7 +272,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // untouched (only orphan objects, cleaned by maintenance).
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             let mut pending_deletes = Vec::new();
-            let mut superseded_positions: Vec<(&UpdateSourceScan, Vec<i64>)> = Vec::new();
+            let mut superseded_positions: Vec<(DeletionTarget<'_>, Vec<i64>)> = Vec::new();
             let mut superseded_inlined: Vec<InlinedRowRef> = Vec::new();
             let mut total_updated: u64 = 0;
 
@@ -292,7 +292,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 total_updated += out.matched_count as u64;
                 updated_batches.extend(out.updated_batches);
                 if inline_capable {
-                    superseded_positions.push((scan, out.matched_positions));
+                    superseded_positions
+                        .push((DeletionTarget::of_scan(scan), out.matched_positions));
                     continue;
                 }
                 pending_deletes.push((
@@ -333,10 +334,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     inline_limit,
                 },
                 updated_batches,
+                Vec::new(),
                 superseded_positions,
                 pending_deletes,
                 superseded_inlined,
-                total_updated,
             )
             .await?;
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
@@ -370,7 +371,9 @@ pub(crate) struct RowVersionCommit<'a> {
 /// Commit an `UPDATE`'s new row versions and the deletion of the versions they
 /// supersede in one snapshot, as official's `UPDATE` does (see the module
 /// docs): `updated_batches` are `[physical columns..., rowid]`, each keeping
-/// its row's id; `superseded_positions` are each source file's superseded rows
+/// its row's id; `inserted` are a `MERGE`'s inserted rows, physical columns
+/// only, one group per `INSERT` action, each written to files of its own as
+/// official writes them, drawing new row ids; `superseded_positions` are each source file's superseded rows
 /// on a writer that stages row mutations, `pending_deletes` each source
 /// file's cumulative delete file `(data_file_id, live delete file, path,
 /// positions)` on any other, and `superseded_inlined` the inlined rows the new
@@ -378,10 +381,10 @@ pub(crate) struct RowVersionCommit<'a> {
 pub(crate) async fn commit_row_versions(
     commit: &RowVersionCommit<'_>,
     updated_batches: Vec<RecordBatch>,
-    superseded_positions: Vec<(&UpdateSourceScan, Vec<i64>)>,
+    inserted: Vec<Vec<RecordBatch>>,
+    superseded_positions: Vec<(DeletionTarget<'_>, Vec<i64>)>,
     pending_deletes: Vec<(i64, Option<i64>, String, Vec<i64>)>,
     superseded_inlined: Vec<InlinedRowRef>,
-    total_updated: u64,
 ) -> DataFusionResult<Option<i64>> {
     let RowVersionCommit {
         table,
@@ -401,19 +404,15 @@ pub(crate) async fn commit_row_versions(
     let physical_schema = table.physical_schema();
     validate_not_null_batches(physical_schema.as_ref(), &updated_batches)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    for batches in &inserted {
+        validate_not_null_batches(physical_schema.as_ref(), batches)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
 
     // Each source file's superseded rows are deleted as official's
     // `DuckLakeDelete::FlushDelete` deletes them.
     let mut deletions = FileDeletions::default();
-    for (scan, positions) in superseded_positions {
-        let target = DeletionTarget {
-            data_file_id: scan.data_file_id,
-            data_file_path: &scan.source_path,
-            record_count: scan.record_count,
-            delete_file: scan
-                .delete_file_id
-                .map(|id| (id, &scan.existing_parquet_deletes)),
-        };
+    for (target, positions) in superseded_positions {
         deletions
             .record(
                 table,
@@ -448,21 +447,26 @@ pub(crate) async fn commit_row_versions(
             RecordBatch::try_new(Arc::clone(&physical_schema), columns)
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let inline_new_versions = total_updated <= inline_limit as u64
+    let total_updated: usize = new_versions.iter().map(RecordBatch::num_rows).sum();
+    let inline_new_versions = total_updated > 0
+        && total_updated <= inline_limit
         && table_writer
             .should_inline(
                 schema_name,
                 table_name,
-                total_updated as usize,
+                total_updated,
                 physical_schema.as_ref(),
                 &new_versions,
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let staged = inline_capable
-        && (inline_new_versions
-            || deletions.needs_staged_commit()
-            || !superseded_inlined.is_empty());
+    // Inserted rows commit as a stage of their own files, which every writer
+    // takes.
+    let staged = !inserted.is_empty()
+        || (inline_capable
+            && (inline_new_versions
+                || deletions.needs_staged_commit()
+                || !superseded_inlined.is_empty()));
 
     // Append the rewritten rows (embedding their original rowids) AND
     // apply every positional delete in ONE snapshot. The new versions keep
@@ -484,6 +488,8 @@ pub(crate) async fn commit_row_versions(
                 })
                 .collect::<Vec<_>>();
             (StagedTableData::Inlined(new_versions), Some(row_ids))
+        } else if updated_batches.is_empty() {
+            (StagedTableData::None, None)
         } else {
             let files = write_rewritten_files(
                 table_writer,
@@ -497,6 +503,22 @@ pub(crate) async fn commit_row_versions(
             .await?;
             (StagedTableData::Files(files), None)
         };
+        // Official's MERGE inlines only its UPDATE action
+        // (`ducklake_merge_into.cpp`); inserted rows go to Parquet.
+        let mut inserted_files = Vec::new();
+        for batches in inserted {
+            inserted_files.extend(
+                write_inserted_files(
+                    table_writer,
+                    schema_name,
+                    table_name,
+                    physical_schema.as_ref(),
+                    base_snapshot,
+                    batches,
+                )
+                .await?,
+            );
+        }
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_config(context.session_config().clone())
             .with_runtime_env(context.runtime_env())
@@ -517,6 +539,7 @@ pub(crate) async fn commit_row_versions(
                 base_snapshot,
                 data,
                 row_ids,
+                inserted_files,
                 delete_entries,
                 deletions.rewritten,
                 superseded_inlined,
@@ -582,6 +605,26 @@ async fn write_rewritten_files(
         .map(|session| session.with_base_snapshot_id(base_snapshot))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     write_rewritten_stream(session, batches).await
+}
+
+/// Write a `MERGE`'s inserted rows, physical columns only, to Parquet files in
+/// the table's partition layout, in source order and never inlined, without
+/// committing them; the commit draws their row ids. Official's `MERGE` plans
+/// its `INSERT` action without the table's insert sort
+/// (`ducklake_merge_into.cpp`).
+async fn write_inserted_files(
+    table_writer: &DuckLakeTableWriter,
+    schema_name: &str,
+    table_name: &str,
+    physical_schema: &Schema,
+    base_snapshot: i64,
+    batches: Vec<RecordBatch>,
+) -> DataFusionResult<Vec<DataFileInfo>> {
+    let session = table_writer
+        .begin_write_without_inlining(schema_name, table_name, physical_schema)
+        .map(|session| session.with_base_snapshot_id(base_snapshot))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    write_rewritten_stream(session, stream::iter(batches.into_iter().map(Ok))).await
 }
 
 /// Write `batches`, rewritten rows `[physical columns..., rowid]`, through

@@ -693,14 +693,11 @@ pub(crate) fn staged_table_write_changes(
     if write.inlined_flush {
         return format!("inline_flush:{}", write.table_id);
     }
-    let insert = match &write.data {
-        StagedTableData::Files(_) => Some(false),
-        StagedTableData::Inlined(_) => Some(true),
-        StagedTableData::None => None,
-    };
-    table_storage_changes(
+    let changes = TableChanges::of_staged(write);
+    table_storage_tokens(
         write.table_id,
-        insert,
+        changes.inserted_into,
+        changes.inserted_inlined,
         !write.positional_deletes.is_empty()
             || !write.rewritten_deletes.is_empty()
             || !write.dropped_files.is_empty()
@@ -721,14 +718,32 @@ pub(crate) fn table_storage_changes(
     deleted_files: bool,
     deleted_inlined: bool,
 ) -> String {
+    table_storage_tokens(
+        table_id,
+        inlined_insert == Some(false),
+        inlined_insert == Some(true),
+        deleted_files,
+        deleted_inlined,
+    )
+}
+
+/// [`table_storage_changes`] for a write that may insert both Parquet and
+/// inlined rows, as a `MERGE` does.
+fn table_storage_tokens(
+    table_id: i64,
+    inserted_files: bool,
+    inserted_inlined: bool,
+    deleted_files: bool,
+    deleted_inlined: bool,
+) -> String {
     let mut changes = Vec::new();
-    if inlined_insert == Some(false) {
+    if inserted_files {
         changes.push(format!("inserted_into_table:{table_id}"));
     }
     if deleted_files {
         changes.push(format!("deleted_from_table:{table_id}"));
     }
-    if inlined_insert == Some(true) {
+    if inserted_inlined {
         changes.push(format!("inlined_insert:{table_id}"));
     }
     if deleted_inlined {
@@ -2721,7 +2736,8 @@ impl TableChanges {
     /// The changes a staged write makes.
     pub(crate) fn of_staged(write: &StagedTableWrite) -> Self {
         Self {
-            inserted_into: matches!(write.data, StagedTableData::Files(_)),
+            inserted_into: matches!(write.data, StagedTableData::Files(_))
+                || !write.inserted_files.is_empty(),
             inserted_inlined: matches!(write.data, StagedTableData::Inlined(_)),
             deleted_from: !write.positional_deletes.is_empty()
                 || !write.rewritten_deletes.is_empty()
@@ -2954,7 +2970,7 @@ impl<'a> SourceFile<'a> {
 
 /// Whether `write` deletes rows without inserting any: a `DELETE`.
 pub(crate) fn is_pure_delete(write: &StagedTableWrite) -> bool {
-    matches!(write.data, StagedTableData::None) && !write.inlined_flush
+    !write.inserts_rows() && !write.inlined_flush
 }
 
 /// The data files a staged write deletes from or drops, whose inlined
@@ -3070,6 +3086,10 @@ pub struct StagedTableWrite {
     /// them from the table's `next_row_id`; `Some` keeps them, as an `UPDATE`
     /// keeps each updated row's id, and leaves `next_row_id` unchanged.
     pub(crate) inlined_row_ids: Option<Vec<i64>>,
+    /// Parquet files of rows a `MERGE` inserts, committed after `data` and
+    /// drawing their row ids from `next_row_id`, so they can join inlined
+    /// `data` in one snapshot as official's `MERGE` commits them.
+    pub(crate) inserted_files: Vec<DataFileInfo>,
     /// Deletions of Parquet rows recorded in `ducklake_inlined_delete_<table_id>`.
     pub(crate) inlined_file_deletes: Vec<InlinedFileDelete>,
     /// Live data files whose rows are all deleted: each is ended, its live
@@ -3145,6 +3165,11 @@ pub(crate) fn materialize_null_columns(
 }
 
 impl StagedTableWrite {
+    /// Whether the stage inserts rows: `data`, or a `MERGE`'s inserted files.
+    pub(crate) fn inserts_rows(&self) -> bool {
+        !matches!(self.data, StagedTableData::None) || !self.inserted_files.is_empty()
+    }
+
     /// Returns the target table id reserved during write setup.
     #[must_use]
     pub const fn table_id(&self) -> i64 {

@@ -60,7 +60,7 @@ use crate::metadata_writer::{
     DeleteFileEntry, DroppedDataFile, InlinedFileDelete, InlinedFlushDeleteFile,
     InlinedFlushFileDelete, InlinedRowRef, MetadataWriter, StagedTableData,
 };
-use crate::table::DuckLakeTable;
+use crate::table::{DuckLakeTable, UpdateSourceScan};
 use crate::table_writer::DuckLakeTableWriter;
 
 /// Schema for the output of a delete operation: the count of rows deleted.
@@ -498,6 +498,18 @@ impl<'a> DeletionTarget<'a> {
             delete_file: file.delete_file_id.map(|id| (id, existing)),
         }
     }
+
+    /// The target an `UPDATE` source scan read.
+    pub(crate) fn of_scan(scan: &'a UpdateSourceScan) -> Self {
+        Self {
+            data_file_id: scan.data_file_id,
+            data_file_path: &scan.source_path,
+            record_count: scan.record_count,
+            delete_file: scan
+                .delete_file_id
+                .map(|id| (id, &scan.existing_parquet_deletes)),
+        }
+    }
 }
 
 /// How one statement records its deletions of Parquet rows, per data file.
@@ -736,6 +748,7 @@ async fn commit_row_deletes(
             base_snapshot,
             StagedTableData::None,
             None,
+            Vec::new(),
             deletions.positional,
             deletions.rewritten,
             inlined_rows,

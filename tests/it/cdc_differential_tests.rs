@@ -392,6 +392,49 @@ fn assert_feeds_match(context: &str, official: &CanonFeed, ours: &CanonFeed) {
     );
 }
 
+/// Official's `ducklake_table_changes` for `table` over `[a, b]`, from one
+/// read each of its insertion and deletion feeds.
+///
+/// The macro (`ducklake_table_changes.cpp`) joins the two feeds both ways and
+/// evaluates each feed once per side. On CI, one evaluation once missed a
+/// deletion that the other found, so official reported an update's postimage
+/// as an `insert` next to its `update_preimage`. Each feed is read once here
+/// into a temporary table and joined exactly as the macro joins it, so both
+/// sides see the same rows.
+fn official_changes_sql(
+    conn: &duckdb::Connection,
+    table: &str,
+    a: i64,
+    b: i64,
+) -> DataFusionResult<String> {
+    for (feed, function) in [
+        ("official_insertions", "ducklake_table_insertions"),
+        ("official_deletions", "ducklake_table_deletions"),
+    ] {
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE {feed} AS \
+             SELECT snapshot_id AS feed_snapshot_id, rowid AS feed_rowid, * \
+             FROM {function}('c', 'main', '{table}', {a}, {b})"
+        ))
+        .map_err(box_err)?;
+    }
+    Ok(
+        "SELECT i.feed_snapshot_id AS snapshot_id, i.feed_rowid AS rowid, \
+            CASE WHEN d.feed_rowid IS NOT NULL THEN 'update_postimage' ELSE 'insert' END \
+                AS change_type, \
+            i.* EXCLUDE (feed_snapshot_id, feed_rowid) \
+        FROM official_insertions i LEFT JOIN official_deletions d \
+        ON i.feed_snapshot_id = d.feed_snapshot_id AND i.feed_rowid = d.feed_rowid \
+        UNION ALL \
+        SELECT d.feed_snapshot_id, d.feed_rowid, \
+            CASE WHEN i.feed_rowid IS NOT NULL THEN 'update_preimage' ELSE 'delete' END, \
+            d.* EXCLUDE (feed_snapshot_id, feed_rowid) \
+        FROM official_deletions d LEFT JOIN official_insertions i \
+        ON d.feed_snapshot_id = i.feed_snapshot_id AND d.feed_rowid = i.feed_rowid"
+            .to_string(),
+    )
+}
+
 /// Build the catalog from `statements`, then diff both CDC feeds between the
 /// two engines over every derived snapshot window.
 async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionResult<()> {
@@ -456,11 +499,7 @@ async fn assert_catalog_feeds_conform_with(
     {
         let conn = official_connection(&path)?;
         for (a, b) in windows(&snapshot_ids(&conn)?) {
-            let changes = official_feed(
-                &conn,
-                &format!("SELECT * FROM ducklake_table_changes('c', 'main', '{table}', {a}, {b})"),
-                true,
-            )?;
+            let changes = official_feed(&conn, &official_changes_sql(&conn, table, a, b)?, true)?;
             // rowid/snapshot_id are virtual on the official deletions and
             // insertions scans: project them explicitly; neither feed has a
             // change_type column.

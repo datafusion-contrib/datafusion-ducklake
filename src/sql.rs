@@ -1,5 +1,5 @@
-//! SQL entry point for DuckLake metadata and data-layout DDL and
-//! `CREATE TABLE … AS SELECT`.
+//! SQL entry point for DuckLake metadata and data-layout DDL,
+//! `CREATE TABLE … AS SELECT`, and `MERGE INTO`.
 //!
 //! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
 //! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
@@ -9,7 +9,8 @@
 //! and `COMMENT ON`, using DataFusion's bundled sqlparser with no new dependency,
 //! then dispatches them to the programmatic
 //! [`MetadataWriter`] API on the given
-//! [`DuckLakeCatalog`], and delegates everything else to `ctx.sql(sql)` unchanged.
+//! [`DuckLakeCatalog`], handles DuckLake `MERGE INTO`, and delegates everything
+//! else to `ctx.sql(sql)` unchanged.
 //!
 //! `CREATE TABLE … AS SELECT` (CTAS) also runs here. DataFusion executes a CTAS
 //! by materializing the query into a `MemTable` and handing it to the schema's
@@ -62,15 +63,16 @@ use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
-    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Merge,
     ObjectName, Query, Statement as SqlStatement, Value,
 };
 use datafusion::sql::sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
-use datafusion::sql::sqlparser::tokenizer::Token;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use crate::catalog::DuckLakeCatalog;
+use crate::merge::{MERGE_DO_NOTHING_SENTINEL, MERGE_UPDATE_ALL_SENTINEL};
 use crate::metadata_provider::{MetadataProvider, TagObjectType, TagTarget};
 use crate::metadata_writer::{
     CatalogNode, ColumnDef, MetadataWriter, WriteMode, catalog_column_defs,
@@ -82,9 +84,9 @@ use crate::schema::{
 use crate::sort::{NullOrder, SortDirection, SortField};
 use crate::table_writer::{DuckLakeTableWriter, TableWriteOptions};
 
-/// Execute a SQL statement against `ctx`, handling DuckLake comments and layout
-/// DDL and `CREATE TABLE … AS SELECT` directly on `catalog` and delegating
-/// everything else to [`SessionContext::sql`].
+/// Execute a SQL statement against `ctx`, handling DuckLake comments, layout
+/// DDL, `CREATE TABLE … AS SELECT`, and `MERGE INTO` directly on `catalog` and
+/// delegating everything else to [`SessionContext::sql`].
 ///
 /// For a recognized DDL statement this resolves the target through `catalog`'s
 /// provider/writer, applies the change, and returns an empty result set matching
@@ -93,8 +95,9 @@ use crate::table_writer::{DuckLakeTableWriter, TableWriteOptions};
 /// on `ctx`, derives nullable columns from the query schema (as DuckDB does), and
 /// commits the table and its rows in one snapshot through the object store
 /// registered on `ctx` for the catalog's data path, with the write options an
-/// `INSERT` uses. An empty result publishes the table with no data file. Callers
-/// can route all their SQL through it.
+/// `INSERT` uses. An empty result publishes the table with no data file. A
+/// `MERGE INTO` returns the affected-row count. Callers can route all their SQL
+/// through it.
 ///
 /// The DDL targets `catalog` (the 1–3 part table name's catalog segment, if any,
 /// is not cross-checked); a read-only catalog yields a clear error. A CTAS is
@@ -105,6 +108,11 @@ pub async fn execute_ducklake_sql(
     catalog: &DuckLakeCatalog,
     sql: &str,
 ) -> DataFusionResult<DataFrame> {
+    if let Some(merge) = parse_ducklake_merge(sql)? {
+        // Boxed so the MERGE state stays off the stack of every statement's
+        // future.
+        return Box::pin(crate::merge::execute_merge(ctx, catalog, merge)).await;
+    }
     if let Some(call) = parse_flush_inlined_data_call(sql)? {
         return flush_inlined_data_call(ctx, catalog, call).await;
     }
@@ -321,6 +329,139 @@ struct CreateTableAs {
 
 const OR_REPLACE_UNSUPPORTED: &str =
     "CREATE OR REPLACE TABLE AS SELECT is not supported; DROP TABLE first";
+
+/// Parse `sql` as a DuckLake `MERGE INTO`, or `Ok(None)` when it is not one.
+///
+/// Official DuckLake's shorthand actions are rewritten to forms the parser
+/// accepts: a bare `UPDATE` to an assignment of [`MERGE_UPDATE_ALL_SENTINEL`],
+/// a bare `INSERT` to `INSERT ROW`, and `DO NOTHING` to an action naming
+/// [`MERGE_DO_NOTHING_SENTINEL`].
+fn parse_ducklake_merge(sql: &str) -> DataFusionResult<Option<Merge>> {
+    let dialect = GenericDialect {};
+    // A statement that does not tokenize here, or does not start with MERGE,
+    // goes to DataFusion, which reports it in the session's dialect.
+    let is_merge = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .is_ok_and(|mut parser| parser.parse_keyword(Keyword::MERGE));
+    if !is_merge {
+        return Ok(None);
+    }
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|e| DataFusionError::Plan(format!("MERGE tokenize error: {e}")))?;
+    normalize_merge_shorthand(&mut tokens);
+    let statements = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_statements()
+        .map_err(|e| DataFusionError::Plan(format!("MERGE parse error: {e}")))?;
+    let [statement] = statements.as_slice() else {
+        return Err(DataFusionError::Plan(
+            "MERGE accepts exactly one SQL statement".to_string(),
+        ));
+    };
+    match statement {
+        SqlStatement::Merge(merge) => Ok(Some(merge.clone())),
+        _ => Err(DataFusionError::Plan(
+            "expected a MERGE INTO statement".to_string(),
+        )),
+    }
+}
+
+fn normalize_merge_shorthand(tokens: &mut Vec<Token>) {
+    let significant: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| (!is_whitespace(token)).then_some(index))
+        .collect();
+    let ends_clause = |position: usize| {
+        significant.get(position).is_none_or(|index| {
+            is_keyword(&tokens[*index], Keyword::WHEN)
+                || matches!(tokens[*index], Token::SemiColon | Token::EOF)
+        })
+    };
+    let sentinel = |name: &str| Token::make_word(name, Some('"'));
+    let space = || Token::Whitespace(Whitespace::Space);
+    let assign = |name: &str| {
+        vec![
+            space(),
+            Token::make_keyword("SET"),
+            space(),
+            sentinel(name),
+            space(),
+            Token::Eq,
+            space(),
+            sentinel(name),
+        ]
+    };
+    // (replaced token range, replacement)
+    let mut edits: Vec<(std::ops::Range<usize>, Vec<Token>)> = Vec::new();
+    let mut not_matched = false;
+    for position in 0..significant.len() {
+        let token = &tokens[significant[position]];
+        if is_keyword(token, Keyword::WHEN) {
+            // `WHEN NOT MATCHED [BY TARGET]` inserts; `BY SOURCE` does not.
+            let word = |offset: usize| significant.get(position + offset).map(|i| &tokens[*i]);
+            not_matched = word(1).is_some_and(|t| is_keyword(t, Keyword::NOT))
+                && !(word(3).is_some_and(|t| is_keyword(t, Keyword::BY))
+                    && word(4).is_some_and(|t| is_keyword(t, Keyword::SOURCE)));
+            continue;
+        }
+        if !is_keyword(token, Keyword::THEN) {
+            continue;
+        }
+        let Some(&action) = significant.get(position + 1) else {
+            continue;
+        };
+        if ends_clause(position + 2) {
+            if is_keyword(&tokens[action], Keyword::UPDATE) {
+                edits.push((action + 1..action + 1, assign(MERGE_UPDATE_ALL_SENTINEL)));
+            } else if is_keyword(&tokens[action], Keyword::INSERT) {
+                edits.push((
+                    action + 1..action + 1,
+                    vec![space(), Token::make_keyword("ROW")],
+                ));
+            }
+            continue;
+        }
+        let is_word = |index: usize, text: &str| {
+            matches!(&tokens[index], Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(text))
+        };
+        if let Some(&nothing) = significant.get(position + 2)
+            && is_word(action, "DO")
+            && is_word(nothing, "NOTHING")
+            && ends_clause(position + 3)
+        {
+            let replacement = if not_matched {
+                vec![
+                    Token::make_keyword("INSERT"),
+                    space(),
+                    Token::LParen,
+                    sentinel(MERGE_DO_NOTHING_SENTINEL),
+                    Token::RParen,
+                    space(),
+                    Token::make_keyword("ROW"),
+                ]
+            } else {
+                let mut update = vec![Token::make_keyword("UPDATE")];
+                update.extend(assign(MERGE_DO_NOTHING_SENTINEL));
+                update
+            };
+            edits.push((action..nothing + 1, replacement));
+        }
+    }
+    for (range, replacement) in edits.into_iter().rev() {
+        tokens.splice(range, replacement);
+    }
+}
+
+fn is_whitespace(token: &Token) -> bool {
+    matches!(token, Token::Whitespace(_))
+}
+
+fn is_keyword(token: &Token, keyword: Keyword) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == keyword)
+}
 
 /// The DuckLake metadata and data-layout DDL statements this module recognizes.
 /// Names hold raw `(value, is_quoted)` parts for identifier normalization.

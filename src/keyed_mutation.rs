@@ -718,7 +718,7 @@ impl<'a> KeyedMutation<'a> {
         let mut superseded_positions = Vec::with_capacity(scans.len());
         for (scan, versions, positions) in &scans {
             updated_batches.extend(versions.iter().cloned());
-            superseded_positions.push((scan, positions.clone()));
+            superseded_positions.push((DeletionTarget::of_scan(scan), positions.clone()));
         }
         let rows_updated: u64 = updated_batches
             .iter()
@@ -739,10 +739,10 @@ impl<'a> KeyedMutation<'a> {
                 inline_limit: context.inline_limit,
             },
             updated_batches,
+            Vec::new(),
             superseded_positions,
             Vec::new(),
             superseded_inlined,
-            rows_updated,
         )
         .await
         .map_err(from_df)?;
@@ -1050,6 +1050,7 @@ impl<'a> KeyedMutation<'a> {
                 base_snapshot,
                 data,
                 None,
+                Vec::new(),
                 deletions.positional,
                 deletions.rewritten,
                 matched.inlined_rows,
