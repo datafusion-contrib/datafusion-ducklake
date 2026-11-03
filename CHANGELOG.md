@@ -96,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cleanup_old_files_mysql` and `delete_orphaned_files_mysql` clean up MySQL catalogs.
 - `CREATE TABLE [IF NOT EXISTS] t [(columns)] AS SELECT` through `execute_ducklake_sql`: rows and
   table metadata commit in one snapshot, with columns named and nullable as in DuckDB (#308).
+- `MERGE INTO` through `execute_ducklake_sql`, as official DuckLake runs it: matched,
+  not-matched, and by-source clauses commit in one snapshot on any table layout.
 
 ### Changed
 
@@ -259,6 +261,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merging them by source order. The merge held one decoded batch of every partition in memory it
   could not spill, so wide rows failed with "Resources exhausted" under a pool that holds a few
   batches; the output order is unchanged.
+- A data file's first row group counts the values of `Utf8View` and `BinaryView` columns, at any
+  depth, toward `max_row_group_bytes`. Only their 16-byte views were counted, so a write of wide
+  text never reached the byte cap and held every batch of the file in memory until it closed.
+  Counting a column's distinct values in that row group also stops converting its batches to
+  rows once the column is over the dictionary limit.
 - PostgreSQL: `register_existing_data_files` and `MulticatalogManager::fork_table` resolve a
   partition key's column by its field id. A nested column (a list, a struct) before the key
   made them check the key's value against another column's type, refusing a valid fork

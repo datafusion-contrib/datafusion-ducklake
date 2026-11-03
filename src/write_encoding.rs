@@ -33,10 +33,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::array::{Array, ArrayData, ArrayRef, AsArray, BinaryViewArray, StringViewArray};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use arrow::row::{RowConverter, Rows, SortField};
+use arrow::row::{RowConverter, SortField};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{DEFAULT_MAX_ROW_GROUP_ROW_COUNT, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
@@ -144,15 +144,19 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
         return Ok(0);
     };
     let converter = RowConverter::new(vec![SortField::new(first.data_type().clone())])?;
-    let rows: Vec<Rows> = arrays
-        .iter()
-        .map(|array| converter.convert_columns(std::slice::from_ref(*array)))
-        .collect::<std::result::Result<_, _>>()?;
-    let mut distinct = HashSet::new();
-    for (array, rows) in arrays.iter().zip(&rows) {
-        for index in 0..array.len() {
-            if array.is_valid(index) && distinct.insert(rows.row(index)) && distinct.len() > limit {
-                return Ok(limit + 1);
+    // Each array is converted when its turn comes, so a column that goes over
+    // the limit early converts none of the rest of the row group. What is kept
+    // across arrays is a copy of each distinct value's row, at most `limit + 1`.
+    let mut distinct: HashSet<Box<[u8]>> = HashSet::new();
+    for array in arrays {
+        let rows = converter.convert_columns(std::slice::from_ref(*array))?;
+        for index in (0..array.len()).filter(|index| array.is_valid(*index)) {
+            let row = rows.row(index);
+            if !distinct.contains(row.as_ref()) {
+                distinct.insert(row.as_ref().into());
+                if distinct.len() > limit {
+                    return Ok(limit + 1);
+                }
             }
         }
     }
@@ -259,12 +263,34 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
         .columns()
         .iter()
         .map(|column| {
-            column
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| column.get_array_memory_size())
+            let data = column.to_data();
+            match data.get_slice_memory_size() {
+                Ok(bytes) => bytes + view_value_bytes(&data),
+                // The whole allocation, data buffers included.
+                Err(_) => column.get_array_memory_size(),
+            }
         })
         .sum()
+}
+
+/// Bytes the values of `data`'s own rows hold in the data buffers of every view
+/// array in it, at any depth.
+///
+/// `get_slice_memory_size` counts a `Utf8View` or `BinaryView` array as its
+/// 16-byte views alone. A value longer than 12 bytes lives in the array's data
+/// buffers instead, so text that DataFusion decodes as views would otherwise
+/// count as 16 bytes a row, however wide it is.
+fn view_value_bytes(data: &ArrayData) -> usize {
+    let own = match data.data_type() {
+        DataType::Utf8View => StringViewArray::from(data.clone()).total_buffer_bytes_used(),
+        DataType::BinaryView => BinaryViewArray::from(data.clone()).total_buffer_bytes_used(),
+        _ => 0,
+    };
+    own + data
+        .child_data()
+        .iter()
+        .map(view_value_bytes)
+        .sum::<usize>()
 }
 
 /// A parquet writer that buffers its file's first row group before opening, so
@@ -357,8 +383,9 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int64Array, StringArray};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{Float64Array, Int64Array, MapArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{Field, Fields, Schema};
     use bytes::Bytes;
     use parquet::basic::Encoding;
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -503,5 +530,157 @@ mod tests {
         assert_eq!(writer.bytes_written() + writer.in_progress_size(), 0);
         writer.write(&batch(1_000, 2_000)).unwrap();
         assert!(writer.bytes_written() + writer.in_progress_size() > 0);
+    }
+
+    /// 16 batches of 32 rows, each row carrying a 40 KiB value built by
+    /// `payload` from the row's id: 20 MiB of values, five times
+    /// [`VIEW_TEST_CAP`].
+    fn write_wide_rows(
+        payload_type: DataType,
+        payload: impl Fn(Vec<String>) -> ArrayRef,
+    ) -> RowGroupSampledWriter<Vec<u8>> {
+        const ROW_BYTES: usize = 40 * 1024;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", payload_type, false),
+        ]));
+        let base = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_000_000))
+            .set_max_row_group_bytes(Some(VIEW_TEST_CAP))
+            .build();
+        let mut writer = RowGroupSampledWriter::new(Vec::new(), schema.clone(), base);
+        for b in 0..16i64 {
+            let ids: Vec<i64> = (b * 32..(b + 1) * 32).collect();
+            let values = ids
+                .iter()
+                .map(|i| {
+                    let mut text = format!("row-{i:08}-");
+                    text.extend(std::iter::repeat_n('x', ROW_BYTES - text.len()));
+                    text
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(ids)), payload(values)],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer
+    }
+
+    const VIEW_TEST_CAP: usize = 4 * 1024 * 1024;
+
+    fn assert_sample_ended(writer: &RowGroupSampledWriter<Vec<u8>>) {
+        assert!(
+            writer.writer.is_some(),
+            "20 MiB of rows went past a {VIEW_TEST_CAP}-byte row-group cap and the writer \
+             is still buffering {} batches, counted as {} bytes",
+            writer.buffered.len(),
+            writer.buffered_bytes,
+        );
+    }
+
+    /// The byte cap ends the sampled row group for string-view columns too.
+    ///
+    /// A compaction merge reads its sources through DataFusion, which decodes
+    /// strings as `Utf8View`. A view array keeps its values longer than 12
+    /// bytes in separate data buffers, which `get_slice_memory_size` does not
+    /// count: it counts only the 16-byte views. Measured that way, 40 KiB rows
+    /// look like 16-byte rows, the cap is never reached, and the writer buffers
+    /// every batch of the file until `into_inner`.
+    #[test]
+    fn the_byte_cap_ends_the_sample_for_string_view_columns() {
+        let writer = write_wide_rows(DataType::Utf8View, |values| {
+            Arc::new(StringViewArray::from_iter_values(values))
+        });
+        assert_sample_ended(&writer);
+    }
+
+    #[test]
+    fn the_byte_cap_ends_the_sample_for_binary_view_columns() {
+        let writer = write_wide_rows(DataType::BinaryView, |values| {
+            Arc::new(BinaryViewArray::from_iter_values(values))
+        });
+        assert_sample_ended(&writer);
+    }
+
+    /// A view nested in a struct is counted as a top-level one is.
+    #[test]
+    fn the_byte_cap_ends_the_sample_for_a_view_in_a_struct() {
+        let fields = Fields::from(vec![Field::new("text", DataType::Utf8View, false)]);
+        let writer = write_wide_rows(DataType::Struct(fields.clone()), |values| {
+            Arc::new(StructArray::new(
+                fields.clone(),
+                vec![Arc::new(StringViewArray::from_iter_values(values))],
+                None,
+            ))
+        });
+        assert_sample_ended(&writer);
+    }
+
+    /// A view as a map's values, one entry per row, is counted too.
+    #[test]
+    fn the_byte_cap_ends_the_sample_for_views_in_a_map() {
+        let entries = Fields::from(vec![
+            Field::new("keys", DataType::Utf8View, false),
+            Field::new("values", DataType::Utf8View, true),
+        ]);
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entries.clone()),
+            false,
+        ));
+        let writer = write_wide_rows(DataType::Map(Arc::clone(&entries_field), false), |values| {
+            let rows = values.len();
+            let keys = StringViewArray::from_iter_values((0..rows).map(|_| "k"));
+            Arc::new(MapArray::new(
+                Arc::clone(&entries_field),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+                StructArray::new(
+                    entries.clone(),
+                    vec![Arc::new(keys), Arc::new(StringViewArray::from_iter_values(values))],
+                    None,
+                ),
+                None,
+                false,
+            ))
+        });
+        assert_sample_ended(&writer);
+    }
+
+    #[test]
+    fn distinct_values_are_counted_across_arrays_up_to_the_limit() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![Some("b"), Some("c"), None]));
+        let c: ArrayRef = Arc::new(StringArray::from(vec![Some("d")]));
+        // Exact at or below the limit; NULLs are not values; a value repeated in
+        // a later array is counted once.
+        assert_eq!(distinct_up_to(&[&a, &b], 3).unwrap(), 3);
+        assert_eq!(distinct_up_to(&[&a, &b, &c], 4).unwrap(), 4);
+        // Over the limit reads as `limit + 1`, however many more there are.
+        assert_eq!(distinct_up_to(&[&a, &b, &c], 2).unwrap(), 3);
+        assert_eq!(distinct_up_to(&[&a, &b, &c], 0).unwrap(), 1);
+        assert_eq!(distinct_up_to(&[], 5).unwrap(), 0);
+    }
+
+    /// A slice of a view array counts only the values its own rows point at,
+    /// not every value in the data buffers it shares with its parent.
+    #[test]
+    fn a_view_slice_counts_only_its_own_values() {
+        let values = StringViewArray::from_iter_values((0..1_000).map(|i| format!("{i:0>1024}")));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let parent = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+        let whole = sliced_memory_size(&parent);
+        let slice = sliced_memory_size(&parent.slice(0, 100));
+        assert!(whole >= 1_000 * 1024, "the parent counts {whole} bytes");
+        assert!(
+            (100 * 1024..2 * 100 * 1024).contains(&slice),
+            "a 100-row slice counts {slice} bytes"
+        );
     }
 }

@@ -411,6 +411,98 @@ async fn sql_create_then_insert_then_select() {
     assert_eq!(n, 2);
 }
 
+/// A MERGE that only inserts is a plain append, which this writer commits;
+/// one with an UPDATE or DELETE action is refused before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn merge_inserts_and_refuses_row_mutations() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(catalog));
+    ctx.sql("CREATE TABLE lake.main.nums (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = PostgresSingleCatalogMetadataWriter::new(&conn_str)
+        .await
+        .unwrap();
+    let catalog =
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap());
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "lake",
+        Arc::clone(&catalog) as Arc<dyn datafusion::catalog::CatalogProvider>,
+    );
+    let merge = |action: &str| {
+        format!(
+            "MERGE INTO lake.main.nums AS t
+             USING (VALUES (1, 'one'), (2, 'two')) AS s(id, name)
+             ON t.id = s.id {action}"
+        )
+    };
+
+    let inserted = execute_ducklake_sql(&ctx, &catalog, &merge("WHEN NOT MATCHED THEN INSERT"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let snapshots_after_insert: i64 =
+        sqlx::query_scalar("SELECT max(snapshot_id) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let refused = execute_ducklake_sql(&ctx, &catalog, &merge("WHEN MATCHED THEN DELETE"))
+        .await
+        .unwrap_err();
+    let snapshots_after_refusal: i64 =
+        sqlx::query_scalar("SELECT max(snapshot_id) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let rows = read_context(&conn_str)
+        .await
+        .sql("SELECT id, name FROM lake.main.nums ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inserted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    assert_eq!(
+        refused.to_string(),
+        "This feature is not implemented: MERGE INTO with an UPDATE or DELETE action needs a \
+         writer that stages row mutations (SQLite, DuckDB, MySQL or multi-catalog PostgreSQL)"
+    );
+    assert_eq!(snapshots_after_refusal, snapshots_after_insert);
+    let ids = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names: Vec<String> = (0..rows[0].num_rows())
+        .map(|row| arrow::util::display::array_value_to_string(rows[0].column(1), row).unwrap())
+        .collect();
+    assert_eq!(ids.values().to_vec(), vec![1, 2]);
+    assert_eq!(names, vec!["one", "two"]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn comment_on_versions_tags_and_bumps_schema_version() {

@@ -2011,7 +2011,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         &write.column_ids,
                         write.mode,
                         write.base_snapshot_id,
-                        !matches!(write.data, StagedTableData::None),
+                        write.inserts_rows(),
                         self.reserved_tables.take(write.table_id),
                     )
                     .await?,
@@ -2028,6 +2028,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         commit_inlined_at_snapshot(&mut tx, snapshot_id, &write, batches).await?;
                     },
                     StagedTableData::None => {},
+                }
+                if !write.inserted_files.is_empty() {
+                    commit_files_at_snapshot(&mut tx, snapshot_id, &write, &write.inserted_files)
+                        .await?;
                 }
                 apply_positional_deletes_at_snapshot(
                     &mut tx,
