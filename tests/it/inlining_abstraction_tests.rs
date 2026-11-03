@@ -1503,6 +1503,245 @@ pub(crate) async fn keyed_update_keeps_row_ids(make: MakeLake) {
     assert!(matches!(refused, Err(DuckLakeError::InvalidConfig(_))));
 }
 
+/// Rows `(id, v)` followed by a trailing `rowid` column named `rowid_name`.
+fn rowid_rows(
+    ids: &[i64],
+    values: &[&str],
+    row_ids: Vec<Option<i64>>,
+    rowid_name: &str,
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, true),
+            Field::new(rowid_name, DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(values.to_vec())),
+            Arc::new(Int64Array::from(row_ids)),
+        ],
+    )
+    .unwrap()
+}
+
+/// `update_rowids` gives each live row named by `rowid` its staged values and
+/// keeps its `rowid`, in Parquet files and inlined rows, in one snapshot;
+/// ignores dead and unknown rowids; commits nothing when none matches; and
+/// refuses malformed input before anything is written.
+pub(crate) async fn update_rowids_keeps_row_ids(make: MakeLake) {
+    let lake = keyed_table(&make).await;
+    let before = lake.rows("t").await;
+    let ids = row_ids(&before);
+    let (parquet, inlined) = (ids[&6], ids[&103]);
+    let head = lake.head();
+
+    let refusals: Vec<(&str, Vec<RecordBatch>)> = vec![
+        (
+            "a rowid twice in one batch",
+            vec![rowid_rows(
+                &[6, 6],
+                &["x", "y"],
+                vec![Some(parquet), Some(parquet)],
+                "rowid",
+            )],
+        ),
+        (
+            "a rowid twice across batches",
+            vec![
+                rowid_rows(&[6], &["x"], vec![Some(parquet)], "rowid"),
+                rowid_rows(&[6], &["y"], vec![Some(parquet)], "rowid"),
+            ],
+        ),
+        (
+            "a NULL rowid",
+            vec![rowid_rows(&[6], &["x"], vec![None], "rowid")],
+        ),
+        (
+            "a rowid that is not Int64",
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, true),
+                        Field::new("v", DataType::Utf8, true),
+                        Field::new("rowid", DataType::Int32, true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![6])),
+                        Arc::new(StringArray::from(vec!["x"])),
+                        Arc::new(arrow::array::Int32Array::from(vec![parquet as i32])),
+                    ],
+                )
+                .unwrap(),
+            ],
+        ),
+        (
+            "a missing column",
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, true),
+                        Field::new("rowid", DataType::Int64, true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![6])),
+                        Arc::new(Int64Array::from(vec![parquet])),
+                    ],
+                )
+                .unwrap(),
+            ],
+        ),
+        (
+            "a value that does not fit its column",
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Utf8, true),
+                        Field::new("v", DataType::Utf8, true),
+                        Field::new("rowid", DataType::Int64, true),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["6"])),
+                        Arc::new(StringArray::from(vec!["x"])),
+                        Arc::new(Int64Array::from(vec![parquet])),
+                    ],
+                )
+                .unwrap(),
+            ],
+        ),
+    ];
+    for (case, rows) in refusals {
+        let (ctx, table) = lake.table("t").await;
+        let refused = table.update_rowids(&ctx.state(), rows).await;
+        assert!(
+            matches!(refused, Err(DuckLakeError::InvalidConfig(_))),
+            "{case}: {refused:?}"
+        );
+        assert_eq!(lake.head(), head, "{case}: no snapshot");
+    }
+    assert_eq!(lake.rows("t").await, before, "nothing was written");
+
+    // A rowid no live row has, deleted or never assigned: no commit.
+    let (ctx, table) = lake.table("t").await;
+    table.delete_rowids(&ctx.state(), &[ids[&7]]).await.unwrap();
+    let head = lake.head();
+    let before = lake.rows("t").await;
+    let (ctx, table) = lake.table("t").await;
+    let none = table
+        .update_rowids(
+            &ctx.state(),
+            vec![rowid_rows(
+                &[7, 999],
+                &["x", "y"],
+                vec![Some(ids[&7]), Some(9_999_999)],
+                "rowid",
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(none.rows_updated, 0);
+    assert_eq!(none.snapshot_id, None);
+    assert_eq!(lake.head(), head, "no snapshot");
+
+    // A Parquet row and an inlined row, beside dead and unknown rowids, an
+    // empty batch, and a second batch whose rowid column has another name.
+    let (ctx, table) = lake.table("t").await;
+    let result = table
+        .update_rowids(
+            &ctx.state(),
+            vec![
+                rowid_rows(
+                    &[6, 7, 999],
+                    &["u6", "dead", "unknown"],
+                    vec![Some(parquet), Some(ids[&7]), Some(9_999_999)],
+                    "rowid",
+                ),
+                rowid_rows(&[], &[], vec![], "rowid"),
+                rowid_rows(&[1003], &["u103"], vec![Some(inlined)], "any_name"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 2);
+    assert_eq!(result.rows_deleted, 0);
+    assert_eq!(result.rows_inserted, 0);
+    assert_eq!(result.snapshot_id, Some(head + 1));
+    assert_eq!(lake.head(), head + 1, "one snapshot");
+    let after = lake.rows("t").await;
+    let mut want: Vec<String> = before
+        .iter()
+        .map(|line| {
+            if line.starts_with(&format!("{parquet},")) {
+                format!("{parquet},6,u6")
+            } else if line.starts_with(&format!("{inlined},")) {
+                format!("{inlined},1003,u103")
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
+    want.sort_by_key(|line| line.split(',').next().unwrap().parse::<i64>().unwrap());
+    assert_eq!(
+        after, want,
+        "each row keeps its rowid, every other row unchanged"
+    );
+
+    // A 1-row update of a Parquet row under the limit stays inlined.
+    let inlined_before = lake.inlined_rows("t");
+    let files_before = lake.data_files("t");
+    let (ctx, table) = lake.table("t").await;
+    let one = table
+        .update_rowids(
+            &ctx.state(),
+            vec![rowid_rows(&[8], &["u8"], vec![Some(ids[&8])], "rowid")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(one.rows_updated, 1);
+    if lake.inlines {
+        assert_eq!(
+            lake.inlined_rows("t"),
+            inlined_before + 1,
+            "the new version is inlined"
+        );
+        assert_eq!(
+            lake.data_files("t"),
+            files_before,
+            "no data file is written"
+        );
+    }
+    let rows = lake.rows("t").await;
+    assert_eq!(row_ids(&rows)[&8], ids[&8]);
+    assert_eq!(values(&rows)[&8], vec!["u8".to_string()]);
+}
+
+/// `update_rowids` on a table read before another commit deleted one of its
+/// rows fails with a conflict and writes nothing.
+pub(crate) async fn update_rowids_conflicts_with_a_later_delete(make: MakeLake) {
+    let lake = keyed_table(&make).await;
+    let ids = row_ids(&lake.rows("t").await);
+    let (ctx, stale) = lake.table("t").await;
+    let (other_ctx, other) = lake.table("t").await;
+    other
+        .delete_rowids(&other_ctx.state(), &[ids[&6]])
+        .await
+        .unwrap();
+    let head = lake.head();
+    let before = lake.rows("t").await;
+    let refused = stale
+        .update_rowids(
+            &ctx.state(),
+            vec![rowid_rows(&[6], &["u6"], vec![Some(ids[&6])], "rowid")],
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DuckLakeError::Conflict(_))),
+        "got {refused:?}"
+    );
+    assert_eq!(lake.head(), head);
+    assert_eq!(lake.rows("t").await, before);
+}
+
 /// Keys of several columns match on every column; a partitioned table's
 /// upsert writes its rows into their partitions.
 pub(crate) async fn keyed_composite_and_partitioned(make: MakeLake) {
@@ -2702,6 +2941,11 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
     Box::pin(keyed_delete_reaches_inlined_rows(Arc::clone(&make))).await;
     Box::pin(keyed_upsert_replaces_inlined_rows(Arc::clone(&make))).await;
     Box::pin(keyed_update_keeps_row_ids(Arc::clone(&make))).await;
+    Box::pin(update_rowids_keeps_row_ids(Arc::clone(&make))).await;
+    Box::pin(update_rowids_conflicts_with_a_later_delete(Arc::clone(
+        &make,
+    )))
+    .await;
     Box::pin(keyed_composite_and_partitioned(Arc::clone(&make))).await;
     Box::pin(change_detection_sees_inlined_changes(Arc::clone(&make))).await;
     Box::pin(rowid_lookup_everywhere(Arc::clone(&make))).await;
@@ -2748,6 +2992,8 @@ per_backend!(
     keyed_delete_reaches_inlined_rows,
     keyed_upsert_replaces_inlined_rows,
     keyed_update_keeps_row_ids,
+    update_rowids_keeps_row_ids,
+    update_rowids_conflicts_with_a_later_delete,
     keyed_composite_and_partitioned,
     change_detection_sees_inlined_changes,
     rowid_lookup_everywhere,
