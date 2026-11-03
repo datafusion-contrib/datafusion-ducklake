@@ -667,9 +667,15 @@ fn adjacent_row_id_start(bin: &[&DuckLakeTableFile]) -> Option<i64> {
 /// bin's sources split into. A sort-preserving merge on a source-order key gave
 /// the same order but held one decoded batch per partition in a reservation
 /// that cannot spill, which failed for wide rows against a pool that holds a
-/// few batches but not one per partition. It also reads the sources one at a
-/// time rather than concurrently; the single writer this stream feeds consumes
-/// them one at a time anyway.
+/// few batches but not one per partition.
+///
+/// Reading the sources one at a time rather than concurrently costs no
+/// throughput, because the merge is bound by the single writer this stream
+/// feeds. The sort-preserving merge used about one core on a 1 GiB merge of 12
+/// partitions. Merging three 448 MiB files of wide text, or three 224 MiB files
+/// of numeric columns, took no longer in sequence than through that merge.
+/// Prefetching the next one or two partitions was about 5% faster and took up
+/// to a third more peak memory.
 fn source_ordered_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,
