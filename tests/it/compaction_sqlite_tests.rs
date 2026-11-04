@@ -517,6 +517,7 @@ async fn compaction_ignores_a_foreign_dialect_sort_spec() {
             target_file_size: 1 << 30,
             max_merged_files: 1024,
             min_file_size: 0,
+            ..MergeOptions::default()
         },
     )
     .await;
@@ -593,6 +594,7 @@ async fn merge_only_within_a_partition_and_preserves_assignment() {
             target_file_size: 1 << 30,
             max_merged_files: 1024,
             min_file_size: 0,
+            ..MergeOptions::default()
         },
     )
     .await;
@@ -724,6 +726,7 @@ async fn merge_reads_a_whole_bin_in_one_pass() {
             target_file_size: 1 << 30,
             max_merged_files: 1024,
             min_file_size: 0,
+            ..MergeOptions::default()
         },
     )
     .await;
@@ -2607,6 +2610,7 @@ async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
             target_file_size: big as u64,
             max_merged_files: 1024,
             min_file_size: 0,
+            ..MergeOptions::default()
         },
     )
     .await;
@@ -2628,6 +2632,7 @@ async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
             target_file_size: 1 << 30,
             max_merged_files: 1024,
             min_file_size: 0,
+            ..MergeOptions::default()
         },
     )
     .await;
@@ -3227,6 +3232,54 @@ async fn adjacent_merge_of_wide_rows_fits_a_pool_smaller_than_its_partitions() {
         (0..i64::from(ROWS)).map(Some).collect::<Vec<_>>(),
     );
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
+}
+
+/// Reading partitions ahead changes when a rowid-adjacent merge reads its
+/// sources, not what it writes: every read-ahead depth writes the file a
+/// strictly sequential merge writes, row for row, with the same lineage.
+#[tokio::test(flavor = "multi_thread")]
+async fn adjacent_merge_writes_the_same_file_at_every_read_ahead() {
+    const FILES: i32 = 3;
+    const ROW_GROUPS_PER_FILE: i32 = 4;
+    const ROWS_PER_GROUP: i32 = 64;
+    const ROWS: i32 = FILES * ROW_GROUPS_PER_FILE * ROWS_PER_GROUP;
+
+    async fn merge(read_ahead: usize) -> (Vec<i32>, Vec<(Option<i64>, Option<i64>)>) {
+        let temp = TempDir::new().unwrap();
+        seed_wide(&temp, FILES, ROW_GROUPS_PER_FILE, ROWS_PER_GROUP, 512).await;
+        let config = SessionConfig::new()
+            .with_batch_size(16)
+            .with_target_partitions(usize::try_from(ROW_GROUPS_PER_FILE).unwrap())
+            .with_repartition_file_min_size(0);
+        let ctx = SessionContext::new_with_config(config);
+        let result = with_writable_table_context(&temp, ctx, |table, state| async move {
+            table
+                .merge_adjacent_files(
+                    &state,
+                    MergeOptions {
+                        read_ahead_partitions: read_ahead,
+                        ..MergeOptions::default()
+                    },
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(result.files_created, 1, "read_ahead={read_ahead}");
+        let (path, row_id_start, record_count) = live_file(&pool(&temp).await).await;
+        assert_eq!((row_id_start, record_count), (Some(0), i64::from(ROWS)));
+        (file_values(&temp, &path), file_lineage(&temp, &path))
+    }
+
+    let sequential = merge(0).await;
+    assert_eq!(sequential.0, (0..ROWS).collect::<Vec<_>>());
+    for read_ahead in [1, 2, 4, 64] {
+        assert_eq!(
+            merge(read_ahead).await,
+            sequential,
+            "read_ahead={read_ahead}"
+        );
+    }
 }
 
 /// A sorted merge of rowid-adjacent files keeps the first source's
