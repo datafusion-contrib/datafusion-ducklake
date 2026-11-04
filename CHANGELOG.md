@@ -103,6 +103,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A merge of rowid-adjacent files reads the next source partitions while it writes the current
+  one, as many as `MergeOptions::read_ahead_partitions` (default 2), so object-store reads
+  overlap the writer's encoding again. Each partition read ahead holds at most two decoded
+  batches, charged to the memory pool; once the pool refuses one, the merge reads sequentially.
+  `0` restores the strictly sequential read. The output order is unchanged. **BREAKING** for a
+  `MergeOptions` literal that names every field. Against an S3-compatible store with 30 ms of
+  first-byte latency and a 100 MiB/s per-connection cap, a merge of three 448 MiB files of wide
+  text takes 14.1 s instead of 21.7 s.
 - A PostgreSQL commit reads a table's file statistics in one pass. Its cost no longer grows with
   the square of the table's file count (#297).
 - Building a table no longer sums every file's column sizes; table-level column `byte_size` in

@@ -539,6 +539,7 @@ async fn merge_preserves_partition_assignment_postgres() {
                 target_file_size: 1 << 30,
                 max_merged_files: 1024,
                 min_file_size: 0,
+                ..MergeOptions::default()
             },
         )
         .await

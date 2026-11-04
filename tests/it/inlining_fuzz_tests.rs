@@ -1654,6 +1654,7 @@ impl Lake {
                             target_file_size: target,
                             max_merged_files: usize::MAX,
                             min_file_size: 0,
+                            ..MergeOptions::default()
                         },
                     )
                     .await
