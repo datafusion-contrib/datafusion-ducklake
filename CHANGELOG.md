@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTable::update_rowids`: give the live rows with given `rowid`s new values, keeping
+  each `rowid`, in one snapshot, as official's `UPDATE` does.
 - `read_columns_by_rowid_with` and `RowIdReadOptions`: a rowid read that charges the batches it
   holds and its result to a DataFusion `MemoryReservation`; `RowsByRowId::rows_decoded`.
 - `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`,

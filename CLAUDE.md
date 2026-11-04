@@ -80,7 +80,7 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `column_rename.rs`: reads Parquet files whose physical column names predate a rename
    - `table_changes.rs` / `table_deletions.rs`: change-data-capture between snapshots
    - `keyed_mutation.rs`: delete / update / upsert by key from a staged batch, and
-     `delete_positions` / `delete_rowids`, over Parquet and inlined rows alike
+     `delete_positions` / `delete_rowids` / `update_rowids`, over Parquet and inlined rows alike
    - `rowid_lookup.rs`: find rows by `rowid` (inlined, positional, or embedded row ids)
    - `change_detection.rs`: whether a table's rows changed between snapshots (the `changes_made`
      ledger, falling back to the change feed for flush and compaction snapshots)

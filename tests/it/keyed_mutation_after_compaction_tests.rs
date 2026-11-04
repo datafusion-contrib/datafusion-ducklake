@@ -924,3 +924,224 @@ async fn keyed_delete_follows_the_stored_inlining_limit() {
     );
     assert_eq!(read_rows(&temp).await, vec![(1, 10), (3, 30)]);
 }
+
+/// `(id, val, rowid)` rows for `update_rowids`.
+fn rowid_batch(ids: Vec<i32>, vals: Vec<i32>, row_ids: Vec<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+            Field::new("rowid", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(vals)),
+            Arc::new(Int64Array::from(row_ids)),
+        ],
+    )
+    .unwrap()
+}
+
+/// A writable handle on `main.t` at the head, writing with no inlining.
+async fn writable_table(temp: &TempDir) -> (SessionContext, DuckLakeTable) {
+    let (ctx, provider) = open_table(temp).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(make_writer(temp).await);
+    let table = as_ducklake(&provider)
+        .clone()
+        .with_writer("main".to_string(), writer);
+    (ctx, table)
+}
+
+/// `update_rowids` on a rewritten file, whose rows embed rowids with holes and
+/// which records no `row_id_start`: each row is found by its embedded rowid,
+/// its physical position is deleted, and a hole's rowid is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_after_rewrite_with_rowid_holes() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, (1..=7).collect(), (1..=7).map(|v| v * 10).collect()).await;
+    run_dml(&temp, "DELETE FROM ducklake.main.t WHERE id IN (2, 4)").await;
+    run_rewrite(
+        &temp,
+        RewriteOptions {
+            delete_threshold: 0.01,
+            ..RewriteOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        vec![(1, 0), (3, 2), (5, 4), (6, 5), (7, 6)],
+    );
+
+    let (ctx, table) = writable_table(&temp).await;
+    let result = table
+        .update_rowids(
+            &ctx.state(),
+            vec![rowid_batch(vec![5, 7, 2], vec![55, 77, 22], vec![4, 6, 1])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 2);
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (3, 30), (5, 55), (6, 60), (7, 77)],
+    );
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        vec![(1, 0), (3, 2), (5, 4), (6, 5), (7, 6)],
+    );
+    // Ids 5 and 7 sit at positions 2 and 4 of the rewritten file.
+    assert_eq!(live_delete_positions(&temp).await, vec![2, 4]);
+}
+
+/// `update_rowids` on the output of an adjacent merge, read at the head.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_after_adjacent_merge() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    let p = pool(&temp).await;
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT count(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        1,
+        "the merge leaves one file",
+    );
+
+    let (ctx, table) = writable_table(&temp).await;
+    let result = table
+        .update_rowids(
+            &ctx.state(),
+            vec![rowid_batch(vec![1, 5], vec![11, 55], vec![0, 4])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 2);
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 11), (2, 20), (3, 30), (4, 40), (5, 55), (6, 60)],
+    );
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        vec![(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5)],
+    );
+}
+
+/// [`keyed_update_skips_rows_a_merged_file_holds_from_later_snapshots`] for
+/// `update_rowids`: the merged file's row from a later snapshot is not a row
+/// of the table at the snapshot read, so its rowid is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_skips_rows_a_merged_file_holds_from_later_snapshots() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await;
+    let p = pool(&temp).await;
+    let first = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![2], vec![20]).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    assert!(
+        opt_i64(
+            &p,
+            "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await
+        .is_some_and(|max| max > first),
+        "the merge writes a partial file spanning both snapshots",
+    );
+
+    let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::new(provider), first).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let provider = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let writer: Arc<dyn MetadataWriter> =
+        Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+    let table = as_ducklake(&provider)
+        .clone()
+        .with_writer("main".to_string(), writer);
+    let result = table
+        .update_rowids(&ctx.state(), vec![rowid_batch(vec![2], vec![99], vec![1])])
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 0);
+    assert_eq!(result.snapshot_id, None);
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
+}
+
+/// `update_rowids` refuses a NULL in a `NOT NULL` column before anything is
+/// written.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_refuses_null_in_a_not_null_column() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    let p = pool(&temp).await;
+    let head = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+    let staged = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("val", DataType::Int32, true),
+            Field::new("rowid", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![None])),
+            Arc::new(Int64Array::from(vec![0])),
+        ],
+    )
+    .unwrap();
+    let (ctx, table) = writable_table(&temp).await;
+    let error = table
+        .update_rowids(&ctx.state(), vec![staged])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("NOT NULL constraint failed"),
+        "got {error}"
+    );
+    assert_eq!(
+        scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await,
+        head
+    );
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
+}
+
+/// `update_rowids` on a table read before a merge replaced the files its rows
+/// are in fails with a conflict and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_rowids_conflicts_with_a_later_merge() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+    let (ctx, stale) = writable_table(&temp).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    let p = pool(&temp).await;
+    let head = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+
+    let error = stale
+        .update_rowids(&ctx.state(), vec![rowid_batch(vec![1], vec![11], vec![0])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "got {error}"
+    );
+    assert_eq!(
+        scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await,
+        head
+    );
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+    );
+}

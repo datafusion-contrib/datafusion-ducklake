@@ -366,6 +366,30 @@ impl DuckLakeTable {
             .rows)
     }
 
+    /// [`Self::locate_rowids`], with the files it read and their inlined
+    /// deletions, by data file id.
+    #[cfg(feature = "write")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn locate_rowids_in_files(
+        &self,
+        state: &dyn Session,
+        row_ids: &[i64],
+    ) -> crate::Result<(
+        Vec<RowIdLocation>,
+        HashMap<i64, DuckLakeTableFile>,
+        std::collections::HashMap<i64, HashSet<i64>>,
+    )> {
+        let located = self
+            .locate(state, row_ids, None, &RowIdReadAccounting::new(None))
+            .await?;
+        let files = located
+            .files
+            .into_iter()
+            .map(|file| (file.data_file_id, file))
+            .collect();
+        Ok((located.rows, files, located.inlined_deletes))
+    }
+
     /// [`Self::locate_rowids`], with what it read the rows from. The inlined
     /// deletions, then the inlined rows, then the files are read, in the
     /// order a scan reads them, so that a flush between the reads moves no

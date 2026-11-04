@@ -1105,6 +1105,19 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   more go to a delete file, which replaces the file's live one carrying every position with its
   snapshot, and a file it would empty is ended instead. `DuckLakeTableWriter::write_delete_file`
   with `MetadataWriter::set_delete_file` still writes a delete file unconditionally.
+- **Update by `rowid`** (`DuckLakeTable::update_rowids`, on the backends of keyed mutations):
+  each live row named by a staged `rowid` takes that staged row's values and keeps its `rowid`,
+  in one snapshot. Official's `UPDATE ... WHERE rowid IN (...)` does the same. A staged batch
+  holds the table's columns, found by name and typed as for keyed mutations. Its last column is
+  the `rowid`, taken by position. A `rowid` that no live row has is ignored. A NULL `rowid` is
+  refused before anything is written. A `rowid` given more than once takes its first staged row,
+  in batch order, and the others are ignored. Official's `UPDATE ... FROM`, whose join can match
+  one row to several source rows, applies one of the matches, without a defined choice. The
+  old and new versions are recorded as `update_by_keys` records them. New versions that number at
+  most the table's limit are inlined, so with inlining enabled a 1-row update writes no data file.
+  Official reads the data files before the inlined rows, and its new versions follow its scan
+  order. This crate writes each file's rows by position, files by id, then each inlined table's
+  rows by `rowid`, one table after another, as official reads them.
 - **Row lookup by `rowid`** (`DuckLakeTable::locate_rowids`, `read_rows_by_rowid`,
   `read_columns_by_rowid`): where each live row is (inlined, or a data file and position) and the
   rows themselves, reading only the files that hold them. `read_columns_by_rowid` reads only the

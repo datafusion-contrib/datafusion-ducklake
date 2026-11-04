@@ -123,7 +123,8 @@ pub struct KeyedMutationResult {
     /// Rows deleted: by [`KeyedMutation::delete_by_keys`], or replaced by
     /// [`KeyedMutation::upsert_by_keys`].
     pub rows_deleted: u64,
-    /// Rows [`KeyedMutation::update_by_keys`] gave new values.
+    /// Rows [`KeyedMutation::update_by_keys`] or
+    /// [`DuckLakeTable::update_rowids`] gave new values.
     pub rows_updated: u64,
     /// Rows [`KeyedMutation::upsert_by_keys`] appended.
     pub rows_inserted: u64,
@@ -143,8 +144,9 @@ pub struct KeyedMutation<'a> {
     table: &'a DuckLakeTable,
     key_columns: Vec<String>,
     concurrency: Option<usize>,
-    /// Set for [`DuckLakeTable::delete_positions`] and
-    /// [`DuckLakeTable::delete_rowids`], which name rows without keys.
+    /// Set for [`DuckLakeTable::delete_positions`],
+    /// [`DuckLakeTable::delete_rowids`] and [`DuckLakeTable::update_rowids`],
+    /// which name rows without keys.
     by_position: bool,
 }
 
@@ -214,6 +216,225 @@ impl DuckLakeTable {
         }
         self.delete_located(state, positions.into_iter().collect(), inlined)
             .await
+    }
+
+    /// Give each live row whose `rowid` is in `rows` that row's values,
+    /// keeping its `rowid`, in one snapshot, as official DuckLake's `UPDATE`
+    /// records it: the old versions are deleted as
+    /// [`KeyedMutation::update_by_keys`] deletes them (inlined rows ended,
+    /// Parquet positions deleted as [`Self::delete_positions`] deletes them),
+    /// and the new versions are inlined when they number at most the table's
+    /// `data_inlining_row_limit`, else written to Parquet with their rowids
+    /// embedded. A changed partition value moves the row to its partition. The
+    /// new versions are not sorted by the table's `SET SORTED BY` order, as
+    /// official's `UPDATE` sorts none.
+    ///
+    /// Each batch of `rows` has the table's physical columns, found by name,
+    /// followed by the `rowid` as its last column, taken by position (any
+    /// name; `rowid` by convention), so a table column named `rowid` is never
+    /// read as it. The values are conformed as
+    /// [`KeyedMutation::update_by_keys`] conforms them ([module docs](self)).
+    /// The old values are not read: every column of the new version comes
+    /// from `rows`.
+    ///
+    /// Refused with [`DuckLakeError::InvalidConfig`] before anything is
+    /// written: a missing or extra column, a value whose type does not widen
+    /// to its column's without loss, a `rowid` column that is not `Int64`
+    /// (each checked in empty batches too), and a NULL `rowid`. A NULL in a
+    /// `NOT NULL` column of a row that replaces a live row fails with the
+    /// `NOT NULL constraint failed` error, also before anything is written.
+    ///
+    /// A `rowid` given more than once takes its first staged row, in batch
+    /// order, and the others are ignored. Official's `UPDATE ... FROM` applies
+    /// one of a row's matches and ignores the others.
+    ///
+    /// A `rowid` no live row has at this table's snapshot (deleted, never
+    /// assigned, or a row of a merged file inserted after the snapshot) is
+    /// ignored. [`rows_updated`](KeyedMutationResult::rows_updated) counts the
+    /// live rows replaced. When none matches, nothing is committed and
+    /// `snapshot_id` is `None`.
+    ///
+    /// The table is read at the snapshot it was opened at; a conflicting
+    /// commit since aborts the update with [`DuckLakeError::Conflict`], as
+    /// [`KeyedMutation`] does. Files are read `target_partitions` at a time.
+    pub async fn update_rowids(
+        &self,
+        state: &dyn Session,
+        rows: Vec<RecordBatch>,
+    ) -> crate::Result<KeyedMutationResult> {
+        let mutation = KeyedMutation {
+            table: self,
+            key_columns: Vec::new(),
+            concurrency: None,
+            by_position: true,
+        };
+        let context = mutation.context(state)?;
+        let width = context.physical_schema.fields().len();
+        let mut values = Vec::with_capacity(rows.len());
+        let mut row_ids: Vec<arrow::array::Int64Array> = Vec::with_capacity(rows.len());
+        for batch in &rows {
+            if batch.num_columns() != width + 1 {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "staged rows have {} columns, an update by rowid of '{}' needs its {} \
+                     columns and a trailing rowid",
+                    batch.num_columns(),
+                    self.table_name(),
+                    width
+                )));
+            }
+            let ids = batch.column(width);
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| {
+                    DuckLakeError::InvalidConfig(format!(
+                        "the trailing rowid column must be Int64, got {}",
+                        ids.data_type()
+                    ))
+                })?;
+            if ids.null_count() > 0 {
+                return Err(DuckLakeError::InvalidConfig(
+                    "the trailing rowid column holds a NULL".to_string(),
+                ));
+            }
+            // The rowids of the non-empty batches, as `conform` returns them.
+            if batch.num_rows() > 0 {
+                row_ids.push(ids.clone());
+            }
+            values.push(batch.project(&(0..width).collect::<Vec<_>>())?);
+        }
+        let all: Vec<usize> = (0..width).collect();
+        let staged = context.conform(&values, &all, true)?;
+
+        // Each rowid's first staged row, as (batch, row in batch). Later rows
+        // of the same rowid are ignored.
+        let mut source: HashMap<i64, (usize, usize)> = HashMap::new();
+        for (batch, ids) in row_ids.iter().enumerate() {
+            for (row, row_id) in ids.values().iter().enumerate() {
+                source.entry(*row_id).or_insert((batch, row));
+            }
+        }
+        let wanted: Vec<i64> = source.keys().copied().collect();
+        let (located, mut files, inlined_deletes) =
+            self.locate_rowids_in_files(state, &wanted).await?;
+
+        let mut superseded_inlined = Vec::new();
+        let mut by_file: std::collections::BTreeMap<i64, Vec<(i64, i64)>> =
+            std::collections::BTreeMap::new();
+        for row in located {
+            match row.location {
+                crate::rowid_lookup::RowLocation::Inlined {
+                    table_name,
+                } => superseded_inlined.push(InlinedRowRef {
+                    table_name,
+                    row_id: row.row_id,
+                }),
+                crate::rowid_lookup::RowLocation::File {
+                    data_file_id,
+                    position,
+                    ..
+                } => by_file
+                    .entry(data_file_id)
+                    .or_default()
+                    .push((position, row.row_id)),
+            }
+        }
+        // The new versions: each file's rows by position, files by id, then
+        // each inlined table's rows by rowid, tables in the order they are read.
+        let mut order: Vec<i64> = Vec::new();
+        for rows in by_file.values_mut() {
+            rows.sort_unstable();
+            order.extend(rows.iter().map(|(_, row_id)| *row_id));
+        }
+        for run in superseded_inlined.chunk_by_mut(|a, b| a.table_name == b.table_name) {
+            run.sort_unstable_by_key(|row| row.row_id);
+        }
+        order.extend(superseded_inlined.iter().map(|row| row.row_id));
+        let rows_updated = order.len() as u64;
+        if rows_updated == 0 {
+            return Ok(KeyedMutationResult::default());
+        }
+
+        let picks: Vec<(usize, usize)> = order.iter().map(|row_id| source[row_id]).collect();
+        let mut columns = Vec::with_capacity(width + 1);
+        for column in 0..width {
+            let parts: Vec<&dyn Array> = staged
+                .iter()
+                .map(|batch| batch.column(column).as_ref())
+                .collect();
+            columns.push(arrow::compute::interleave(&parts, &picks)?);
+        }
+        columns.push(Arc::new(arrow::array::Int64Array::from(order)) as ArrayRef);
+        let mut fields: Vec<_> = permissive(&context.physical_schema)
+            .fields()
+            .iter()
+            .cloned()
+            .collect();
+        fields.push(Arc::new(crate::row_id::rowid_field()));
+        let updated = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+
+        let table = self;
+        type Superseded = (UpdateSourceScan, Vec<i64>);
+        let pending: Vec<BoxFuture<'_, DataFusionResult<Superseded>>> = by_file
+            .into_iter()
+            .map(|(data_file_id, rows)| {
+                let file = files.remove(&data_file_id);
+                let inlined = inlined_deletes.get(&data_file_id);
+                let pending: BoxFuture<'_, DataFusionResult<Superseded>> = Box::pin(async move {
+                    let file = file.ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "located data file {data_file_id} is not a file of the \
+                             table's read"
+                        ))
+                    })?;
+                    let scan = table
+                        .build_update_scan_filtered(state, &file, inlined, None)
+                        .await?;
+                    Ok((
+                        scan,
+                        rows.into_iter().map(|(position, _)| position).collect(),
+                    ))
+                });
+                pending
+            })
+            .collect();
+        let scans = bounded(pending, mutation.concurrency(state))
+            .await
+            .map_err(from_df)?;
+        let superseded_positions = scans
+            .iter()
+            .map(|(scan, positions)| {
+                (
+                    crate::delete_exec::DeletionTarget::of_scan(scan),
+                    positions.clone(),
+                )
+            })
+            .collect();
+
+        let snapshot_id = crate::update_exec::commit_row_versions(
+            &crate::update_exec::RowVersionCommit {
+                table: self,
+                table_writer: &context.table_writer,
+                context: state.task_ctx(),
+                schema_name: &context.schema_name,
+                table_name: self.table_name(),
+                base_snapshot: self.snapshot_id(),
+                inline_capable: true,
+                inline_limit: context.inline_limit,
+            },
+            vec![updated],
+            Vec::new(),
+            superseded_positions,
+            Vec::new(),
+            superseded_inlined,
+        )
+        .await
+        .map_err(from_df)?;
+        Ok(KeyedMutationResult {
+            snapshot_id,
+            rows_updated,
+            ..KeyedMutationResult::default()
+        })
     }
 
     async fn delete_located(

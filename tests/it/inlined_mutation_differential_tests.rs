@@ -462,8 +462,8 @@ async fn run_crate_sql(side: &CrateSide, statement: &str) {
 /// Run a statement's row-level API equivalent: `/* api <op> <query> */` before
 /// the SQL official runs. `<query>`, run by this crate against `lake`, gives the
 /// staged rows (or, for `delete_rowids`, the row ids); `<op>` is `delete`,
-/// `update` or `upsert` (keyed on `id`), `stream` (a streaming write session)
-/// or `delete_rowids`.
+/// `update` or `upsert` (keyed on `id`), `stream` (a streaming write session),
+/// `delete_rowids`, or `update_rowids` (every column, then `rowid`).
 async fn run_crate_api(side: &CrateSide, directive: &str) {
     let (op, query) = directive.split_once(' ').unwrap();
     let ctx = SessionContext::new();
@@ -520,6 +520,9 @@ async fn run_crate_api(side: &CrateSide, directive: &str) {
                 })
                 .collect::<Vec<_>>();
             table.delete_rowids(&state, &ids).await.unwrap();
+        },
+        "update_rowids" => {
+            table.update_rowids(&state, staged).await.unwrap();
         },
         "stream" => {
             let schema = datafusion::catalog::TableProvider::schema(&table);
@@ -1224,6 +1227,116 @@ pub(crate) fn scenario_row_apis() -> Scenario {
     }
 }
 
+/// `update_rowids` against official's `UPDATE ... WHERE rowid IN (...)`: on
+/// inlined rows, a positional Parquet file, a file with inlined deletions and
+/// a live delete file, a file of new versions with embedded rowids, rows a
+/// flush moved to Parquet, and inlined and Parquet rows together; one row
+/// (under the limit) and many (over it).
+pub(crate) fn scenario_update_rowids() -> Scenario {
+    let update = |set: &str, row_ids: &str| {
+        format!(
+            "/* api update_rowids SELECT id, {set} AS v, rowid FROM lake.main.t \
+             WHERE rowid IN ({row_ids}) */ \
+             UPDATE lake.main.t SET v = {set} WHERE rowid IN ({row_ids})"
+        )
+    };
+    Scenario {
+        name: "update_rowids",
+        official_setup: s(&[
+            "CALL lake.set_option('data_inlining_row_limit', 5)",
+            "CREATE TABLE lake.main.t (id INTEGER, v VARCHAR)",
+            "INSERT INTO lake.main.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO lake.main.t SELECT i, 'x' || i FROM range(10, 30) r(i)",
+        ]),
+        crate_setup: vec![
+            CrateStep::Append(id_value([1, 2, 3], |id| {
+                ["a", "b", "c"][id as usize - 1].to_string()
+            })),
+            CrateStep::Append(id_value(10..30, |id| format!("x{id}"))),
+        ],
+        // Rowids: 0..=2 inlined (ids 1..=3), 3..=22 in one Parquet file (ids
+        // 10..=29).
+        statements: vec![
+            update("'one inlined'", "0"),
+            update("'one parquet'", "3"),
+            update("'c' || CAST(id AS VARCHAR)", "1, 4, 5"),
+            "/* api delete_rowids SELECT rowid FROM lake.main.t WHERE rowid BETWEEN 6 AND 11 */ \
+             DELETE FROM lake.main.t WHERE rowid BETWEEN 6 AND 11"
+                .to_string(),
+            update("'many'", "12, 13, 14, 15, 16, 17, 18, 19"),
+            update("'again'", "13, 14"),
+            // A join that matches rowid 20 twice updates it once.
+            "/* api update_rowids SELECT t.id, src.v AS v, t.rowid FROM lake.main.t t \
+             JOIN (VALUES (20, 'dup'), (20, 'dup'), (21, 'dup')) AS src(rid, v) \
+             ON t.rowid = src.rid */ \
+             UPDATE lake.main.t SET v = src.v \
+             FROM (VALUES (20, 'dup'), (20, 'dup'), (21, 'dup')) AS src(rid, v) \
+             WHERE t.rowid = src.rid"
+                .to_string(),
+            "CALL ducklake_flush_inlined_data('lake')".to_string(),
+            update("'flushed'", "0, 3, 20"),
+            update("'after flush'", "1, 2, 4, 5, 12, 15, 21, 22"),
+            // Last: the rows come from inlined rows and several files.
+            update("'mixed'", "0, 3, 20, 16, 17, 18"),
+        ],
+        limit: LIMIT,
+        known_differences: vec![],
+    }
+}
+
+/// [`scenario_partitioned`]'s table, updated by rowid: a changed partition
+/// value moves the row.
+pub(crate) fn scenario_update_rowids_partitioned() -> Scenario {
+    let base = scenario_partitioned();
+    let update = |p: &str, v: &str, predicate: &str| {
+        format!(
+            "/* api update_rowids SELECT id, {p} AS p, {v} AS v, rowid FROM lake.main.t \
+             WHERE {predicate} */ UPDATE lake.main.t SET p = {p}, v = {v} WHERE {predicate}"
+        )
+    };
+    Scenario {
+        name: "update_rowids_partitioned",
+        official_setup: base.official_setup,
+        crate_setup: base.crate_setup,
+        statements: vec![
+            update("CAST(1 - p AS INTEGER)", "'moved'", "id IN (1, 2, 101)"),
+            update("p", "'stay'", "id = 3"),
+            update("CAST(1 - p AS INTEGER)", "'many'", "id < 12 AND id > 3"),
+            "CALL ducklake_flush_inlined_data('lake')".to_string(),
+            update("CAST(1 - p AS INTEGER)", "'back'", "id IN (1, 2, 5, 101)"),
+        ],
+        limit: LIMIT,
+        known_differences: base.known_differences,
+    }
+}
+
+/// [`scenario_schema_evolution`]'s table, updated by rowid: inlined rows of
+/// the table's first schema and of its second, and Parquet rows.
+pub(crate) fn scenario_update_rowids_schema_evolution() -> Scenario {
+    let base = scenario_schema_evolution();
+    let update = |v: &str, w: &str, predicate: &str| {
+        format!(
+            "/* api update_rowids SELECT id, {v} AS v, {w} AS w, rowid FROM lake.main.t \
+             WHERE {predicate} */ UPDATE lake.main.t SET v = {v}, w = {w} WHERE {predicate}"
+        )
+    };
+    Scenario {
+        name: "update_rowids_schema_evolution",
+        official_setup: base.official_setup,
+        crate_setup: base.crate_setup,
+        statements: vec![
+            update("v", "CAST(id * 10 AS INTEGER)", "id IN (1, 3, 11)"),
+            update("'y'", "w", "id = 2"),
+            "CALL ducklake_flush_inlined_data('lake')".to_string(),
+            update("'z'", "w", "id IN (1, 2)"),
+            // Last: the rows come from several files.
+            update("'last'", "CAST(id AS INTEGER)", "w IS NULL OR id = 3"),
+        ],
+        limit: LIMIT,
+        known_differences: base.known_differences,
+    }
+}
+
 pub(crate) fn scenarios() -> Vec<Scenario> {
     vec![
         scenario_basic(),
@@ -1233,6 +1346,9 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
         scenario_file_lifecycle(LIMIT),
         scenario_file_lifecycle(0),
         scenario_row_apis(),
+        scenario_update_rowids(),
+        scenario_update_rowids_partitioned(),
+        scenario_update_rowids_schema_evolution(),
     ]
 }
 
@@ -1335,6 +1451,21 @@ mod sqlite {
     #[tokio::test(flavor = "multi_thread")]
     async fn row_apis() {
         run(scenario_row_apis()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids() {
+        run(scenario_update_rowids()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_partitioned() {
+        run(scenario_update_rowids_partitioned()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_schema_evolution() {
+        run(scenario_update_rowids_schema_evolution()).await;
     }
 }
 
@@ -3462,6 +3593,21 @@ mod duckdb_backend {
     #[tokio::test(flavor = "multi_thread")]
     async fn row_apis() {
         run(scenario_row_apis()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids() {
+        run(scenario_update_rowids()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_partitioned() {
+        run(scenario_update_rowids_partitioned()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rowids_schema_evolution() {
+        run(scenario_update_rowids_schema_evolution()).await;
     }
 }
 
