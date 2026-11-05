@@ -1254,6 +1254,67 @@ pub(crate) fn embedded_row_id_bounds(metadata: &ParquetMetaData) -> Option<(i64,
     bounds
 }
 
+/// What `metadata`, the footer of a file a writer just wrote, says of its
+/// rows' `rowid`s: [`RowIdBounds::Positional`] when no column carries
+/// [`ROW_ID_PARQUET_FIELD_ID`], the embedded column's bounds when it does and
+/// every row group records them, else [`RowIdBounds::Unknown`].
+///
+/// [`RowIdBounds::Positional`]: crate::metadata_writer::RowIdBounds::Positional
+/// [`RowIdBounds::Unknown`]: crate::metadata_writer::RowIdBounds::Unknown
+#[cfg(feature = "write")]
+pub(crate) fn written_row_id_bounds(
+    metadata: &ParquetMetaData,
+) -> crate::metadata_writer::RowIdBounds {
+    use crate::metadata_writer::RowIdBounds;
+    let carries_row_ids = metadata
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .any(|field| {
+            let info = field.get_basic_info();
+            info.has_id() && info.id() == ROW_ID_PARQUET_FIELD_ID
+        });
+    if !carries_row_ids {
+        return RowIdBounds::Positional;
+    }
+    match embedded_row_id_bounds(metadata) {
+        Some((min, max)) => RowIdBounds::Known {
+            min,
+            max,
+        },
+        None => RowIdBounds::Unknown,
+    }
+}
+
+/// [`written_row_id_bounds`] of the Parquet file at `path`, reading only its
+/// footer. [`RowIdBounds::Unknown`] when the footer cannot be read.
+///
+/// [`RowIdBounds::Unknown`]: crate::metadata_writer::RowIdBounds::Unknown
+#[cfg(feature = "write")]
+pub(crate) fn written_file_row_id_bounds(
+    path: &std::path::Path,
+) -> crate::metadata_writer::RowIdBounds {
+    let read = || -> std::result::Result<_, Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(path)?;
+        let metadata = datafusion::parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&file)?;
+        Ok(written_row_id_bounds(&metadata))
+    };
+    match read() {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "failed to read a written file's rowid bounds; registering it without them"
+            );
+            crate::metadata_writer::RowIdBounds::Unknown
+        },
+    }
+}
+
 /// Whether some id of `sorted` (ascending) lies in `[min, max]`.
 pub(crate) fn any_id_within(sorted: &[i64], min: i64, max: i64) -> bool {
     let first = sorted.partition_point(|id| *id < min);
@@ -1672,8 +1733,7 @@ pub struct DuckLakeTable {
     #[allow(dead_code)]
     table_id: i64,
     table_name: String,
-    #[allow(dead_code)]
-    provider: Arc<dyn MetadataProvider>,
+    pub(crate) provider: Arc<dyn MetadataProvider>,
     /// Snapshot this table was opened at. Threaded to the delete-commit path as
     /// the `base_snapshot` (the generation the resolved positions were read
     /// against) for conflict diagnostics.

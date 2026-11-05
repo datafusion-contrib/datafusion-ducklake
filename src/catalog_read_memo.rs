@@ -885,6 +885,13 @@ impl MetadataProvider for MemoizedMetadataProvider {
             .get_table_files_for_select(table_id, snapshot_id)
     }
 
+    fn get_file_row_id_bounds(
+        &self,
+        data_file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (i64, i64)>> {
+        self.reader()?.get_file_row_id_bounds(data_file_ids)
+    }
+
     fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         self.reader()?.get_partition_spec(table_id, snapshot_id)
     }

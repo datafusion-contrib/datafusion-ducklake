@@ -362,6 +362,14 @@ impl MulticatalogManager {
         let result = async {
             let mut promoted = Vec::with_capacity(metadata.len() + 1);
             let mut delete_files_written = 0;
+            // The source's recorded rowid bounds hold for the same objects
+            // under the fork's ids. See `crate::row_id_bounds`.
+            let source_bounds = source.provider.get_file_row_id_bounds(
+                &metadata
+                    .iter()
+                    .map(|entry| entry.file.data_file_id)
+                    .collect::<Vec<_>>(),
+            )?;
             for entry in &metadata {
                 let file = &entry.file;
                 let path = crate::path_resolver::resolve_path(
@@ -385,6 +393,12 @@ impl MulticatalogManager {
                 .with_source_row_id_start(file.row_id_start);
                 if let Some(footer) = file.file.footer_size {
                     info = info.with_footer_size(footer);
+                }
+                if let Some(&(min, max)) = source_bounds.get(&file.data_file_id) {
+                    info = info.with_row_id_bounds(crate::metadata_writer::RowIdBounds::Known {
+                        min,
+                        max,
+                    });
                 }
                 if let Some(floor) = next_row_id {
                     info = info.with_row_id_floor(floor);

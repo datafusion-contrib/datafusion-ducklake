@@ -215,6 +215,10 @@ pub struct FileOwners {
 #[derive(Debug, Clone)]
 pub struct MulticatalogManager {
     pool: PgPool,
+    // Keep per-file rowid bounds (see `crate::row_id_bounds`): the providers and
+    // writers this manager builds record and read them, and its expire and
+    // forks maintain them.
+    row_id_bounds: bool,
     /// Set once the store is seen to have the `ducklake_inlined_data_tables`
     /// registry, which is never dropped.
     has_inlined_registry: Arc<OnceLock<()>>,
@@ -262,9 +266,32 @@ impl MulticatalogManager {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            row_id_bounds: false,
             has_inlined_registry: Arc::new(OnceLock::new()),
             writable: Arc::default(),
         }
+    }
+
+    /// Keep per-file `rowid` bounds: the providers and writers
+    /// [`Self::provider`] and [`Self::writer`] build read and record them,
+    /// and expire and forks maintain them. The table must exist
+    /// ([`Self::create_row_id_bounds_table`]). Off by default; see
+    /// [`crate::row_id_bounds`].
+    #[must_use]
+    pub fn with_row_id_bounds(mut self, enabled: bool) -> Self {
+        self.row_id_bounds = enabled;
+        self
+    }
+
+    /// Create [`crate::row_id_bounds::ROW_ID_BOUNDS_TABLE`] when it does not
+    /// exist. Idempotent. Run before any writer records bounds; see
+    /// [`crate::row_id_bounds`].
+    pub async fn create_row_id_bounds_table(&self) -> Result<()> {
+        self.require_writable().await?;
+        sqlx::query(crate::row_id_bounds::CREATE_ROW_ID_BOUNDS_TABLE)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Refuse a store a multicatalog writer would refuse, reading its version
@@ -285,12 +312,20 @@ impl MulticatalogManager {
 
     /// Build a catalog-scoped provider sharing this manager's pool.
     pub async fn provider(&self, catalog_id: i64) -> Result<crate::MulticatalogProvider> {
-        crate::MulticatalogProvider::with_pool_and_id(self.pool.clone(), catalog_id).await
+        Ok(
+            crate::MulticatalogProvider::with_pool_and_id(self.pool.clone(), catalog_id)
+                .await?
+                .with_row_id_bounds(self.row_id_bounds),
+        )
     }
 
     /// Build a catalog-scoped writer sharing this manager's pool.
     pub async fn writer(&self, catalog_id: i64) -> Result<crate::PostgresMetadataWriter> {
-        crate::PostgresMetadataWriter::with_pool(self.pool.clone(), catalog_id).await
+        Ok(
+            crate::PostgresMetadataWriter::with_pool(self.pool.clone(), catalog_id)
+                .await?
+                .with_row_id_bounds(self.row_id_bounds),
+        )
     }
 
     /// Create a catalog with the given name, returning its `catalog_id`.
@@ -984,6 +1019,12 @@ impl MulticatalogManager {
             .bind(&data_file_ids)
             .execute(&mut *tx)
             .await?;
+        crate::row_id_bounds::delete_file_row_id_bounds(
+            &mut tx,
+            self.row_id_bounds,
+            &data_file_ids,
+        )
+        .await?;
         // Per-file metadata dies with its file. Official deletes these in the same
         // group as ducklake_data_file, keyed on the same ids; the compaction path
         // here already does the same for the sources it retires. Without this the

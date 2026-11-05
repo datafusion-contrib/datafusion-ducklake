@@ -1417,6 +1417,8 @@ pub struct PostgresMetadataWriter {
     lock_timeout_ms: u32,
     commit_guard: Option<Arc<dyn PostgresCommitGuard>>,
     data_inlining_row_limit: Option<usize>,
+    // Record each registered file's rowid bounds (see `crate::row_id_bounds`).
+    row_id_bounds: bool,
 }
 
 impl PostgresMetadataWriter {
@@ -1977,6 +1979,14 @@ impl PostgresMetadataWriter {
                 // reports the file's columns as unknown, exactly as the source did.
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
+                crate::row_id_bounds::insert_file_row_id_bounds(
+                    &mut tx,
+                    self.row_id_bounds,
+                    data_file_id,
+                    file,
+                    row_ids.stored,
+                )
+                .await?;
 
                 // An existing positional delete file travels with its data file: same
                 // commit, same snapshot, hanging off the id just assigned. The path is
@@ -2135,6 +2145,7 @@ impl PostgresMetadataWriter {
             lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
             commit_guard: None,
             data_inlining_row_limit: None,
+            row_id_bounds: false,
         })
     }
 
@@ -2181,6 +2192,21 @@ impl PostgresMetadataWriter {
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
         self
+    }
+
+    /// Record each file this writer registers' `rowid` bounds in
+    /// [`crate::row_id_bounds::ROW_ID_BOUNDS_TABLE`], which must exist
+    /// ([`crate::MulticatalogManager::create_row_id_bounds_table`]). Off by
+    /// default; see [`crate::row_id_bounds`].
+    #[must_use]
+    pub fn with_row_id_bounds(mut self, enabled: bool) -> Self {
+        self.row_id_bounds = enabled;
+        self
+    }
+
+    /// Whether this writer records `rowid` bounds ([`Self::with_row_id_bounds`]).
+    pub fn row_id_bounds(&self) -> bool {
+        self.row_id_bounds
     }
 
     /// Drive `future`, a catalog call of this writer, with its
@@ -4131,6 +4157,7 @@ pub(crate) async fn apply_inlined_flush_at_snapshot(
     base_snapshot: i64,
     tables: &[InlinedFlushTable],
     catalog_id: Option<i64>,
+    row_id_bounds: bool,
 ) -> Result<()> {
     let changes: Vec<Option<String>> = sqlx::query_scalar(
         "SELECT changes_made FROM ducklake_snapshot_changes
@@ -4183,6 +4210,14 @@ pub(crate) async fn apply_inlined_flush_at_snapshot(
             .await?;
             insert_file_column_stats(tx, table.table_id, data_file_id, &out.file.column_stats)
                 .await?;
+            crate::row_id_bounds::insert_file_row_id_bounds(
+                tx,
+                row_id_bounds,
+                data_file_id,
+                &out.file,
+                carried_row_id_start(&out.file),
+            )
+            .await?;
             insert_partition_metadata(tx, table.table_id, data_file_id, &out.file).await?;
             if let Some(delete) = &out.delete {
                 insert_flush_delete_file(tx, table.table_id, data_file_id, delete).await?;
@@ -4282,6 +4317,7 @@ pub(crate) async fn commit_files_at_snapshot(
     snapshot_id: i64,
     write: &StagedTableWrite,
     files: &[DataFileInfo],
+    row_id_bounds: bool,
 ) -> Result<()> {
     if files.is_empty() {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -4332,6 +4368,14 @@ pub(crate) async fn commit_files_at_snapshot(
         .fetch_one(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
+        crate::row_id_bounds::insert_file_row_id_bounds(
+            tx,
+            row_id_bounds,
+            data_file_id,
+            file,
+            Some(next_row_id),
+        )
+        .await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += file.record_count;
         total_records += file.record_count;
@@ -6341,6 +6385,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             // Persist the file's per-column zone maps + refresh the table roll-up,
             // in the same commit as the data-file row.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            crate::row_id_bounds::insert_file_row_id_bounds(
+                &mut tx,
+                self.row_id_bounds,
+                data_file_id,
+                file,
+                row_ids.stored,
+            )
+            .await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             merge_file_table_column_stats(
                 &mut tx,
@@ -6519,6 +6571,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let data_file_id: i64 = inserted.try_get(0)?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
+                crate::row_id_bounds::insert_file_row_id_bounds(
+                    &mut tx,
+                    self.row_id_bounds,
+                    data_file_id,
+                    file,
+                    row_ids.stored,
+                )
+                .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 next_row_id += row_ids.advance;
                 total_advance += row_ids.advance;
@@ -6902,7 +6962,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             {
                 match &write.data {
                     StagedTableData::Files(files) => {
-                        commit_files_at_snapshot(&mut tx, snapshot_id, write, files).await?;
+                        commit_files_at_snapshot(
+                            &mut tx,
+                            snapshot_id,
+                            write,
+                            files,
+                            self.row_id_bounds,
+                        )
+                        .await?;
                     },
                     StagedTableData::Inlined(batches) => {
                         commit_inlined_at_snapshot(&mut tx, snapshot_id, write, batches).await?;
@@ -6910,8 +6977,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                     StagedTableData::None => {},
                 }
                 if !write.inserted_files.is_empty() {
-                    commit_files_at_snapshot(&mut tx, snapshot_id, write, &write.inserted_files)
-                        .await?;
+                    commit_files_at_snapshot(
+                        &mut tx,
+                        snapshot_id,
+                        write,
+                        &write.inserted_files,
+                        self.row_id_bounds,
+                    )
+                    .await?;
                 }
                 apply_positional_deletes_at_snapshot(
                     &mut tx,
@@ -7598,6 +7671,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             // the persistence was missing.
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            crate::row_id_bounds::insert_file_row_id_bounds(
+                &mut tx,
+                self.row_id_bounds,
+                data_file_id,
+                file,
+                row_ids.stored,
+            )
+            .await?;
             merge_file_table_column_stats(
                 &mut tx,
                 table_id,
@@ -7862,6 +7943,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
+                crate::row_id_bounds::insert_file_row_id_bounds(
+                    &mut tx,
+                    self.row_id_bounds,
+                    data_file_id,
+                    file,
+                    row_ids.stored,
+                )
+                .await?;
                 next_row_id += row_ids.advance;
                 total_advance += row_ids.advance;
                 total_records += file.record_count;
@@ -8382,6 +8471,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 base_snapshot,
                 tables,
                 Some(self.catalog_id),
+                self.row_id_bounds,
             )
             .await?;
             record_snapshot_changes(
@@ -8554,6 +8644,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                         .bind(&source_data_ids)
                         .execute(&mut *tx)
                         .await?;
+                    crate::row_id_bounds::delete_file_row_id_bounds(
+                        &mut tx,
+                        self.row_id_bounds,
+                        &source_data_ids,
+                    )
+                    .await?;
                     // Hard-delete the removed sources' per-column stats too, as
                     // official DuckLake does on merge (otherwise they orphan).
                     sqlx::query(
@@ -8624,6 +8720,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let data_file_id: i64 = inserted.try_get(0)?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
+                crate::row_id_bounds::insert_file_row_id_bounds(
+                    &mut tx,
+                    self.row_id_bounds,
+                    data_file_id,
+                    &out.file,
+                    crate::metadata_writer::carried_row_id_start(&out.file),
+                )
+                .await?;
                 // Carry the output's partition assignment over from its sources.
                 // Every file in a compaction group shares one partition, so the
                 // output belongs to exactly that partition; without this the

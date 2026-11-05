@@ -94,6 +94,7 @@ pub mod partition;
 pub mod partition_counts;
 pub mod path_resolver;
 pub mod row_id;
+pub mod row_id_bounds;
 pub(crate) mod row_lineage;
 pub mod rowid_lookup;
 pub mod schema;
@@ -234,7 +235,7 @@ pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
     DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
-    PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
+    PromoteLayout, PromotedFile, RowIdBounds, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]

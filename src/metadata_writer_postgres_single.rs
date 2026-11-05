@@ -2022,7 +2022,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 write.table_id = ids.table_id;
                 match &write.data {
                     StagedTableData::Files(files) => {
-                        commit_files_at_snapshot(&mut tx, snapshot_id, &write, files).await?;
+                        commit_files_at_snapshot(&mut tx, snapshot_id, &write, files, false).await?;
                     },
                     StagedTableData::Inlined(batches) => {
                         commit_inlined_at_snapshot(&mut tx, snapshot_id, &write, batches).await?;
@@ -2030,8 +2030,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     StagedTableData::None => {},
                 }
                 if !write.inserted_files.is_empty() {
-                    commit_files_at_snapshot(&mut tx, snapshot_id, &write, &write.inserted_files)
-                        .await?;
+                    commit_files_at_snapshot(
+                        &mut tx,
+                        snapshot_id,
+                        &write,
+                        &write.inserted_files,
+                        false,
+                    )
+                    .await?;
                 }
                 apply_positional_deletes_at_snapshot(
                     &mut tx,
@@ -2080,8 +2086,15 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             let mut tx = self.pool.begin().await?;
             // A flush is not DDL: schema_version carries forward.
             let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
-            apply_inlined_flush_at_snapshot(&mut tx, snapshot_id, base_snapshot, tables, None)
-                .await?;
+            apply_inlined_flush_at_snapshot(
+                &mut tx,
+                snapshot_id,
+                base_snapshot,
+                tables,
+                None,
+                false,
+            )
+            .await?;
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,

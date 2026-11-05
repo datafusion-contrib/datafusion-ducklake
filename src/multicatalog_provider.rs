@@ -422,6 +422,8 @@ pub struct MulticatalogProvider {
     // Set once the store's layout version is found readable (see
     // `require_readable`). Shared across clones.
     readable: Arc<tokio::sync::OnceCell<()>>,
+    // Read per-file rowid bounds (see `crate::row_id_bounds`).
+    row_id_bounds: bool,
 }
 
 /// A consistent read of a [`MulticatalogProvider`]: a transaction on a pooled
@@ -564,6 +566,7 @@ impl MulticatalogProvider {
             read_session: None,
             consistent: None,
             readable: Arc::default(),
+            row_id_bounds: false,
         })
     }
 
@@ -588,11 +591,22 @@ impl MulticatalogProvider {
             read_session: None,
             consistent: None,
             readable: Arc::default(),
+            row_id_bounds: false,
         })
     }
 
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Read per-file `rowid` bounds
+    /// ([`MetadataProvider::get_file_row_id_bounds`]) from
+    /// [`crate::row_id_bounds::ROW_ID_BOUNDS_TABLE`], which must exist. Off
+    /// by default, when none are read; see [`crate::row_id_bounds`].
+    #[must_use]
+    pub fn with_row_id_bounds(mut self, enabled: bool) -> Self {
+        self.row_id_bounds = enabled;
+        self
     }
 
     /// Take one connection from this provider's pool for the catalog reads of
@@ -1822,6 +1836,35 @@ impl MetadataProvider for MulticatalogProvider {
                 mapping_type: first.try_get(2)?,
                 entries,
             })
+        })
+    }
+
+    fn get_file_row_id_bounds(
+        &self,
+        data_file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (i64, i64)>> {
+        if !self.row_id_bounds || data_file_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        block_on(async {
+            let rows: Vec<(i64, i64, i64)> = self
+                .on_connection(async |connection| {
+                    Ok::<_, crate::DuckLakeError>(
+                        sqlx::query_as(
+                            "SELECT data_file_id, row_id_min, row_id_max
+                             FROM ducklake_catalog_data_file_row_id_bounds
+                             WHERE data_file_id = ANY($1)",
+                        )
+                        .bind(data_file_ids)
+                        .fetch_all(connection)
+                        .await?,
+                    )
+                })
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, min, max)| (id, (min, max)))
+                .collect())
         })
     }
 

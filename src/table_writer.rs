@@ -2331,7 +2331,8 @@ impl DuckLakeTableWriter {
 
         Ok(DataFileInfo::new(file_name, file_size, row_count)
             .with_footer_size(footer_size)
-            .with_column_stats(column_stats))
+            .with_column_stats(column_stats)
+            .with_row_id_bounds(crate::table::written_file_row_id_bounds(temp.path())))
     }
 
     /// Write a partitioned dataset: each group is written to its own parquet file
@@ -4655,7 +4656,8 @@ async fn upload_staged_file(
     Ok(
         DataFileInfo::new(&staged.catalog_path, file_size, staged.row_count)
             .with_footer_size(footer_size)
-            .with_column_stats(column_stats),
+            .with_column_stats(column_stats)
+            .with_row_id_bounds(crate::table::written_file_row_id_bounds(&staged.temp)),
     )
 }
 
@@ -6039,7 +6041,8 @@ impl TableWriteSession {
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size)
-            .with_column_stats(column_stats);
+            .with_column_stats(column_stats)
+            .with_row_id_bounds(crate::table::written_file_row_id_bounds(temp.path()));
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }

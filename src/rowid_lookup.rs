@@ -442,6 +442,7 @@ impl DuckLakeTable {
             sorted
         };
         let sorted = &sorted;
+        let files = self.files_that_may_hold(files, sorted)?;
         let inlined_deletes_ref = &inlined_deletes;
         let concurrency = state.config().target_partitions().max(1);
         type InFile = (Vec<RowIdLocation>, Option<(i64, ReadAhead)>);
@@ -480,6 +481,35 @@ impl DuckLakeTable {
             inlined_deletes,
             read_ahead: ahead_by_file,
         })
+    }
+
+    /// `files` without those whose recorded `rowid` bounds hold no id of
+    /// `sorted` (ascending), so a lookup opens none of them. A file without
+    /// recorded bounds is kept. See [`crate::row_id_bounds`].
+    fn files_that_may_hold(
+        &self,
+        files: Vec<DuckLakeTableFile>,
+        sorted: &[i64],
+    ) -> crate::Result<Vec<DuckLakeTableFile>> {
+        let ids: Vec<i64> = files.iter().map(|file| file.data_file_id).collect();
+        let bounds = self.provider.get_file_row_id_bounds(&ids)?;
+        if bounds.is_empty() {
+            return Ok(files);
+        }
+        let listed = files.len();
+        let kept: Vec<DuckLakeTableFile> = files
+            .into_iter()
+            .filter(|file| {
+                crate::row_id_bounds::may_hold_any(bounds.get(&file.data_file_id).copied(), sorted)
+            })
+            .collect();
+        tracing::debug!(
+            listed,
+            with_bounds = bounds.len(),
+            kept = kept.len(),
+            "rowid lookup skipped files by their recorded bounds"
+        );
+        Ok(kept)
     }
 
     /// The position `file`'s embedded `rowid` page index guesses for each id

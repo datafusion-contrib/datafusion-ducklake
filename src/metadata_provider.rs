@@ -2754,6 +2754,19 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<DuckLakeTableFile>>;
     //     todo: support select with file pruning
 
+    /// The recorded `rowid` bounds `(min, max)` of each of `data_file_ids`
+    /// that has them, by data file id. A file left out has no recorded
+    /// bounds, and may hold any `rowid`.
+    ///
+    /// Only a multicatalog PostgreSQL store with per-file bounds enabled
+    /// records them ([`crate::row_id_bounds`]); the default records none.
+    fn get_file_row_id_bounds(
+        &self,
+        _data_file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (i64, i64)>> {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Read the table's active partition spec visible at `snapshot_id`
     /// (`ducklake_partition_info` + `ducklake_partition_column`), or `None` if
     /// the table is unpartitioned or the catalog has no partition tables. Drives

@@ -1675,6 +1675,53 @@ pub enum RowIdStart {
     Preserved(i64),
 }
 
+/// What a writer knows about the `rowid`s of a file it registers, for the
+/// per-file rowid bounds a multicatalog Postgres store keeps when they are
+/// enabled (see [`crate::row_id_bounds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowIdBounds {
+    /// Nothing is known: no bounds are recorded, and a rowid lookup reads the
+    /// file as if bounds were never enabled.
+    #[default]
+    Unknown,
+    /// The file has no embedded rowid column, so its rows' `rowid`s are
+    /// `row_id_start + position`: the bounds are taken from the `row_id_start`
+    /// the commit stores. Recorded only when that is not NULL.
+    Positional,
+    /// Every `rowid` of the file is within `min..=max`: read from the
+    /// embedded rowid column the writer wrote, or carried from bounds already
+    /// recorded for the same object (a fork).
+    Known {
+        /// No `rowid` of the file is smaller.
+        min: i64,
+        /// No `rowid` of the file is larger.
+        max: i64,
+    },
+}
+
+impl RowIdBounds {
+    /// The `(row_id_min, row_id_max)` to record for a file of `record_count`
+    /// rows registered with `row_id_start`, or `None` to record nothing.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn resolve(
+        self,
+        row_id_start: Option<i64>,
+        record_count: i64,
+    ) -> Option<(i64, i64)> {
+        match self {
+            RowIdBounds::Unknown => None,
+            RowIdBounds::Positional => {
+                let start = row_id_start?;
+                (record_count > 0).then(|| (start, start.saturating_add(record_count - 1)))
+            },
+            RowIdBounds::Known {
+                min,
+                max,
+            } => (min <= max).then_some((min, max)),
+        }
+    }
+}
+
 /// Information about a data file to register in the catalog.
 ///
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.
@@ -1731,6 +1778,9 @@ pub struct DataFileInfo {
     /// [`RowIdStart::Embedded`]/[`RowIdStart::Preserved`], whose real ids the row
     /// count does not reveal: pass the source table's `next_row_id`.
     pub row_id_floor: Option<i64>,
+    /// What is known of the file's `rowid`s, recorded as per-file bounds when
+    /// the writer has them enabled. [`RowIdBounds::Unknown`] unless set.
+    pub row_id_bounds: RowIdBounds,
 }
 
 impl DataFileInfo {
@@ -1759,7 +1809,14 @@ impl DataFileInfo {
             owner_catalog_id: None,
             row_id_start: RowIdStart::Assign,
             row_id_floor: None,
+            row_id_bounds: RowIdBounds::Unknown,
         }
+    }
+
+    /// See [`row_id_bounds`](Self::row_id_bounds).
+    pub fn with_row_id_bounds(mut self, bounds: RowIdBounds) -> Self {
+        self.row_id_bounds = bounds;
+        self
     }
 
     /// Set the footer size for read optimization.
