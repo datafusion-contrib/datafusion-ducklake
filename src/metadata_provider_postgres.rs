@@ -1076,26 +1076,32 @@ pub(crate) async fn inlined_file_deletes_for_flush_on(
 }
 
 /// The inlined deletions of Parquet rows of `table_id` committed after
-/// `start_snapshot` and at or below `end_snapshot`, read on `connection`. A
-/// table without an inlined-deletion table has none: check that it exists
-/// first. `in_transaction` says whether `connection` is inside a transaction;
+/// `start_snapshot` and at or below `end_snapshot`, of the data files
+/// `data_file_ids` only when given, read on `connection`. A table without an
+/// inlined-deletion table has none: check that it exists first.
+/// `in_transaction` says whether `connection` is inside a transaction;
 /// outside one, a table gone since the check reads as `None` (see
 /// [`missing_table_as_none`]).
 pub(crate) async fn inlined_file_deletes_between_on(
     connection: &mut PgConnection,
     in_transaction: bool,
     table_id: i64,
+    data_file_ids: Option<&[i64]>,
     start_snapshot: i64,
     end_snapshot: i64,
 ) -> Result<Option<Vec<InlinedFileDeleteChange>>> {
     let table = quote_ident(&inlined_delete_table_name(table_id)?);
-    let sql = inlined_file_deletes_between_sql(&table, ["$1", "$2", "$3"]);
-    let rows = sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+    // The ids are bound as one array, so the statement stays one string.
+    let file_ids = data_file_ids.map(|_| "= ANY($4::bigint[])");
+    let sql = inlined_file_deletes_between_sql(&table, ["$1", "$2", "$3"], file_ids);
+    let mut query = sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
         .bind(table_id)
         .bind(start_snapshot)
-        .bind(end_snapshot)
-        .fetch_all(connection)
-        .await;
+        .bind(end_snapshot);
+    if let Some(ids) = data_file_ids {
+        query = query.bind(ids);
+    }
+    let rows = query.fetch_all(connection).await;
     Ok(missing_table_as_none(rows, in_transaction)?
         .map(|rows| rows.into_iter().map(inlined_file_delete_change).collect()))
 }
@@ -1593,6 +1599,38 @@ pub struct PostgresMetadataProvider {
 }
 
 impl PostgresMetadataProvider {
+    /// The inlined deletions of Parquet rows of `table_id` in the inclusive
+    /// window, of the data files `data_file_ids` only when given.
+    fn inlined_file_deletes(
+        &self,
+        table_id: i64,
+        data_file_ids: Option<&[i64]>,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        let table = inlined_delete_table_name(table_id)?;
+        block_on(async {
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            let mut connection = self.connection().await?;
+            let in_read = connection.in_read();
+            let read = inlined_file_deletes_between_on(
+                &mut connection,
+                in_read,
+                table_id,
+                data_file_ids,
+                start_snapshot,
+                end_snapshot,
+            )
+            .await;
+            self.inlined_deletion_tables.rows_or_forget(table_id, read)
+        })
+    }
+
     /// Creates a new provider for an existing DuckLake catalog.
     pub async fn new(connection_string: &str) -> Result<Self> {
         let url = connection_string.to_string();
@@ -3088,26 +3126,20 @@ impl MetadataProvider for PostgresMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
-        let table = inlined_delete_table_name(table_id)?;
-        block_on(async {
-            if !self
-                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
-                .await?
-            {
-                return Ok(Vec::new());
-            }
-            let mut connection = self.connection().await?;
-            let in_read = connection.in_read();
-            let read = inlined_file_deletes_between_on(
-                &mut connection,
-                in_read,
-                table_id,
-                start_snapshot,
-                end_snapshot,
-            )
-            .await;
-            self.inlined_deletion_tables.rows_or_forget(table_id, read)
-        })
+        self.inlined_file_deletes(table_id, None, start_snapshot, end_snapshot)
+    }
+
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inlined_file_deletes(table_id, Some(data_file_ids), start_snapshot, end_snapshot)
     }
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
@@ -3804,7 +3836,8 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
-    current_delete.begin_snapshot
+    current_delete.begin_snapshot,
+    current_delete.data_file_id
 FROM current_delete
 JOIN data_files data USING (data_file_id)
 LEFT JOIN LATERAL (
@@ -3840,7 +3873,8 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
-    data.end_snapshot
+    data.end_snapshot,
+    data.data_file_id
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
     SELECT
@@ -3851,7 +3885,7 @@ LEFT JOIN LATERAL (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = data.data_file_id
-      AND ddf.begin_snapshot < data.end_snapshot
+      AND ddf.begin_snapshot <= data.end_snapshot
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true
@@ -3870,6 +3904,7 @@ WHERE data.table_id = $1
                 .map(|row| {
                     Ok(DeleteFileChange {
                         // data file
+                        data_file_id: row.try_get(16)?,
                         data_file_path: row.try_get(0)?,
                         data_file_path_is_relative: row.try_get(1)?,
                         data_file_size_bytes: row.try_get(2)?,

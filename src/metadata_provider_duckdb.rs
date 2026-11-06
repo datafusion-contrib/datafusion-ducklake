@@ -25,7 +25,7 @@ use crate::metadata_provider::{
     build_inlined_batch, inlined_delete_table_name, inlined_file_delete_change,
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
-    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings, sql_id_list,
 };
 use crate::metadata_provider::{SQL_FILE_SCHEMA_VERSION, SQL_NEXT_FILE_ID};
 use crate::partition::PartitionSpec;
@@ -997,6 +997,42 @@ pub struct DuckdbMetadataProvider {
 }
 
 impl DuckdbMetadataProvider {
+    /// The inlined deletions of Parquet rows of `table_id` in the inclusive
+    /// window, of the data files `data_file_ids` only when given.
+    fn inlined_file_deletes(
+        &self,
+        table_id: i64,
+        data_file_ids: Option<&[i64]>,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> crate::Result<Vec<InlinedFileDeleteChange>> {
+        let conn = self.connection()?;
+        let table = quote_ident(&inlined_delete_table_name(table_id)?);
+        let file_ids = data_file_ids.map(sql_id_list);
+        let sql = inlined_file_deletes_between_sql(&table, ["?", "?", "?"], file_ids.as_deref());
+        let mut statement = match conn.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(statement
+            .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
+                Ok(inlined_file_delete_change((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                )))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Create a new DuckDB metadata provider
     pub fn new(catalog_path: impl Into<String>) -> crate::Result<Self> {
         let catalog_path = catalog_path.into();
@@ -2521,30 +2557,20 @@ impl MetadataProvider for DuckdbMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> crate::Result<Vec<InlinedFileDeleteChange>> {
-        let conn = self.connection()?;
-        let table = quote_ident(&inlined_delete_table_name(table_id)?);
-        let sql = inlined_file_deletes_between_sql(&table, ["?", "?", "?"]);
-        let mut statement = match conn.prepare(&sql) {
-            Ok(statement) => statement,
-            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(statement
-            .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
-                Ok(inlined_file_delete_change((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                )))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.inlined_file_deletes(table_id, None, start_snapshot, end_snapshot)
+    }
+
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> crate::Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inlined_file_deletes(table_id, Some(data_file_ids), start_snapshot, end_snapshot)
     }
 
     fn get_schema_by_name(
@@ -3013,6 +3039,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
                 Ok(DeleteFileChange {
                     // data file
+                    data_file_id: row.get(16)?,
                     data_file_path: row.get(0)?,
                     data_file_path_is_relative: row.get(1)?,
                     data_file_size_bytes: row.get(2)?,

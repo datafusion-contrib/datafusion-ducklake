@@ -27,7 +27,7 @@ use crate::metadata_provider::{
     InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedVersionColumn,
     SQL_FILE_SCHEMA_VERSION, SchemaVersionLedger, inlined_file_delete_change,
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
-    inlined_version_columns_sql, inlined_version_snapshot_sql,
+    inlined_version_columns_sql, inlined_version_snapshot_sql, sql_id_list,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -740,6 +740,37 @@ pub struct MySqlMetadataProvider {
 }
 
 impl MySqlMetadataProvider {
+    /// The inlined deletions of Parquet rows of `table_id` in the inclusive
+    /// window, of the data files `data_file_ids` only when given.
+    fn inlined_file_deletes(
+        &self,
+        table_id: i64,
+        data_file_ids: Option<&[i64]>,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        block_on(async {
+            let table = quote_ident(&inlined_delete_table_name(table_id)?);
+            let file_ids = data_file_ids.map(sql_id_list);
+            let sql =
+                inlined_file_deletes_between_sql(&table, ["?", "?", "?"], file_ids.as_deref());
+            match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+                .bind(table_id)
+                .bind(start_snapshot)
+                .bind(end_snapshot)
+                // Ids written into the SQL make a string per id list: not
+                // one for the connection's statement cache.
+                .persistent(data_file_ids.is_none())
+                .fetch_all(&mut *self.connection().await?)
+                .await
+            {
+                Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
+                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     /// Creates a new provider for an existing DuckLake catalog.
     pub async fn new(connection_string: &str) -> Result<Self> {
         let url = connection_string.to_string();
@@ -2223,21 +2254,20 @@ impl MetadataProvider for MySqlMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
-        block_on(async {
-            let table = quote_ident(&inlined_delete_table_name(table_id)?);
-            let sql = inlined_file_deletes_between_sql(&table, ["?", "?", "?"]);
-            match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(start_snapshot)
-                .bind(end_snapshot)
-                .fetch_all(&mut *self.connection().await?)
-                .await
-            {
-                Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
-                Err(error) if is_absent_inlined_deletion_table(&error) => Ok(Vec::new()),
-                Err(error) => Err(error.into()),
-            }
-        })
+        self.inlined_file_deletes(table_id, None, start_snapshot, end_snapshot)
+    }
+
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inlined_file_deletes(table_id, Some(data_file_ids), start_snapshot, end_snapshot)
     }
 
     fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
@@ -2888,7 +2918,8 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
-    current_delete.begin_snapshot
+    current_delete.begin_snapshot,
+    current_delete.data_file_id
 FROM current_delete
 JOIN data_files data USING (data_file_id)
 LEFT JOIN LATERAL (
@@ -2924,7 +2955,8 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
-    data.end_snapshot
+    data.end_snapshot,
+    data.data_file_id
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
     SELECT
@@ -2935,7 +2967,7 @@ LEFT JOIN LATERAL (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = ?
       AND ddf.data_file_id = data.data_file_id
-      AND ddf.begin_snapshot < data.end_snapshot
+      AND ddf.begin_snapshot <= data.end_snapshot
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true
@@ -2962,6 +2994,7 @@ WHERE data.table_id = ?
                 .map(|row| {
                     Ok(DeleteFileChange {
                         // data file
+                        data_file_id: row.try_get(16)?,
                         data_file_path: row.try_get(0)?,
                         data_file_path_is_relative: row.try_get(1)?,
                         data_file_size_bytes: row.try_get(2)?,

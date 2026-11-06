@@ -5,50 +5,66 @@
 //! inserts, deletes (with the deleted rows' old values), and UPDATEs correlated
 //! into `update_preimage`/`update_postimage` pairs, matching official DuckLake.
 //!
+//! The feed is planned as official's `ducklake_table_changes` macro defines it:
+//! the window's insertions ([`InsertedRowsExec`], plus inlined rows) left-joined
+//! to its deletions ([`DeletedRowsExec`], plus inlined rows) on
+//! `(snapshot_id, rowid)`, and the deletions to the insertions, unioned. Both
+//! sides stream; each join holds only the other side's keys, in memory charged
+//! to the session's pool.
+//!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array};
-use arrow::compute::take;
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Result as DataFusionResult;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{JoinType, NullEquality, Result as DataFusionResult};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{CaseExpr, Column, is_not_null};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::reset_plan_states;
+use datafusion::physical_plan::joins::utils::JoinOn;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use crate::column_rename::ColumnRenameExec;
+use crate::feed_charge::{
+    KeyedInlinedRows, PlanCharge, file_deletes_bytes, inlined_rows_bytes, plan_charge, release,
+};
 use crate::metadata_provider::{
-    DataFileChange, DuckLakeInlinedRows, DuckLakeTableColumn, InlinedFileDeleteChange,
-    InlinedRowSelection, MetadataProvider,
+    DataFileChange, DuckLakeTableColumn, InlinedFileDeleteChange, InlinedRowSelection,
+    MetadataProvider, snapshot_change_tokens,
 };
 use crate::path_resolver::resolve_path;
-use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
+use crate::row_id::positional_table_schema_reserving;
 use crate::table::{
-    ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
-    delete_file_schema, metadata_size_hint, read_parquet_file_layout, read_parquet_footer_facts,
-    session_parquet_source, validated_file_size, validated_record_count,
+    ParquetFileLayout, cached_parquet_reader_factory, metadata_size_hint, session_parquet_source,
+    validated_file_size,
+};
+use crate::table_deletions::{
+    DeletedRowsExec, DeletionSource, FeedFiles, WindowDeletions, change_type_literal,
+    keyed_rows_schema, label_rows, project_feed, projected_table_indices,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
 use crate::types::DuckLakeDefaultExprAdapterFactory;
@@ -184,7 +200,7 @@ pub(crate) fn check_column_count(table_len: usize, columns_len: usize) -> DataFu
 /// projection (`SELECT snapshot_id FROM …`, `COUNT(*)`) reads one data column
 /// purely for its row count, and a column the file predates is materialised as a
 /// null array rather than read from it.
-fn row_count_probe_index(read_schema: &Schema) -> usize {
+pub(crate) fn row_count_probe_index(read_schema: &Schema) -> usize {
     read_schema
         .fields()
         .iter()
@@ -542,57 +558,18 @@ impl TableChangesTable {
         }
     }
 
-    /// The read layout of one data file, memoized by resolved path.
-    ///
-    /// `size_bytes` and `footer_size` are the catalog's recorded values for the
-    /// file, so a cold footer read needs no `head()` and no length probe.
-    #[allow(clippy::too_many_arguments)]
-    async fn file_layout(
-        &self,
-        state: &dyn Session,
-        columns: &[DuckLakeTableColumn],
-        path: &str,
-        is_relative: bool,
-        size_bytes: i64,
-        footer_size: Option<i64>,
-        mapping_id: Option<i64>,
-    ) -> DataFusionResult<Arc<ParquetFileLayout>> {
-        let resolved = resolve_path(&self.table_path, path, is_relative)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        {
-            let cache = self.layout_cache.lock().unwrap();
-            if let Some(layout) = cache.get(&resolved) {
-                return Ok(Arc::clone(layout));
-            }
+    /// The view of this feed the per-file planners read.
+    fn feed_files(&self) -> FeedFiles<'_> {
+        FeedFiles {
+            provider: self.provider.as_ref(),
+            table_id: self.table_id,
+            start_snapshot: self.start_snapshot,
+            end_snapshot: self.end_snapshot,
+            object_store_url: self.object_store_url.as_ref(),
+            table_path: &self.table_path,
+            table_schema: &self.table_schema,
+            layout_cache: &self.layout_cache,
         }
-        // No encryption key: this path never reaches an encrypted file (see the
-        // guard in `scan`), and a footer it cannot decrypt is not readable here.
-        let layout = read_parquet_file_layout(
-            state,
-            self.object_store_url.as_ref(),
-            &resolved,
-            Some(size_bytes),
-            footer_size,
-            None,
-            columns,
-            &self.table_schema,
-        )
-        .await?;
-        let layout = apply_name_mapping_to_layout(
-            self.provider.as_ref(),
-            self.table_id,
-            self.end_snapshot,
-            columns,
-            &resolved,
-            mapping_id,
-            layout,
-        )?;
-        self.layout_cache
-            .lock()
-            .unwrap()
-            .entry(resolved)
-            .or_insert_with(|| Arc::clone(&layout));
-        Ok(layout)
     }
 
     /// Analyze projection and split into table columns and CDC columns.
@@ -838,34 +815,6 @@ impl TableChangesTable {
         )))
     }
 
-    /// Read a DELETE file's footer and return the physical name of its embedded
-    /// per-row snapshot column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`]) when present.
-    /// Current-spec delete files are cumulative and carry one.
-    ///
-    /// A delete file holds `(file_path, pos[, snapshot])`, none of it table
-    /// columns, so it needs the raw footer rather than a read layout.
-    async fn detect_delete_file_snapshot_name(
-        &self,
-        state: &dyn Session,
-        path: &str,
-        is_relative: bool,
-        size_bytes: Option<i64>,
-        footer_size: Option<i64>,
-    ) -> DataFusionResult<Option<String>> {
-        let resolved = resolve_path(&self.table_path, path, is_relative)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let facts = read_parquet_footer_facts(
-            state,
-            self.object_store_url.as_ref(),
-            &resolved,
-            size_bytes,
-            footer_size,
-            None,
-        )
-        .await?;
-        Ok(facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned())
-    }
-
     /// The read schema for a data file: its table columns under the physical names
     /// THIS file gives them, plus the embedded rowid / per-row snapshot columns
     /// when present, in that order.
@@ -891,32 +840,30 @@ impl TableChangesTable {
         }
     }
 
-    /// The catalog fields the per-file scans of the correlated feed present, so
-    /// every one of them hands `correlate_changes` the same table columns.
-    fn catalog_table_fields(&self) -> Vec<FieldRef> {
-        self.table_schema.fields().iter().cloned().collect()
-    }
-
-    /// Scan of an inserted data file for the correlated feed. A file with an
-    /// embedded rowid (an UPDATE / compaction postimage) is scanned plainly — its
-    /// rowid IS the embedded column. A plain insert is scanned positionally —
-    /// the parquet reader appends the physical position — so its rowid can be
-    /// synthesized as `row_id_start + position`; but only when `need_rowid`,
-    /// otherwise it is a plain scan with no position column.
+    /// The read of an inserted data file for the correlated feed, projected to
+    /// the table columns at `table_indices`.
     ///
-    /// The positional scan takes no explicit projection, so the position column
-    /// lands last, after the table columns and any embedded columns — the index
-    /// `pos_col_idx` computes in `build_insert_units`.
+    /// A file with an embedded rowid (an UPDATE / compaction postimage) is
+    /// scanned plainly — its rowid IS the embedded column. A plain insert is
+    /// scanned positionally when `resolve_rowid` — the parquet reader appends
+    /// the physical position — so its rowid can be synthesized as
+    /// `row_id_start + position`; otherwise it is a plain scan and its rowid
+    /// is not resolved. A merged partial file also reads its embedded per-row
+    /// snapshot column.
     ///
-    /// Either way the plan is presented under the catalog schema, ABOVE the scan
-    /// so the position column passes straight through.
-    fn build_insert_scan(
+    /// The scan's columns are the projected table columns, presented under the
+    /// catalog schema, then a row-count probe when nothing else is read, then
+    /// the embedded rowid, the embedded snapshot and the position, each when
+    /// read.
+    fn insert_source(
         &self,
         state: &dyn Session,
         data_file: &DataFileChange,
         layout: &ParquetFileLayout,
-        need_rowid_resolution: bool,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        resolve_rowid: bool,
+        table_indices: &[usize],
+        rewrites: &BTreeSet<i64>,
+    ) -> DataFusionResult<InsertSource> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let resolved = resolve_path(
             &self.table_path,
@@ -939,143 +886,90 @@ impl TableChangesTable {
         };
         let embedded_rowid = &layout.embedded_rowid_parquet_name;
         let read_schema = self.read_schema_with_embedded(layout, embedded_rowid, &snapshot_name);
-        let plain_scan = |pf: PartitionedFile, schema: SchemaRef| {
-            let builder = FileScanConfigBuilder::new(
-                self.object_store_url.as_ref().clone(),
-                Arc::new(
-                    session_parquet_source(state, schema)
-                        .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
-                ),
-            )
-            .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
-            .with_file_group(FileGroup::new(vec![pf]));
-            DataSourceExec::from_data_source(builder.build())
+        let table_len = layout.read_schema.fields().len();
+
+        let mut projection = table_indices.to_vec();
+        if table_indices.is_empty() && embedded_rowid.is_none() && snapshot_name.is_none() {
+            // A data column for the row count: the position alone is a virtual
+            // column, and the reader needs a real one to count.
+            projection.push(row_count_probe_index(&layout.read_schema));
+        }
+        let mut next = table_len;
+        let mut take_embedded = || {
+            projection.push(next);
+            next += 1;
+            projection.len() - 1
         };
-        let scan: Arc<dyn ExecutionPlan> = match embedded_rowid {
-            // Postimage / rewrite / non-adjacent merge: rowid IS the embedded
-            // column — a plain scan.
-            Some(_) => plain_scan(pf, read_schema),
-            // No embedded rowid but resolution required (rowid projected, or a
-            // partial file whose real rowids feed the update correlation): scan
-            // positionally to synthesize rowid = row_id_start + position.
-            None if need_rowid_resolution => {
+        let rowid_col = embedded_rowid.as_ref().map(|_| take_embedded());
+        let snapshot_col = snapshot_name.as_ref().map(|_| take_embedded());
+        let (scan_schema, pos_col): (TableSchema, Option<usize>) =
+            if embedded_rowid.is_none() && resolve_rowid {
                 // Re-presented under the catalog names below, where
                 // `ColumnRenameExec` binds by name; keep the position column
                 // clear of those as well as of the file's own names.
-                let (table_schema, _, _) = positional_table_schema_reserving(
+                let (schema, pos_index, _) = positional_table_schema_reserving(
                     read_schema,
                     self.table_schema.fields().iter().map(|f| f.name().as_str()),
                 );
-                let builder = FileScanConfigBuilder::new(
-                    self.object_store_url.as_ref().clone(),
-                    Arc::new(
-                        session_parquet_source(state, table_schema)
-                            .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
-                    ),
+                projection.push(pos_index);
+                (schema, Some(projection.len() - 1))
+            } else {
+                (read_schema.into(), None)
+            };
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(
+                session_parquet_source(state, scan_schema)
+                    .with_parquet_file_reader_factory(reader_factory),
+            ),
+        )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
+        .with_file_group(FileGroup::new(vec![pf]))
+        .with_projection_indices(Some(projection))?;
+        let table_fields: Vec<FieldRef> = table_indices
+            .iter()
+            .map(|&i| Arc::clone(&self.table_schema.fields()[i]))
+            .collect();
+        let scan = present_catalog_schema(
+            DataSourceExec::from_data_source(builder.build()),
+            &table_fields,
+            &layout.name_mapping,
+            &layout.constants,
+        );
+        #[cfg(debug_assertions)]
+        if let Some(idx) = pos_col {
+            let schema = scan.schema();
+            let field = schema.fields().get(idx).unwrap_or_else(|| {
+                panic!(
+                    "pos_col {idx} is out of range for a scan of {} columns",
+                    schema.fields().len()
                 )
-                .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
-                .with_file_group(FileGroup::new(vec![pf]));
-                DataSourceExec::from_data_source(builder.build())
-            },
-            // Plain insert, rowid not needed: a plain scan, no positions.
-            None => plain_scan(pf, read_schema),
-        };
-        Ok(present_catalog_schema(
-            scan,
-            &self.catalog_table_fields(),
-            &layout.name_mapping,
-            &layout.constants,
-        ))
-    }
-
-    /// Positional scan of a delete's source data file: table columns, the
-    /// embedded rowid column when present, and the reader-produced
-    /// physical-position column appended last. Positions come from the parquet
-    /// reader, so deleted rows can be matched to the delete file's `pos` set
-    /// regardless of how the scan is pruned, split or reordered.
-    fn build_delete_data_scan(
-        &self,
-        state: &dyn Session,
-        resolved_path: &str,
-        size_bytes: i64,
-        footer_size: i64,
-        layout: &ParquetFileLayout,
-        embedded_name: &Option<String>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
-        let mut pf = PartitionedFile::new(
-            resolved_path,
-            validated_file_size(size_bytes, resolved_path)?,
-        );
-        if let Some(hint) = metadata_size_hint(Some(footer_size)) {
-            pf = pf.with_metadata_size_hint(hint);
+            });
+            crate::row_id::validate_row_pos_field("insert_source", idx, field)
+                .expect("`pos_col` arithmetic must land on the position column");
         }
-        let read_schema = self.read_schema_with_embedded(layout, embedded_name, &None);
-        // See `build_insert_scan`: the catalog names are reserved too.
-        let (table_schema, _, _) = positional_table_schema_reserving(
-            read_schema,
-            self.table_schema.fields().iter().map(|f| f.name().as_str()),
-        );
-        let builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(
-                session_parquet_source(state, table_schema)
-                    .with_parquet_file_reader_factory(reader_factory),
-            ),
-        )
-        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
-        .with_file_group(FileGroup::new(vec![pf]));
-        let scan = DataSourceExec::from_data_source(builder.build());
-        Ok(present_catalog_schema(
-            scan,
-            &self.catalog_table_fields(),
-            &layout.name_mapping,
-            &layout.constants,
-        ))
-    }
-
-    /// Scan of a positional delete file (the standard `(file_path, pos)` schema);
-    /// the correlation path reads its `pos` column to find newly-deleted rows.
-    fn build_delete_file_scan(
-        &self,
-        state: &dyn Session,
-        path: &str,
-        is_relative: bool,
-        size_bytes: i64,
-        footer_size: i64,
-        snapshot_name: &Option<String>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
-        let resolved = resolve_path(&self.table_path, path, is_relative)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let mut pf = PartitionedFile::new(&resolved, validated_file_size(size_bytes, &resolved)?);
-        if let Some(hint) = metadata_size_hint(Some(footer_size)) {
-            pf = pf.with_metadata_size_hint(hint);
-        }
-        // A cumulative (current-spec) delete file embeds each row's delete
-        // snapshot as a third column; read it when present.
-        let schema = match snapshot_name {
-            Some(name) => {
-                let mut fields: Vec<Field> = delete_file_schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
-                fields.push(Field::new(name, DataType::Int64, true));
-                Arc::new(Schema::new(fields))
+        let rowid = match (rowid_col, pos_col) {
+            (Some(column), _) => InsertRowid::Embedded(column),
+            (None, Some(position)) => InsertRowid::Positional {
+                position,
+                row_id_start: data_file.row_id_start,
             },
-            None => delete_file_schema(),
+            (None, None) => InsertRowid::Unresolved,
         };
-        let builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(
-                session_parquet_source(state, schema)
-                    .with_parquet_file_reader_factory(reader_factory),
-            ),
-        )
-        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
-        .with_file_group(FileGroup::new(vec![pf]));
-        Ok(DataSourceExec::from_data_source(builder.build()))
+        let excluded_snapshots = match data_file.partial_max {
+            Some(partial_max) if partial_max >= data_file.begin_snapshot => rewrites
+                .range(data_file.begin_snapshot..=partial_max)
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(InsertSource {
+            scan,
+            snapshot_id: data_file.begin_snapshot,
+            rowid,
+            snapshot_col,
+            excluded_snapshots,
+        })
     }
 
     /// Refuse the feed when an encrypted table's columns changed identity between
@@ -1162,42 +1056,58 @@ impl TableChangesTable {
         Ok(())
     }
 
-    /// Build the correlated change feed: pair a same-snapshot delete + insert
-    /// that share a rowid into `update_preimage` (old) + `update_postimage`
-    /// (new); surface unmatched inserts as `insert` and unmatched deletes as
-    /// `delete` (carrying the deleted rows' old values), matching official
-    /// DuckLake's `ducklake_table_changes`.
+    /// Build the correlated change feed as official DuckLake's
+    /// `ducklake_table_changes` macro defines it: the window's insertions
+    /// left-joined to its deletions on `(snapshot_id, rowid)` — a matched row
+    /// is an `update_postimage`, the rest `insert` — and the deletions
+    /// left-joined to the insertions — `update_preimage`, else `delete` —
+    /// unioned. A row that shares its key with several rows of the other side
+    /// is reported once per such row, as official's join reports it.
+    ///
+    /// Each side streams. The joins build on the other side's keys alone
+    /// (`(snapshot_id, rowid)`, read with no table column), in a hash table
+    /// charged to the session's memory pool.
+    ///
+    /// A plain insert (no embedded rowid, not a merged partial file) carries a
+    /// rowid first assigned in its own snapshot, which no deletion of that
+    /// snapshot holds — a row inserted and deleted in one commit is never
+    /// written — so plain inserts skip the join and surface as `insert`; that
+    /// also lets them leave their rowid unresolved when it is not projected.
     #[allow(clippy::too_many_arguments)]
     async fn build_correlated_changes(
         &self,
         state: &dyn Session,
         columns: &[DuckLakeTableColumn],
         data_files: &[DataFileChange],
-        delete_files: &[crate::metadata_provider::DeleteFileChange],
+        window_deletions: WindowDeletions,
+        rewrites: &BTreeSet<i64>,
         inlined: InlinedChanges,
         layouts: &[Arc<ParquetFileLayout>],
         projection: Option<&Vec<usize>>,
+        charge: &PlanCharge,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let table_len = self.table_schema.fields().len();
-        // Both come from the same column list, and the index arithmetic below
-        // (which column of a scan batch is the embedded rowid, the embedded
-        // snapshot, the position) assumes they agree. A disagreement would
-        // silently misalign every per-file scan — with more columns than
+        // Both come from the same column list, and the index arithmetic of the
+        // scans (which column of a scan batch is the embedded rowid, the
+        // embedded snapshot, the position) assumes they agree. A disagreement
+        // would silently misalign every per-file scan — with more columns than
         // `table_len` the internal-column indices land on DATA columns and the
         // feed emits a data value as a rowid. Unreachable through the table
         // functions, which derive both from one `get_table_structure` call, but
         // the constructor and `with_columns` are public: refuse loudly.
         check_column_count(table_len, columns.len())?;
-        // Whether the caller wants the rowid column (at ROWID_IDX among the
-        // leading CDC columns). When it does not, plain inserts skip the
-        // positional scan and rowid synthesis entirely.
-        let need_rowid = projection.is_none_or(|idx| idx.contains(&ROWID_IDX));
+        // The table columns the caller reads, and whether it reads the rowid
+        // column (at ROWID_IDX among the leading CDC columns). When it does
+        // not, plain inserts skip the positional scan and rowid synthesis
+        // entirely.
+        let (table_indices, need_rowid) = projected_table_indices(projection, CDC_COLS, table_len);
 
-        let mut insert_units = Vec::with_capacity(data_files.len());
+        // Inserted files split into those whose rows can pair with a deletion
+        // (an embedded rowid, or a merged partial file whose real rowids feed
+        // the pairing) and plain inserts.
+        let mut plain = Vec::new();
+        let mut pairable = Vec::new();
         for (df, layout) in data_files.iter().zip(layouts.iter()) {
-            // Column layout of the scan batch after the `table_len` table
-            // columns: [embedded rowid?][embedded snapshot? (partial files
-            // only)][position? (appended by the positional scan)].
             let is_partial = df.partial_max.is_some();
             if is_partial && layout.embedded_snapshot_parquet_name.is_none() {
                 return Err(DataFusionError::External(
@@ -1210,234 +1120,145 @@ impl TableChangesTable {
                     .into(),
                 ));
             }
-            // A partial file's rows carry REAL rowids into the update
-            // correlation (a placeholder could false-pair), so rowid is
-            // resolved for them even when it is not projected.
-            let resolve_rowid = need_rowid || is_partial;
-            let has_embedded_rowid = layout.embedded_rowid_parquet_name.is_some();
-            let mut next_idx = table_len;
-            let embedded_col_idx = has_embedded_rowid.then(|| {
-                let i = next_idx;
-                next_idx += 1;
-                i
-            });
-            let snapshot_col_idx = (is_partial && layout.embedded_snapshot_parquet_name.is_some())
-                .then(|| {
-                    let i = next_idx;
-                    next_idx += 1;
-                    i
-                });
-            let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
-            let scan = self.build_insert_scan(state, df, layout, resolve_rowid)?;
-            #[cfg(debug_assertions)]
-            if let Some(idx) = pos_col_idx {
-                let schema = scan.schema();
-                let field = schema.fields().get(idx).unwrap_or_else(|| {
-                    panic!(
-                        "pos_col_idx {idx} is out of range for a scan of {} columns",
-                        schema.fields().len()
-                    )
-                });
-                crate::row_id::validate_row_pos_field("build_insert_units", idx, field)
-                    .expect("`pos_col_idx` arithmetic must land on the position column");
+            if is_partial || layout.embedded_rowid_parquet_name.is_some() {
+                pairable.push((df, layout));
+            } else {
+                plain.push((df, layout));
             }
-            insert_units.push(InsertUnit {
-                snapshot_id: df.begin_snapshot,
-                scan,
-                embedded_col_idx,
-                snapshot_col_idx,
-                pos_col_idx,
-                row_id_start: df.row_id_start,
-            });
         }
 
+        let files = self.feed_files();
         // Every delete in range is read: unmatched ones surface as `delete`
-        // rows, and those sharing a (snapshot_id, rowid) with an embedded-rowid
-        // insert pair into update preimages.
-        let mut inlined_file_deletes =
-            InlinedFileDeletes::group(&self.table_path, &inlined.file_deletes)?;
-        let delete_units = {
-            let mut delete_units = Vec::with_capacity(delete_files.len());
-            for dfc in delete_files {
-                validated_record_count(dfc.data_record_count, &dfc.data_file_path)?;
-                let resolved = resolve_path(
-                    &self.table_path,
-                    &dfc.data_file_path,
-                    dfc.data_file_path_is_relative,
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let (inlined_positions, full_file) =
-                    inlined_file_deletes.claim(&resolved, dfc.current_delete_path.is_none());
-                // The source data file can predate the window (and any rename in
-                // it), so its columns need resolving by field id too.
-                let source_layout = self
-                    .file_layout(
-                        state,
-                        columns,
-                        &dfc.data_file_path,
-                        dfc.data_file_path_is_relative,
-                        dfc.data_file_size_bytes,
-                        dfc.data_file_footer_size,
-                        dfc.data_mapping_id,
-                    )
-                    .await?;
-                let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
-                let data_scan = self.build_delete_data_scan(
-                    state,
-                    &resolved,
-                    dfc.data_file_size_bytes,
-                    dfc.data_file_footer_size.unwrap_or(0),
-                    &source_layout,
-                    &old_embedded,
-                )?;
-                // A cumulative (current-spec) delete file embeds each row's
-                // delete snapshot; its positions are windowed per row and no
-                // previous-file subtraction applies. Legacy 2-column files keep
-                // the delta-vs-previous model.
-                let snapshot_name = match &dfc.current_delete_path {
-                    Some(p) => {
-                        self.detect_delete_file_snapshot_name(
-                            state,
-                            p,
-                            dfc.current_delete_path_is_relative.unwrap_or(true),
-                            dfc.current_delete_file_size_bytes,
-                            dfc.current_delete_footer_size,
-                        )
-                        .await?
-                    },
-                    None => None,
-                };
-                let cumulative = snapshot_name.is_some();
-                // A delete file without per-row snapshots dates every deletion
-                // it adds at its own begin_snapshot, so one beginning before the
-                // window adds none in it (official subtracts the latest delete
-                // file before the window, which holds them all); only the data
-                // file's in-window inlined deletions remain.
-                let before_window = !cumulative && dfc.snapshot_id < self.start_snapshot;
-                let current_delete_scan = match &dfc.current_delete_path {
-                    Some(p) if !before_window => Some(self.build_delete_file_scan(
-                        state,
-                        p,
-                        dfc.current_delete_path_is_relative.unwrap_or(true),
-                        dfc.current_delete_file_size_bytes.unwrap_or(0),
-                        dfc.current_delete_footer_size.unwrap_or(0),
-                        &snapshot_name,
-                    )?),
-                    _ => None,
-                };
-                let previous_delete_scan = match &dfc.previous_delete_path {
-                    Some(p) if !cumulative && !before_window => Some(self.build_delete_file_scan(
-                        state,
-                        p,
-                        dfc.previous_delete_path_is_relative.unwrap_or(true),
-                        dfc.previous_delete_file_size_bytes.unwrap_or(0),
-                        dfc.previous_delete_footer_size.unwrap_or(0),
-                        &None,
-                    )?),
-                    _ => None,
-                };
-                // The positional scan reads every column in order:
-                // `[table columns, embedded rowid?, position]`.
-                let pos_col_idx = table_len + usize::from(old_embedded.is_some());
-                #[cfg(debug_assertions)]
-                {
-                    let schema = data_scan.schema();
-                    let field = schema.fields().get(pos_col_idx).unwrap_or_else(|| {
-                        panic!(
-                            "pos_col_idx {pos_col_idx} is out of range for a scan of {} columns",
-                            schema.fields().len()
-                        )
-                    });
-                    crate::row_id::validate_row_pos_field("build_delete_units", pos_col_idx, field)
-                        .expect("`pos_col_idx` arithmetic must land on the position column");
+        // rows, and those sharing a (snapshot_id, rowid) with an insertion
+        // pair into update preimages.
+        let InlinedChanges {
+            inserts: inlined_inserts,
+            deletes: inlined_deletes,
+            file_deletes,
+        } = inlined;
+        let deletions = Arc::new(
+            files
+                .deletion_sources(state, columns, &window_deletions, file_deletes, charge)
+                .await?,
+        );
+        // The catalog reads not kept are released: the charge follows what the
+        // plan holds.
+        drop(window_deletions);
+        charge.try_resize(
+            inlined_inserts.bytes()
+                + inlined_deletes.bytes()
+                + deletions
+                    .iter()
+                    .map(DeletionSource::held_bytes)
+                    .sum::<usize>(),
+        )?;
+        let has_pairable = !pairable.is_empty() || !inlined_inserts.is_empty();
+        let has_deletions = !deletions.is_empty() || !inlined_deletes.is_empty();
+
+        let window = (self.start_snapshot, self.end_snapshot);
+        let inserted = |files: &[(&DataFileChange, &Arc<ParquetFileLayout>)],
+                        resolve_rowid: bool,
+                        table_indices: &[usize]|
+         -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+            if files.is_empty() {
+                return Ok(None);
+            }
+            let sources = files
+                .iter()
+                .map(|(df, layout)| {
+                    // A partial file's rows carry REAL rowids into the update
+                    // correlation, so rowid is resolved for them even when it
+                    // is not projected.
+                    let resolve = resolve_rowid || df.partial_max.is_some();
+                    self.insert_source(state, df, layout, resolve, table_indices, rewrites)
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            Ok(Some(Arc::new(InsertedRowsExec::new(
+                sources,
+                keyed_rows_schema(&self.table_schema, table_indices),
+                table_indices.len(),
+                window,
+                state.config().target_partitions(),
+            ))))
+        };
+        // Inserted rows that can pair: the pairable files and the inlined
+        // inserts, which carry their row ids (one written by an UPDATE keeps
+        // the row id of the version it supersedes).
+        let pairable_rows =
+            |table_indices: &[usize]| -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+                let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
+                execs.extend(inserted(&pairable, true, table_indices)?);
+                if !inlined_inserts.is_empty() {
+                    execs.push(inlined_inserts.exec(table_indices)?);
                 }
-                delete_units.push(DeleteUnit {
-                    snapshot_id: dfc.snapshot_id,
-                    data_scan,
-                    embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
-                    pos_col_idx,
-                    current_delete_scan,
-                    previous_delete_scan,
-                    cumulative,
-                    full_file,
-                    inlined_positions,
-                    record_count: dfc.data_record_count,
-                    row_id_start: dfc.data_row_id_start,
-                });
-            }
-            // Data files whose only deletions in the window are inlined.
-            for (resolved, file) in inlined_file_deletes.unclaimed() {
-                validated_record_count(file.change.data_record_count, &file.change.data_file_path)?;
-                let source_layout = self
-                    .file_layout(
-                        state,
-                        columns,
-                        &file.change.data_file_path,
-                        file.change.data_file_path_is_relative,
-                        file.change.data_file_size_bytes,
-                        file.change.data_file_footer_size,
-                        file.change.data_mapping_id,
-                    )
-                    .await?;
-                let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
-                let data_scan = self.build_delete_data_scan(
+                union_of(execs)
+            };
+        // Deleted rows: the positions newly masked in the window and the
+        // inlined row versions deleted in it. Their rowids are resolved when
+        // output or when an insertion could pair with them.
+        let deleted_rows = |table_indices: &[usize],
+                            resolve_rowid: bool|
+         -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
+            if !deletions.is_empty() {
+                execs.push(Arc::new(DeletedRowsExec::try_new(
                     state,
-                    &resolved,
-                    file.change.data_file_size_bytes,
-                    file.change.data_file_footer_size.unwrap_or(0),
-                    &source_layout,
-                    &old_embedded,
-                )?;
-                delete_units.push(DeleteUnit {
-                    snapshot_id: file.change.snapshot_id,
-                    data_scan,
-                    embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
-                    pos_col_idx: table_len + usize::from(old_embedded.is_some()),
-                    current_delete_scan: None,
-                    previous_delete_scan: None,
-                    cumulative: false,
-                    full_file: false,
-                    inlined_positions: file.positions,
-                    record_count: file.change.data_record_count,
-                    row_id_start: file.change.data_row_id_start,
-                });
+                    &files,
+                    Arc::clone(&deletions),
+                    table_indices,
+                    resolve_rowid,
+                    charge,
+                )?));
             }
-            delete_units
+            if !inlined_deletes.is_empty() {
+                execs.push(inlined_deletes.exec(table_indices)?);
+            }
+            union_of(execs)
         };
 
-        let inlined_inserts = keyed_inlined_rows(&inlined.inserts, &self.table_schema)?;
-        let inlined_deletes = keyed_inlined_rows(&inlined.deletes, &self.table_schema)?;
-        let full: Arc<dyn ExecutionPlan> = Arc::new(TableChangesExec::new(
-            insert_units,
-            delete_units,
-            Arc::new(inlined_inserts),
-            Arc::new(inlined_deletes),
-            self.table_schema.clone(),
-            self.output_schema.clone(),
-            table_len,
-            need_rowid,
-            (self.start_snapshot, self.end_snapshot),
-        ));
-
-        // The exec emits the full `[snapshot_id, rowid, change_type, table
-        // columns]` schema; honor the requested projection with a
-        // ProjectionExec on top.
-        match projection {
-            None => Ok(full),
-            Some(indices) => {
-                let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = indices
-                    .iter()
-                    .map(|&i| {
-                        let f = self.output_schema.field(i);
-                        (
-                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
-                            f.name().to_string(),
-                        )
-                    })
-                    .collect();
-                Ok(Arc::new(ProjectionExec::try_new(exprs, full)?))
-            },
+        let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(3);
+        if let Some(rows) = inserted(&plain, need_rowid, &table_indices)? {
+            branches.push(label_rows(rows, ChangeType::Insert.as_str())?);
         }
+        if let Some(rows) = pairable_rows(&table_indices)? {
+            let keys = if has_deletions {
+                deleted_rows(&[], true)?
+            } else {
+                None
+            };
+            branches.push(pair_rows(
+                rows,
+                keys,
+                ChangeType::UpdatePostimage,
+                ChangeType::Insert,
+            )?);
+        }
+        if let Some(rows) = deleted_rows(&table_indices, need_rowid || has_pairable)? {
+            let keys = if has_pairable {
+                pairable_rows(&[])?
+            } else {
+                None
+            };
+            branches.push(pair_rows(
+                rows,
+                keys,
+                ChangeType::UpdatePreimage,
+                ChangeType::Delete,
+            )?);
+        }
+        let Some(changes) = union_of(branches)? else {
+            use datafusion::physical_plan::empty::EmptyExec;
+            return Ok(Arc::new(EmptyExec::new(
+                self.analyze_projection(projection).output_schema,
+            )));
+        };
+        project_feed(
+            changes,
+            projection,
+            &self.output_schema,
+            CDC_COLS,
+            &table_indices,
+        )
     }
 }
 
@@ -1472,31 +1293,39 @@ impl TableProvider for TableChangesTable {
         // (`MetadataProvider::begin_consistent_read`): a flush that commits
         // meanwhile moves inlined rows or deletions into files, and separate
         // reads could see them in both places or in neither.
-        let (data_files, delete_files, inlined) =
+        let window = (self.start_snapshot, self.end_snapshot);
+        // What the plan holds from the catalog is charged to the session's
+        // memory pool as it is read, and for as long as the plan holds it.
+        let charge = plan_charge(state, "ducklake_table_changes");
+        let (data_files, window_deletions, rewrites, inlined) =
             crate::metadata_provider::read_consistently(&self.provider, |provider| {
                 let external = |e| DataFusionError::External(Box::new(e));
+                // A rewrite's snapshot changes no row: the feed reports neither
+                // the files it ends nor the rows it writes.
+                let rewrites = rewrite_snapshots(provider.as_ref(), self.table_id, window)?;
                 // INSERT changes.
-                let data_files = provider
+                let mut data_files = provider
                     .get_data_files_added_between_snapshots(
                         self.table_id,
                         self.start_snapshot,
                         self.end_snapshot,
                     )
                     .map_err(external)?;
+                data_files.retain(|file| !written_by_rewrite(file, &rewrites));
                 // Deletes applied in the window surface as `delete` rows (and
                 // pair into update preimages), so they participate in both the
                 // empty check and the path decision — a delete-only window is
                 // NOT empty. The insertions feed never reads the delete side.
-                let delete_files = if self.insertions_only {
-                    Vec::new()
+                let window_deletions = if self.insertions_only {
+                    WindowDeletions::default()
                 } else {
-                    provider
-                        .get_delete_files_added_between_snapshots(
-                            self.table_id,
-                            self.start_snapshot,
-                            self.end_snapshot,
-                        )
-                        .map_err(external)?
+                    WindowDeletions::read(
+                        provider.as_ref(),
+                        self.table_id,
+                        window,
+                        &rewrites,
+                        &charge,
+                    )?
                 };
                 // Inlined inserts, inlined rows deleted or superseded in the
                 // window, and inlined deletions of Parquet-resident rows. Each
@@ -1506,14 +1335,16 @@ impl TableProvider for TableChangesTable {
                     provider.as_ref(),
                     self.table_id,
                     &columns,
+                    &self.table_schema,
                     (self.start_snapshot, self.end_snapshot),
                     !self.insertions_only,
+                    &charge,
                 )?;
-                Ok::<_, DataFusionError>((data_files, delete_files, inlined))
+                Ok::<_, DataFusionError>((data_files, window_deletions, rewrites, inlined))
             })?;
 
         // Handle empty case
-        if data_files.is_empty() && delete_files.is_empty() && inlined.is_empty() {
+        if data_files.is_empty() && window_deletions.is_empty() && inlined.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
@@ -1570,22 +1401,26 @@ impl TableProvider for TableChangesTable {
         }
         let any_partial = data_files.iter().any(|f| f.partial_max.is_some());
 
-        if (proj_info.need_rowid || !delete_files.is_empty() || any_partial || !inlined.is_empty())
+        if (proj_info.need_rowid
+            || !window_deletions.is_empty()
+            || any_partial
+            || !inlined.is_empty())
             && !any_encrypted
         {
             let mut layouts: Vec<Arc<ParquetFileLayout>> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
                 layouts.push(
-                    self.file_layout(
-                        state,
-                        &columns,
-                        &data_file.path,
-                        data_file.path_is_relative,
-                        data_file.file_size_bytes,
-                        data_file.footer_size,
-                        data_file.mapping_id,
-                    )
-                    .await?,
+                    self.feed_files()
+                        .file_layout(
+                            state,
+                            &columns,
+                            &data_file.path,
+                            data_file.path_is_relative,
+                            data_file.file_size_bytes,
+                            data_file.footer_size,
+                            data_file.mapping_id,
+                        )
+                        .await?,
                 );
             }
             return self
@@ -1593,10 +1428,12 @@ impl TableProvider for TableChangesTable {
                     state,
                     &columns,
                     &data_files,
-                    &delete_files,
+                    window_deletions,
+                    &rewrites,
                     inlined,
                     &layouts,
                     projection,
+                    &charge,
                 )
                 .await;
         }
@@ -1632,16 +1469,17 @@ impl TableProvider for TableChangesTable {
                 None
             } else {
                 Some(
-                    self.file_layout(
-                        state,
-                        &columns,
-                        &data_file.path,
-                        data_file.path_is_relative,
-                        data_file.file_size_bytes,
-                        data_file.footer_size,
-                        data_file.mapping_id,
-                    )
-                    .await?,
+                    self.feed_files()
+                        .file_layout(
+                            state,
+                            &columns,
+                            &data_file.path,
+                            data_file.path_is_relative,
+                            data_file.file_size_bytes,
+                            data_file.footer_size,
+                            data_file.mapping_id,
+                        )
+                        .await?,
                 )
             };
             #[cfg(feature = "encryption")]
@@ -1661,22 +1499,13 @@ impl TableProvider for TableChangesTable {
             execs.push(exec);
         }
 
+        // The plan keeps only the inlined inserts of what it read.
+        charge.try_resize(inlined.inserts.bytes())?;
         // Inlined inserts carry their row ids and snapshots as data; on this
         // insert-only path they surface as `insert` like every other row.
         if !inlined.inserts.is_empty() {
-            let keyed = keyed_inlined_rows(&inlined.inserts, &self.table_schema)?;
-            let batches = keyed
-                .iter()
-                .map(|k| {
-                    prepend_cdc_columns(
-                        &k.table_batch,
-                        k.rowid.clone(),
-                        k.snapshot_id,
-                        ChangeType::Insert,
-                        &self.output_schema,
-                    )
-                })
-                .collect::<DataFusionResult<Vec<_>>>()?;
+            let all: Vec<usize> = (0..self.table_schema.fields().len()).collect();
+            let rows = label_rows(inlined.inserts.exec(&all)?, ChangeType::Insert.as_str())?;
             // The per-file branches lay their columns out as the requested CDC
             // columns in feed order, then the requested table columns.
             let layout: Vec<usize> = [
@@ -1688,11 +1517,17 @@ impl TableProvider for TableChangesTable {
             .filter_map(|(needed, idx)| needed.then_some(idx))
             .chain(proj_info.table_indices.iter().map(|i| i + CDC_COLS))
             .collect();
-            execs.push(MemorySourceConfig::try_new_exec(
-                &[batches],
-                self.output_schema.clone(),
-                Some(layout),
-            )?);
+            let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = layout
+                .iter()
+                .map(|&i| {
+                    let f = self.output_schema.field(i);
+                    (
+                        Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                        f.name().to_string(),
+                    )
+                })
+                .collect();
+            execs.push(Arc::new(ProjectionExec::try_new(exprs, rows)?));
         }
 
         // Combine with UnionExec if multiple files
@@ -1703,160 +1538,179 @@ impl TableProvider for TableChangesTable {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Correlated change feed (insert / delete / update_preimage / update_postimage)
 // ---------------------------------------------------------------------------
 
-/// One inserted data file added in the snapshot range, with enough context to
-/// derive each row's rowid. When `embedded_col_idx` is `Some`, the scan's column
-/// at that index is the file's embedded rowid (an UPDATE / compaction postimage);
-/// otherwise the file is a plain INSERT whose scan carries a physical-position
-/// column at `pos_col_idx` and whose rowid is `row_id_start + position`.
-#[derive(Clone)]
-struct InsertUnit {
-    /// The file's `begin_snapshot`: every row's snapshot for an ordinary file;
-    /// for a merged partial file (`snapshot_col_idx` set) it is only the
-    /// minimum, and each row's actual snapshot comes from the embedded column.
-    snapshot_id: i64,
+/// One plan of `execs` unioned, `None` when there are none.
+fn union_of(
+    mut execs: Vec<Arc<dyn ExecutionPlan>>,
+) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+    match execs.len() {
+        0 => Ok(None),
+        1 => Ok(execs.pop()),
+        _ => UnionExec::try_new(execs).map(Some),
+    }
+}
+
+/// `rows` (`[snapshot_id, rowid, table columns]`) labelled `matched` where
+/// `keys` (`[snapshot_id, rowid]` of the other side of the feed) holds the
+/// row's `(snapshot_id, rowid)`, once per such key, and `unmatched` where it
+/// holds none: `rows LEFT JOIN keys`, official's macro. With no `keys`, every
+/// row is `unmatched`.
+///
+/// The join builds on `keys` and probes with `rows`, so only the keys are held,
+/// in a hash table charged to the session's memory pool; the rows stream.
+fn pair_rows(
+    rows: Arc<dyn ExecutionPlan>,
+    keys: Option<Arc<dyn ExecutionPlan>>,
+    matched: ChangeType,
+    unmatched: ChangeType,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let Some(keys) = keys else {
+        return label_rows(rows, unmatched.as_str());
+    };
+    // A `CollectLeft` join builds on one partition. The plan this returns is
+    // executed as it stands too, without the physical optimizer that would
+    // otherwise add the coalesce.
+    let keys: Arc<dyn ExecutionPlan> = if keys.output_partitioning().partition_count() > 1 {
+        Arc::new(CoalescePartitionsExec::new(keys))
+    } else {
+        keys
+    };
+    let on: JoinOn = vec![
+        (
+            Arc::new(Column::new("snapshot_id", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("snapshot_id", 0)) as Arc<dyn PhysicalExpr>,
+        ),
+        (
+            Arc::new(Column::new("rowid", 1)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("rowid", 1)) as Arc<dyn PhysicalExpr>,
+        ),
+    ];
+    let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+        keys,
+        rows,
+        on,
+        None,
+        &JoinType::Right,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?);
+    // `[key snapshot_id, key rowid, snapshot_id, rowid, table columns]`: the
+    // key columns are NULL exactly where the row matched no key.
+    let schema = join.schema();
+    let change_type: Arc<dyn PhysicalExpr> = Arc::new(CaseExpr::try_new(
+        None,
+        vec![(
+            is_not_null(Arc::new(Column::new("snapshot_id", 0)))?,
+            change_type_literal(matched.as_str()),
+        )],
+        Some(change_type_literal(unmatched.as_str())),
+    )?);
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(schema.fields().len() - 1);
+    for (i, field) in schema.fields().iter().enumerate().skip(2) {
+        if i == 4 {
+            exprs.push((Arc::clone(&change_type), "change_type".to_string()));
+        }
+        exprs.push((
+            Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+            field.name().to_string(),
+        ));
+    }
+    if schema.fields().len() == 4 {
+        exprs.push((change_type, "change_type".to_string()));
+    }
+    Ok(Arc::new(ProjectionExec::try_new(exprs, join)?))
+}
+
+/// How an inserted file's rows find their rowids.
+#[derive(Debug, Clone, Copy)]
+enum InsertRowid {
+    /// The file's embedded rowid column, at this index of the scan batch.
+    Embedded(usize),
+    /// `row_id_start + position`, the position at this index of the scan batch.
+    Positional {
+        position: usize,
+        row_id_start: Option<i64>,
+    },
+    /// Not resolved: the rowid is neither output nor paired on (NULL).
+    Unresolved,
+}
+
+/// One inserted data file of the window and how to key its rows.
+#[derive(Debug)]
+struct InsertSource {
+    /// Single-partition scan of the file: the projected table columns, then
+    /// whatever internal columns [`InsertRowid`] and `snapshot_col` index.
     scan: Arc<dyn ExecutionPlan>,
-    /// Column index of the embedded rowid, or `None` for a plain insert.
-    embedded_col_idx: Option<usize>,
+    /// The file's `begin_snapshot`: every row's snapshot for an ordinary file;
+    /// for a merged partial file (`snapshot_col` set) each row's actual
+    /// snapshot comes from the embedded column.
+    snapshot_id: i64,
+    rowid: InsertRowid,
     /// Column index of the embedded per-row snapshot (merged partial files
     /// only). Rows outside the query window are filtered out on read.
-    snapshot_col_idx: Option<usize>,
-    /// Column index of the physical row-position (plain inserts only).
-    pos_col_idx: Option<usize>,
-    /// First rowid of the file (`None` if the catalog carries none). Required
-    /// only for a plain insert, whose rowid is `row_id_start + pos`.
-    row_id_start: Option<i64>,
+    snapshot_col: Option<usize>,
+    /// The rewrite snapshots a merged partial file's rows can carry: those
+    /// rows were written by a rewrite, which inserted none of them, and are
+    /// filtered out on read (official's `snapshot_filter_excluded`).
+    excluded_snapshots: Vec<i64>,
 }
 
-/// One delete applied in the snapshot range: enough to read the newly-deleted
-/// rows of the source data file (the delete positions minus the previous
-/// generation's) together with each row's rowid.
-#[derive(Clone)]
-struct DeleteUnit {
-    snapshot_id: i64,
-    /// Positional scan of the source data file: `[table columns..., (embedded
-    /// rowid), __ducklake_row_pos]`.
-    data_scan: Arc<dyn ExecutionPlan>,
-    /// Column index of the source file's embedded rowid, or `None` (rowids are
-    /// then `row_id_start + position`).
-    embedded_col_idx: Option<usize>,
-    /// Column index of the reader-produced physical-position column. Carried
-    /// explicitly rather than looked up by name: the position column's name is
-    /// per-scan, and a name lookup would bind a catalog column that happens to
-    /// share it.
-    pos_col_idx: usize,
-    /// Scan of the current delete file, or `None` for a full-file delete.
-    current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-    /// Scan of the delete file this one superseded, if any.
-    previous_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-    /// Whether the current delete file is cumulative (carries an embedded
-    /// per-row delete-snapshot column as its third column): positions are then
-    /// windowed per row and each deleted row keys/emits at its own snapshot.
-    cumulative: bool,
-    /// Whether the whole data file was retired at `snapshot_id` (no delete
-    /// file), so every position not deleted before is deleted now.
-    full_file: bool,
-    /// Inlined deletions of the data file's rows made in the window: position
-    /// to deleting snapshot.
-    inlined_positions: HashMap<i64, i64>,
-    record_count: i64,
-    /// First rowid of the source file (`None` if the catalog carries none).
-    /// Required only when a deleted row has no embedded rowid.
-    row_id_start: Option<i64>,
-}
-
-/// Rows carrying their `(snapshot_id, rowid)` correlation key alongside the
-/// table columns, ready to be tagged once update pairs are known.
-#[derive(Debug, Clone)]
-struct KeyedRows {
-    snapshot_id: i64,
-    table_batch: RecordBatch,
-    rowid: Int64Array,
-}
-
-/// Execution plan for the correlated `ducklake_table_changes` feed. Collects the
-/// inserted rows (with embedded rowids) and the newly-deleted rows (with
-/// synthesized/embedded rowids), pairs those sharing a `(snapshot_id, rowid)`
-/// into preimage/postimage, and emits the tagged rows. Single output partition.
+/// Execution plan that reads the rows a window's data files inserted as
+/// `[snapshot_id, rowid, projected table columns]`: each row with the rowid
+/// it was inserted under (embedded, or `row_id_start + position`) and the
+/// snapshot that inserted it (the file's, or a merged partial file's per-row
+/// one, filtered to the window).
+///
+/// Each partition reads its share of the files one at a time, streaming. No
+/// DataFusion children: each file's scan is internal and executed directly,
+/// as one partition, so the optimizer never splits a file away from the
+/// position column its rowids are synthesized from.
 #[derive(Debug)]
-pub struct TableChangesExec {
-    insert_units: Vec<InsertUnit>,
-    delete_units: Vec<DeleteUnit>,
-    /// Inlined row versions written in the window, keyed by their own row ids.
-    inlined_inserts: Arc<Vec<KeyedRows>>,
-    /// Inlined row versions deleted or superseded in the window.
-    inlined_deletes: Arc<Vec<KeyedRows>>,
-    #[allow(dead_code)]
-    table_schema: SchemaRef,
-    output_schema: SchemaRef,
-    table_len: usize,
-    /// Whether the rowid column is actually requested. When false, plain inserts
-    /// skip rowid synthesis (emitting a placeholder dropped by the projection),
-    /// so a non-rowid projection never needs a plain insert's row_id_start.
-    need_rowid: bool,
+pub struct InsertedRowsExec {
+    sources: Arc<Vec<InsertSource>>,
+    /// Number of projected table columns leading each scan batch.
+    table_cols: usize,
     /// The query's `[start, end]` snapshot window (inclusive), used to filter
     /// rows of merged partial files by their embedded per-row snapshot.
     window: (i64, i64),
+    schema: SchemaRef,
+    partitions: usize,
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for InsertUnit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InsertUnit")
-            .field("snapshot_id", &self.snapshot_id)
-            .field("embedded_col_idx", &self.embedded_col_idx)
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for DeleteUnit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeleteUnit")
-            .field("snapshot_id", &self.snapshot_id)
-            .field("embedded_col_idx", &self.embedded_col_idx)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TableChangesExec {
-    #[allow(clippy::too_many_arguments)]
+impl InsertedRowsExec {
     fn new(
-        insert_units: Vec<InsertUnit>,
-        delete_units: Vec<DeleteUnit>,
-        inlined_inserts: Arc<Vec<KeyedRows>>,
-        inlined_deletes: Arc<Vec<KeyedRows>>,
-        table_schema: SchemaRef,
-        output_schema: SchemaRef,
-        table_len: usize,
-        need_rowid: bool,
+        sources: Vec<InsertSource>,
+        schema: SchemaRef,
+        table_cols: usize,
         window: (i64, i64),
+        target_partitions: usize,
     ) -> Self {
+        let partitions = sources.len().min(target_partitions).max(1);
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Final,
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            datafusion::physical_expr::Partitioning::UnknownPartitioning(partitions),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
         Self {
-            insert_units,
-            delete_units,
-            inlined_inserts,
-            inlined_deletes,
-            table_schema,
-            output_schema,
-            table_len,
-            need_rowid,
+            sources: Arc::new(sources),
+            table_cols,
             window,
+            schema,
+            partitions,
             properties,
         }
     }
 }
 
-impl DisplayAs for TableChangesExec {
+impl DisplayAs for InsertedRowsExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default
@@ -1864,19 +1718,16 @@ impl DisplayAs for TableChangesExec {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "TableChangesExec: inserts={}, deletes={}, inlined_inserts={}, \
-                     inlined_deletes={}",
-                    self.insert_units.len(),
-                    self.delete_units.len(),
-                    self.inlined_inserts.len(),
-                    self.inlined_deletes.len()
+                    "InsertedRowsExec: sources={}, table_columns={}",
+                    self.sources.len(),
+                    self.table_cols
                 )
             },
         }
     }
 }
 
-impl ExecutionPlan for TableChangesExec {
+impl ExecutionPlan for InsertedRowsExec {
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
@@ -1885,7 +1736,7 @@ impl ExecutionPlan for TableChangesExec {
     }
 
     fn name(&self) -> &str {
-        "TableChangesExec"
+        "InsertedRowsExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1904,14 +1755,14 @@ impl ExecutionPlan for TableChangesExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(DataFusionError::Internal(
-                "TableChangesExec has no children".to_string(),
+                "InsertedRowsExec has no children".to_string(),
             ));
         }
         Ok(self)
     }
 
     fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn execute(
@@ -1919,568 +1770,125 @@ impl ExecutionPlan for TableChangesExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.partitions {
             return Err(DataFusionError::Internal(format!(
-                "TableChangesExec only supports partition 0, got {partition}"
+                "InsertedRowsExec has {} partitions, got {partition}",
+                self.partitions
             )));
         }
-
-        let insert_units = self.insert_units.clone();
-        let delete_units = self.delete_units.clone();
-        let inlined_inserts = Arc::clone(&self.inlined_inserts);
-        let inlined_deletes = Arc::clone(&self.inlined_deletes);
-        let output_schema = self.output_schema.clone();
-        let table_len = self.table_len;
-        let need_rowid = self.need_rowid;
+        let sources = Arc::clone(&self.sources);
+        let schema = Arc::clone(&self.schema);
+        let table_cols = self.table_cols;
         let window = self.window;
-
-        let fut = async move {
-            correlate_changes(
-                insert_units,
-                delete_units,
-                inlined_inserts,
-                inlined_deletes,
-                output_schema,
-                table_len,
-                need_rowid,
-                window,
-                context,
-            )
-            .await
-        };
-
-        let schema = self.output_schema.clone();
-        let stream = futures::stream::once(fut)
-            .map(|res: DataFusionResult<Vec<RecordBatch>>| match res {
-                Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
-                Err(e) => futures::stream::iter(std::iter::once(Err(e))).boxed(),
+        let indices: Vec<usize> = (partition..sources.len())
+            .step_by(self.partitions)
+            .collect();
+        let stream = futures::stream::iter(indices)
+            .map(move |index| {
+                let source = &sources[index];
+                let partitions = source.scan.output_partitioning().partition_count();
+                if partitions != 1 {
+                    return Err(DataFusionError::Internal(format!(
+                        "insertions data-file scan must be a single partition covering the \
+                         whole file, found {partitions}"
+                    )));
+                }
+                // A fresh copy: a `DataSourceExec` keeps its work queue for the
+                // life of the plan, and yields nothing when executed again.
+                let scan = reset_plan_states(Arc::clone(&source.scan))?;
+                let stream = scan.execute(0, Arc::clone(&context))?;
+                let sources = Arc::clone(&sources);
+                let schema = Arc::clone(&schema);
+                Ok(stream.try_filter_map(move |batch| {
+                    futures::future::ready(inserted_batch(
+                        &sources[index],
+                        &batch,
+                        table_cols,
+                        window,
+                        &schema,
+                    ))
+                }))
             })
-            .flatten();
-
+            .try_flatten();
         Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream),
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            ),
         ))
     }
 }
 
-/// Collect the inserted and deleted rows, correlate update pairs by
-/// `(snapshot_id, rowid)`, and produce the tagged output batches. `window` is
-/// the query's inclusive `[start, end]` snapshot range, applied per row to
-/// merged partial files (whose rows span several snapshots).
-#[allow(clippy::too_many_arguments)]
-async fn correlate_changes(
-    insert_units: Vec<InsertUnit>,
-    delete_units: Vec<DeleteUnit>,
-    inlined_inserts: Arc<Vec<KeyedRows>>,
-    inlined_deletes: Arc<Vec<KeyedRows>>,
-    output_schema: SchemaRef,
-    table_len: usize,
-    need_rowid: bool,
+/// One scan batch of an inserted file as `[snapshot_id, rowid, table
+/// columns]`, its rows outside the window dropped (merged partial files).
+fn inserted_batch(
+    source: &InsertSource,
+    batch: &RecordBatch,
+    table_cols: usize,
     window: (i64, i64),
-    context: Arc<TaskContext>,
-) -> DataFusionResult<Vec<RecordBatch>> {
-    // Inserted rows split into postimage candidates (embedded rowid — can pair
-    // with a delete into an UPDATE) and plain inserts (fresh rowid — never pair).
-    // A plain insert's rowid is synthesized only when actually requested; when it
-    // is projected away it is a placeholder, so a non-rowid query never needs a
-    // plain insert's row_id_start.
-    let mut postimages: Vec<KeyedRows> = Vec::new();
-    let mut plain_inserts: Vec<KeyedRows> = Vec::new();
-    for unit in &insert_units {
-        let batches =
-            datafusion::physical_plan::collect(Arc::clone(&unit.scan), context.clone()).await?;
-        for b in batches {
-            let n = b.num_rows();
-            if n == 0 {
-                continue;
-            }
-            let table_batch = b.project(&(0..table_len).collect::<Vec<_>>())?;
-
-            // Resolve each row's rowid: the embedded column when present, else
-            // row_id_start + physical position (only when actually needed).
-            let embedded_rowid = match unit.embedded_col_idx {
-                Some(idx) => Some(int64_column(&b, idx, "embedded rowid")?.clone()),
-                None => None,
-            };
-            let rowid: Int64Array = match (&embedded_rowid, unit.pos_col_idx) {
-                (Some(arr), _) => (*arr).clone(),
-                (None, Some(pos_idx)) => {
-                    let row_id_start = unit.row_id_start.ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "cannot synthesize rowid: inserted file has neither an embedded \
-                             rowid nor a row_id_start"
-                                .to_string(),
-                        )
-                    })?;
-                    let pos = int64_column(&b, pos_idx, "physical position")?;
-                    Int64Array::from(
-                        (0..n)
-                            .map(|i| row_id_start + pos.value(i))
-                            .collect::<Vec<i64>>(),
-                    )
-                },
-                // Rowid neither embedded nor resolved (not requested): a
-                // placeholder dropped by the projection; never pairs.
-                (None, None) => Int64Array::from(vec![0i64; n]),
-            };
-
-            match unit.snapshot_col_idx {
-                // Merged partial file: each row belongs to its embedded origin
-                // snapshot. Filter rows to the query window and split the batch
-                // into one KeyedRows group per snapshot; their rowids are real,
-                // so they participate in update pairing like any insertion.
-                Some(snap_idx) => {
-                    let snaps = int64_column(&b, snap_idx, "embedded snapshot_id")?;
-                    let mut by_snapshot: std::collections::BTreeMap<i64, Vec<u32>> =
-                        std::collections::BTreeMap::new();
-                    for i in 0..n {
-                        if snaps.is_null(i) {
-                            return Err(DataFusionError::Internal(
-                                "embedded snapshot_id column contains NULL".to_string(),
-                            ));
-                        }
-                        let s = snaps.value(i);
-                        if s >= window.0 && s <= window.1 {
-                            by_snapshot.entry(s).or_default().push(i as u32);
-                        }
-                    }
-                    for (snapshot, row_indices) in by_snapshot {
-                        let indices = UInt32Array::from(row_indices);
-                        let cols: Vec<ArrayRef> = table_batch
-                            .columns()
-                            .iter()
-                            .map(|c| {
-                                take(c.as_ref(), &indices, None)
-                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                            })
-                            .collect::<DataFusionResult<_>>()?;
-                        let group_batch = RecordBatch::try_new(table_batch.schema(), cols)?;
-                        let group_rowid = take(&rowid, &indices, None)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .expect("take preserves Int64")
-                            .clone();
-                        postimages.push(KeyedRows {
-                            snapshot_id: snapshot,
-                            table_batch: group_batch,
-                            rowid: group_rowid,
-                        });
-                    }
-                },
-                // Ordinary file: all rows belong to begin_snapshot. Embedded
-                // rowids (UPDATE / rewrite outputs) can pair with deletes;
-                // plain inserts carry fresh (or placeholder) rowids and never
-                // pair.
-                None => {
-                    let keyed = KeyedRows {
-                        snapshot_id: unit.snapshot_id,
-                        table_batch,
-                        rowid,
-                    };
-                    if embedded_rowid.is_some() {
-                        postimages.push(keyed);
-                    } else {
-                        plain_inserts.push(keyed);
-                    }
-                },
-            }
-        }
+    schema: &SchemaRef,
+) -> DataFusionResult<Option<RecordBatch>> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(None);
     }
-
-    // Inlined inserts carry their row ids; one written by an UPDATE keeps the
-    // row id of the version it supersedes, so every one of them may pair.
-    postimages.extend(inlined_inserts.iter().cloned());
-
-    // Deleted rows: the positions newly masked at this snapshot, with each row's
-    // rowid (embedded column when the source file has one, else row_id_start +
-    // physical position). The rowid is required only when it is output
-    // (`need_rowid`) or when an update pair is possible (some postimage exists
-    // to correlate against); with neither, every delete is a pure delete and
-    // its rowid a placeholder — so a non-rowid projection over a delete-only
-    // window never fails on a source file whose rowid cannot be synthesized
-    // (no embedded rowid and a NULL row_id_start), mirroring
-    // `ducklake_table_deletions`.
-    let preimage_rowids_required = need_rowid || !postimages.is_empty();
-    let mut preimages: Vec<KeyedRows> = inlined_deletes.iter().cloned().collect();
-    for unit in &delete_units {
-        // Cumulative delete files carry a per-row delete snapshot: only
-        // in-window positions are collected, each remembering its snapshot;
-        // no previous-file subtraction applies (the scan is None then).
-        let (current, position_snapshots): (Option<HashSet<i64>>, HashMap<i64, i64>) =
-            if unit.cumulative {
-                let (set, map) = collect_windowed_delete_positions(
-                    &unit.current_delete_scan,
-                    window,
-                    context.clone(),
+    let rowid: ArrayRef = match source.rowid {
+        InsertRowid::Embedded(column) => {
+            Arc::new(int64_column(batch, column, "embedded rowid")?.clone())
+        },
+        InsertRowid::Positional {
+            position,
+            row_id_start,
+        } => {
+            let row_id_start = row_id_start.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "cannot synthesize rowid: inserted file has neither an embedded rowid nor \
+                     a row_id_start"
+                        .to_string(),
                 )
-                .await?;
-                (Some(set), map)
-            } else {
-                (
-                    collect_delete_positions(&unit.current_delete_scan, context.clone()).await?,
-                    HashMap::new(),
-                )
-            };
-        let mut current: HashSet<i64> = match current {
-            Some(set) => set,
-            None if unit.full_file => (0..unit.record_count).collect(),
-            None => HashSet::new(),
-        };
-        let mut position_snapshots = position_snapshots;
-        for (&position, &snapshot) in &unit.inlined_positions {
-            current.insert(position);
-            position_snapshots.insert(position, snapshot);
-        }
-        let previous = collect_delete_positions(&unit.previous_delete_scan, context.clone())
-            .await?
-            .unwrap_or_default();
-
-        let data_batches =
-            datafusion::physical_plan::collect(Arc::clone(&unit.data_scan), context.clone())
-                .await?;
-        for b in data_batches {
-            let n = b.num_rows();
-            if n == 0 {
-                continue;
+            })?;
+            let position = int64_column(batch, position, "physical position")?;
+            Arc::new(position.unary::<_, arrow::datatypes::Int64Type>(|p| row_id_start + p))
+        },
+        InsertRowid::Unresolved => arrow::array::new_null_array(&DataType::Int64, n),
+    };
+    let snapshot: ArrayRef = match source.snapshot_col {
+        Some(column) => {
+            let snapshots = int64_column(batch, column, "embedded snapshot_id")?;
+            if snapshots.null_count() > 0 {
+                return Err(DataFusionError::Internal(
+                    "embedded snapshot_id column contains NULL".to_string(),
+                ));
             }
-            let pos = b
-                .column(unit.pos_col_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("physical-position column is not Int64".to_string())
-                })?;
-            let embedded = match unit.embedded_col_idx {
-                Some(idx) => Some(
-                    b.column(idx)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "embedded rowid column is not Int64".to_string(),
-                            )
-                        })?,
-                ),
-                None => None,
-            };
-
-            // With no embedded rowid, deleted rowids are row_id_start + position;
-            // require row_id_start in that case rather than emitting wrong ids —
-            // but only when the rowid is actually consumed (output or pairing).
-            let synth_start: Option<i64> = if embedded.is_none() && preimage_rowids_required {
-                Some(unit.row_id_start.ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "cannot synthesize deleted rowid: source file has neither an embedded \
-                         rowid nor a row_id_start"
-                            .to_string(),
-                    )
-                })?)
-            } else {
-                None
-            };
-
-            // Group kept rows by their delete snapshot: constant for legacy
-            // delete files, per-row for cumulative ones. Each group becomes
-            // one KeyedRows so the (snapshot, rowid) pairing sees the right
-            // snapshot for every deleted row.
-            let mut by_snapshot: std::collections::BTreeMap<i64, (Vec<u32>, Vec<i64>)> =
-                std::collections::BTreeMap::new();
-            for i in 0..n {
-                let p = pos.value(i);
-                if current.contains(&p) && !previous.contains(&p) {
-                    let rowid = match (embedded, synth_start) {
-                        (Some(arr), _) => arr.value(i),
-                        (None, Some(start)) => start + p,
-                        // Unneeded rowid (not output, nothing to pair with):
-                        // a placeholder that update_keys can never contain.
-                        (None, None) => 0,
-                    };
-                    let snapshot = *position_snapshots.get(&p).unwrap_or(&unit.snapshot_id);
-                    let entry = by_snapshot.entry(snapshot).or_default();
-                    entry.0.push(i as u32);
-                    entry.1.push(rowid);
-                }
-            }
-            for (snapshot, (keep, rowids)) in by_snapshot {
-                let indices = UInt32Array::from(keep);
-                let table_cols: Vec<ArrayRef> = (0..table_len)
-                    .map(|c| {
-                        take(b.column(c).as_ref(), &indices, None)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                    })
-                    .collect::<DataFusionResult<_>>()?;
-                let table_batch = RecordBatch::try_new(
-                    Arc::new(Schema::new(
-                        (0..table_len)
-                            .map(|c| b.schema().field(c).clone())
-                            .collect::<Vec<_>>(),
-                    )),
-                    table_cols,
-                )?;
-                preimages.push(KeyedRows {
-                    snapshot_id: snapshot,
-                    table_batch,
-                    rowid: Int64Array::from(rowids),
-                });
-            }
-        }
+            Arc::new(snapshots.clone())
+        },
+        None => Arc::new(Int64Array::from_value(source.snapshot_id, n)),
+    };
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_cols + 2);
+    columns.push(Arc::clone(&snapshot));
+    columns.push(rowid);
+    columns.extend(batch.columns().iter().take(table_cols).cloned());
+    let rows = RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
+    )?;
+    if source.snapshot_col.is_none() {
+        return Ok(Some(rows));
     }
-
-    // Update pairs = a postimage (embedded, preserved rowid) whose (snapshot,
-    // rowid) also appears as a delete. Only postimages seed the key set — plain
-    // inserts carry fresh rowids that never match a delete (and, when rowid is
-    // projected away, only a placeholder), so they must not participate.
-    //
-    // Official defines the feed as each insertion left-joined to the window's
-    // deletions on `(snapshot_id, rowid)`, and each deletion to its insertions:
-    // a row that shares its key with several rows of the other side is
-    // reported once per such row. A key repeats where a retirement reports an
-    // earlier deletion again (see `InlinedFileDeletes`).
-    let post_counts = key_counts(&postimages);
-    let pre_counts = key_counts(&preimages);
-
-    let mut out: Vec<RecordBatch> = Vec::new();
-    // Plain inserts are always `insert` (they never pair with a delete).
-    for k in &plain_inserts {
-        out.push(prepend_cdc_columns(
-            &k.table_batch,
-            k.rowid.clone(),
-            k.snapshot_id,
-            ChangeType::Insert,
-            &output_schema,
-        )?);
-    }
-    for k in &postimages {
-        // Rows whose key is an update pair become postimages; the rest are plain
-        // inserts (embedded file with no matching delete, e.g. compaction).
-        let (paired, unpaired) = pair_indices(k, &pre_counts);
-        out.extend(take_and_tag(
-            k,
-            paired,
-            ChangeType::UpdatePostimage,
-            &output_schema,
-        )?);
-        out.extend(take_and_tag(
-            k,
-            unpaired,
-            ChangeType::Insert,
-            &output_schema,
-        )?);
-    }
-    for k in &preimages {
-        // Rows paired with an insert surface as update preimages; the rest are
-        // pure deletes, emitted as `delete` rows carrying the old values
-        // (matching official DuckLake's table_changes).
-        let (paired, unpaired) = pair_indices(k, &post_counts);
-        out.extend(take_and_tag(
-            k,
-            paired,
-            ChangeType::UpdatePreimage,
-            &output_schema,
-        )?);
-        out.extend(take_and_tag(
-            k,
-            unpaired,
-            ChangeType::Delete,
-            &output_schema,
-        )?);
-    }
-    Ok(out)
-}
-
-/// The inlined row versions one change-feed window reads.
-pub(crate) struct InlinedChanges {
-    /// Inlined row versions written in the window.
-    pub(crate) inserts: Vec<DuckLakeInlinedRows>,
-    /// Inlined row versions deleted or superseded in the window.
-    pub(crate) deletes: Vec<DuckLakeInlinedRows>,
-    /// Inlined deletions of Parquet-resident rows made in the window.
-    pub(crate) file_deletes: Vec<InlinedFileDeleteChange>,
-}
-
-impl InlinedChanges {
-    /// Read the window's inlined changes; the delete side only when
-    /// `read_deletes`.
-    pub(crate) fn read(
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        columns: &[DuckLakeTableColumn],
-        (start, end): (i64, i64),
-        read_deletes: bool,
-    ) -> DataFusionResult<Self> {
-        let external = |e| DataFusionError::External(Box::new(e));
-        let inserts = provider
-            .read_inlined_rows(
-                table_id,
-                columns,
-                InlinedRowSelection::InsertedBetween {
-                    start,
-                    end,
-                },
-                None,
-            )
-            .map_err(external)?;
-        let (deletes, file_deletes) = if read_deletes {
-            (
-                Self::read_deletes(provider, table_id, columns, (start, end))?,
-                provider
-                    .get_inlined_file_deletes_between(table_id, start, end)
-                    .map_err(external)?,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        Ok(Self {
-            inserts,
-            deletes,
-            file_deletes,
-        })
-    }
-
-    /// Inlined row versions deleted or superseded in the window.
-    pub(crate) fn read_deletes(
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        columns: &[DuckLakeTableColumn],
-        (start, end): (i64, i64),
-    ) -> DataFusionResult<Vec<DuckLakeInlinedRows>> {
-        provider
-            .read_inlined_rows(
-                table_id,
-                columns,
-                InlinedRowSelection::DeletedBetween {
-                    start,
-                    end,
-                },
-                None,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inserts.is_empty() && self.deletes.is_empty() && self.file_deletes.is_empty()
-    }
-}
-
-/// One data file's inlined deletions in a window.
-pub(crate) struct InlinedFileDeletesOfFile {
-    /// The first deletion read for the file; its data-file fields describe it.
-    pub(crate) change: InlinedFileDeleteChange,
-    /// Deleted position to deleting snapshot.
-    pub(crate) positions: HashMap<i64, i64>,
-}
-
-/// A window's inlined deletions of Parquet rows, grouped by data file and
-/// handed out to the delete records that read each file.
-///
-/// Official DuckLake attaches a file's inlined deletions to the delete records
-/// the window holds for it, and reads an inlined-only file on its own. A
-/// whole-file retirement of a file with inlined deletions in the window
-/// contributes only those deletions: official's delete filter treats the
-/// file's inlined deletions as replacing the retirement's every-row set.
-/// Upstream is wrong here, and this matches it deliberately until the fix:
-/// a rewrite deletes no row, yet the window then reports the rewritten file's
-/// rows as inserts, and a window holding only the retirement reports the
-/// earlier deletion again (see COMPATIBILITY.md). The same file reached by
-/// several delete records takes its inlined deletions once, with the first.
-pub(crate) struct InlinedFileDeletes {
-    files: HashMap<String, InlinedFileDeletesOfFile>,
-    order: Vec<String>,
-    claimed: HashSet<String>,
-}
-
-impl InlinedFileDeletes {
-    pub(crate) fn group(
-        table_path: &str,
-        changes: &[InlinedFileDeleteChange],
-    ) -> DataFusionResult<Self> {
-        let mut files: HashMap<String, InlinedFileDeletesOfFile> = HashMap::new();
-        let mut order = Vec::new();
-        for change in changes {
-            let resolved = resolve_path(
-                table_path,
-                &change.data_file_path,
-                change.data_file_path_is_relative,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file = files.entry(resolved.clone()).or_insert_with(|| {
-                order.push(resolved);
-                InlinedFileDeletesOfFile {
-                    change: change.clone(),
-                    positions: HashMap::new(),
-                }
-            });
-            file.positions.insert(change.position, change.snapshot_id);
-            file.change.snapshot_id = file.change.snapshot_id.min(change.snapshot_id);
-        }
-        Ok(Self {
-            files,
-            order,
-            claimed: HashSet::new(),
-        })
-    }
-
-    /// The inlined deletions a delete record of the file at `resolved` reads,
-    /// and whether a whole-file retirement (`retires_file`) still deletes
-    /// every row.
-    pub(crate) fn claim(
-        &mut self,
-        resolved: &str,
-        retires_file: bool,
-    ) -> (HashMap<i64, i64>, bool) {
-        let Some(file) = self.files.get(resolved) else {
-            return (HashMap::new(), retires_file);
-        };
-        let positions = if self.claimed.insert(resolved.to_string()) {
-            file.positions.clone()
-        } else {
-            HashMap::new()
-        };
-        (positions, false)
-    }
-
-    /// The files no delete record claimed, in data-file order.
-    pub(crate) fn unclaimed(self) -> Vec<(String, InlinedFileDeletesOfFile)> {
-        let Self {
-            mut files,
-            order,
-            claimed,
-        } = self;
-        order
-            .into_iter()
-            .filter(|resolved| !claimed.contains(resolved))
-            .filter_map(|resolved| files.remove(&resolved).map(|file| (resolved, file)))
-            .collect()
-    }
-}
-
-/// Inlined row versions as [`KeyedRows`] under the feed's table schema, one per
-/// run of rows sharing a snapshot.
-fn keyed_inlined_rows(
-    rows: &[DuckLakeInlinedRows],
-    table_schema: &SchemaRef,
-) -> DataFusionResult<Vec<KeyedRows>> {
-    let mut keyed = Vec::new();
-    for rows in rows {
-        let batch = RecordBatch::try_new(Arc::clone(table_schema), rows.batch.columns().to_vec())?;
-        let rowids = Int64Array::from(rows.row_ids.clone());
-        let mut start = 0;
-        while start < rows.snapshots.len() {
-            let snapshot_id = rows.snapshots[start];
-            let mut end = start + 1;
-            while end < rows.snapshots.len() && rows.snapshots[end] == snapshot_id {
-                end += 1;
-            }
-            keyed.push(KeyedRows {
-                snapshot_id,
-                table_batch: batch.slice(start, end - start),
-                rowid: rowids.slice(start, end - start),
-            });
-            start = end;
-        }
-    }
-    Ok(keyed)
+    // Merged partial file: each row belongs to its embedded origin snapshot;
+    // keep the rows inside the query window that a rewrite did not write.
+    let snapshot = snapshot
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("the snapshot column is Int64");
+    let excluded = &source.excluded_snapshots;
+    let in_window: arrow::array::BooleanArray = snapshot
+        .iter()
+        .map(|s| s.map(|s| s >= window.0 && s <= window.1 && !excluded.contains(&s)))
+        .collect();
+    let rows = arrow::compute::filter_record_batch(&rows, &in_window)?;
+    Ok((rows.num_rows() > 0).then_some(rows))
 }
 
 /// Downcast a batch column to `Int64Array` with a descriptive error.
@@ -2496,161 +1904,348 @@ fn int64_column<'a>(
         .ok_or_else(|| DataFusionError::Internal(format!("{what} column is not Int64")))
 }
 
-/// Collect the in-window `pos` set AND per-position delete snapshots from a
-/// cumulative delete-file scan (`(file_path, pos, snapshot)` schema). Rows
-/// whose snapshot falls outside the inclusive `window` are skipped.
-async fn collect_windowed_delete_positions(
-    scan: &Option<Arc<dyn ExecutionPlan>>,
-    window: (i64, i64),
-    context: Arc<TaskContext>,
-) -> DataFusionResult<(HashSet<i64>, HashMap<i64, i64>)> {
-    let Some(scan) = scan else {
-        return Ok((HashSet::new(), HashMap::new()));
+/// The inlined row versions one change-feed window reads, charged to the
+/// plan's [`PlanCharge`] as each is read.
+pub(crate) struct InlinedChanges {
+    /// Inlined row versions written in the window.
+    pub(crate) inserts: KeyedInlinedRows,
+    /// Inlined row versions deleted or superseded in the window.
+    pub(crate) deletes: KeyedInlinedRows,
+    /// Inlined deletions of Parquet-resident rows made in the window.
+    pub(crate) file_deletes: Vec<InlinedFileDeleteChange>,
+}
+
+impl InlinedChanges {
+    /// Read the window's inlined changes; the delete side only when
+    /// `read_deletes`.
+    pub(crate) fn read(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        table_schema: &SchemaRef,
+        (start, end): (i64, i64),
+        read_deletes: bool,
+        charge: &PlanCharge,
+    ) -> DataFusionResult<Self> {
+        let inserts = Self::read_rows(
+            provider,
+            table_id,
+            columns,
+            table_schema,
+            InlinedRowSelection::InsertedBetween {
+                start,
+                end,
+            },
+            charge,
+        )?;
+        let (deletes, file_deletes) = if read_deletes {
+            (
+                Self::read_deletes(
+                    provider,
+                    table_id,
+                    columns,
+                    table_schema,
+                    (start, end),
+                    charge,
+                )?,
+                Self::read_file_deletes(provider, table_id, (start, end), charge)?,
+            )
+        } else {
+            (KeyedInlinedRows::empty(charge), Vec::new())
+        };
+        Ok(Self {
+            inserts,
+            deletes,
+            file_deletes,
+        })
+    }
+
+    /// Inlined row versions deleted or superseded in the window.
+    pub(crate) fn read_deletes(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        table_schema: &SchemaRef,
+        (start, end): (i64, i64),
+        charge: &PlanCharge,
+    ) -> DataFusionResult<KeyedInlinedRows> {
+        Self::read_rows(
+            provider,
+            table_id,
+            columns,
+            table_schema,
+            InlinedRowSelection::DeletedBetween {
+                start,
+                end,
+            },
+            charge,
+        )
+    }
+
+    /// Inlined deletions of Parquet-resident rows made in the inclusive window.
+    pub(crate) fn read_file_deletes(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        (start, end): (i64, i64),
+        charge: &PlanCharge,
+    ) -> DataFusionResult<Vec<InlinedFileDeleteChange>> {
+        let changes = provider
+            .get_inlined_file_deletes_between(table_id, start, end)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        charge.try_grow(file_deletes_bytes(&changes))?;
+        Ok(changes)
+    }
+
+    /// [`Self::read_file_deletes`], of the data files `data_file_ids` only.
+    pub(crate) fn read_file_deletes_of_files(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        data_file_ids: &[i64],
+        (start, end): (i64, i64),
+        charge: &PlanCharge,
+    ) -> DataFusionResult<Vec<InlinedFileDeleteChange>> {
+        let changes = provider
+            .get_inlined_file_deletes_of_files_between(table_id, data_file_ids, start, end)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        charge.try_grow(file_deletes_bytes(&changes))?;
+        Ok(changes)
+    }
+
+    /// Read the inlined row versions `selection` names, charge them, and key
+    /// them; the charge then follows what the keyed rows hold.
+    fn read_rows(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        table_schema: &SchemaRef,
+        selection: InlinedRowSelection,
+        charge: &PlanCharge,
+    ) -> DataFusionResult<KeyedInlinedRows> {
+        let rows = provider
+            .read_inlined_rows(table_id, columns, selection, None)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let read = inlined_rows_bytes(&rows);
+        charge.try_grow(read)?;
+        let keyed = KeyedInlinedRows::new(rows, table_schema, charge)?;
+        release(charge, read.saturating_sub(keyed.bytes()));
+        Ok(keyed)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inserts.is_empty() && self.deletes.is_empty() && self.file_deletes.is_empty()
+    }
+}
+
+/// The snapshots of the inclusive window that rewrote data files of
+/// `table_id` (`rewrite_delete:<table_id>` in the snapshot change ledger), as
+/// official DuckLake's `GetTableRewriteSnapshots` reads them (upstream main
+/// after the extension this crate pins). A rewrite changes no row, so the
+/// change feeds report nothing for it: not the data files it ends, not the
+/// files it writes, and not the rows of its outputs a merge later carries.
+/// A provider without a change ledger records no rewrite.
+pub(crate) fn rewrite_snapshots(
+    provider: &dyn MetadataProvider,
+    table_id: i64,
+    (start, end): (i64, i64),
+) -> DataFusionResult<BTreeSet<i64>> {
+    if start > end {
+        return Ok(BTreeSet::new());
+    }
+    let changes = match provider.list_table_snapshot_changes(table_id, start.saturating_sub(1), end)
+    {
+        Ok(changes) => changes,
+        Err(crate::DuckLakeError::Unsupported(_)) => return Ok(BTreeSet::new()),
+        Err(e) => return Err(DataFusionError::External(Box::new(e))),
     };
-    let batches = datafusion::physical_plan::collect(Arc::clone(scan), context).await?;
-    let mut set = HashSet::new();
-    let mut map = HashMap::new();
-    for b in &batches {
-        if b.num_columns() < 3 {
-            return Err(DataFusionError::Internal(
-                "cumulative delete file batch is missing its snapshot column".to_string(),
+    Ok(changes
+        .into_iter()
+        .filter(|(_, made)| {
+            made.as_deref().is_some_and(|made| {
+                snapshot_change_tokens(made).any(|token| {
+                    token.split_once(':').is_some_and(|(kind, id)| {
+                        kind.trim().eq_ignore_ascii_case("rewrite_delete")
+                            && id.trim().parse::<i64>() == Ok(table_id)
+                    })
+                })
+            })
+        })
+        .map(|(snapshot, _)| snapshot)
+        .collect())
+}
+
+/// Whether a data file of the window was written by a rewrite: an ordinary
+/// file that begins at a rewrite snapshot holds rows inserted before it.
+pub(crate) fn written_by_rewrite(file: &DataFileChange, rewrites: &BTreeSet<i64>) -> bool {
+    file.partial_max.is_none() && rewrites.contains(&file.begin_snapshot)
+}
+
+/// One data file's inlined deletions in a window.
+pub(crate) struct InlinedFileDeletesOfFile {
+    /// The first deletion read for the file, dated at the file's earliest
+    /// one; its data-file fields describe it.
+    pub(crate) change: InlinedFileDeleteChange,
+    /// `(deleted position, deleting snapshot)`, sorted by position.
+    pub(crate) positions: Vec<(i64, i64)>,
+}
+
+impl InlinedFileDeletesOfFile {
+    fn bytes(&self) -> usize {
+        self.change.data_file_path.capacity() + self.positions.capacity() * size_of::<(i64, i64)>()
+    }
+}
+
+/// A window's inlined deletions of Parquet rows, grouped by data file and
+/// handed out to the delete records that read each file.
+///
+/// Official DuckLake attaches a file's inlined deletions to the delete records
+/// the window holds for it, and reads an inlined-only file on its own. A data
+/// file retired in the window takes its inlined deletions with its retirement
+/// alone, which reports them at their own snapshots and every other row of the
+/// file at the retirement's (official's `GetTableDeletions`, upstream main
+/// after the extension this crate pins). The same file reached by several
+/// delete records and not retired takes its inlined deletions once, with the
+/// first.
+///
+/// Grouped by sorting the window's deletions in place, so each file's
+/// positions are allocated once at their exact size and charged to the plan's
+/// [`PlanCharge`] before they are.
+pub(crate) struct InlinedFileDeletes {
+    /// Resolved path and deletions of each file, in data-file order; `None`
+    /// once a delete record claimed them.
+    files: Vec<(String, Option<InlinedFileDeletesOfFile>)>,
+    /// Indices into `files`, sorted by path.
+    by_path: Vec<usize>,
+    /// The data files a delete record of the window retires.
+    retired: HashSet<String>,
+}
+
+impl InlinedFileDeletes {
+    pub(crate) fn group(
+        table_path: &str,
+        mut changes: Vec<InlinedFileDeleteChange>,
+        retired: HashSet<String>,
+        charge: &PlanCharge,
+    ) -> DataFusionResult<Self> {
+        type File = (String, Option<InlinedFileDeletesOfFile>);
+        changes.sort_unstable_by_key(|c| (c.data_file_id, c.position, c.snapshot_id));
+        let run_len = |start: usize| {
+            changes[start..]
+                .iter()
+                .take_while(|c| c.data_file_id == changes[start].data_file_id)
+                .count()
+        };
+        // Reserved before anything is allocated: each file's slot and sorted
+        // index, its positions, and at most a resolved path (the table path, a
+        // separator and its own) and a copy of its own.
+        let mut file_count = 0;
+        let mut estimate = 0;
+        let mut start = 0;
+        while start < changes.len() {
+            let len = run_len(start);
+            estimate += size_of::<File>()
+                + size_of::<usize>()
+                + len * size_of::<(i64, i64)>()
+                + table_path.len()
+                + 1
+                + 2 * changes[start].data_file_path.len();
+            start += len;
+            file_count += 1;
+        }
+        charge.try_grow(estimate)?;
+        let mut files: Vec<File> = Vec::with_capacity(file_count);
+        let mut start = 0;
+        while start < changes.len() {
+            let run = &changes[start..start + run_len(start)];
+            start += run.len();
+            let first = &run[0];
+            let resolved = resolve_path(
+                table_path,
+                &first.data_file_path,
+                first.data_file_path_is_relative,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut positions: Vec<(i64, i64)> =
+                run.iter().map(|c| (c.position, c.snapshot_id)).collect();
+            // One per position, the latest deletion kept, as a map keyed by
+            // position would hold them.
+            positions.dedup_by(|later, earlier| {
+                let same = later.0 == earlier.0;
+                if same {
+                    earlier.1 = later.1;
+                }
+                same
+            });
+            let mut change = first.clone();
+            change.snapshot_id = run
+                .iter()
+                .map(|c| c.snapshot_id)
+                .min()
+                .unwrap_or(change.snapshot_id);
+            files.push((
+                resolved,
+                Some(InlinedFileDeletesOfFile {
+                    change,
+                    positions,
+                }),
             ));
         }
-        let pos = int64_column(b, 1, "delete `pos`")?;
-        let snaps = int64_column(b, 2, "delete snapshot")?;
-        for i in 0..pos.len() {
-            if pos.is_null(i) {
-                continue;
-            }
-            if snaps.is_null(i) {
-                return Err(DataFusionError::Internal(
-                    "cumulative delete file has a NULL per-row snapshot".to_string(),
-                ));
-            }
-            let s = snaps.value(i);
-            if s >= window.0 && s <= window.1 {
-                let p = pos.value(i);
-                set.insert(p);
-                map.insert(p, s);
-            }
+        let mut by_path: Vec<usize> = (0..files.len()).collect();
+        by_path.sort_unstable_by(|&a, &b| files[a].0.cmp(&files[b].0));
+        let grouped = Self {
+            files,
+            by_path,
+            retired,
+        };
+        // The estimate is an upper bound; the charge follows what is held,
+        // and the read's deletions, grouped now, are released.
+        let held = grouped.files.capacity() * size_of::<File>()
+            + grouped.by_path.capacity() * size_of::<usize>()
+            + grouped.held_by_files();
+        let read = file_deletes_bytes(&changes);
+        drop(changes);
+        if held > estimate {
+            charge.try_grow(held - estimate)?;
         }
+        release(charge, estimate.saturating_sub(held) + read);
+        Ok(grouped)
     }
-    Ok((set, map))
-}
 
-/// Collect the `pos` set from a delete-file scan (`None` scan => `None`).
-async fn collect_delete_positions(
-    scan: &Option<Arc<dyn ExecutionPlan>>,
-    context: Arc<TaskContext>,
-) -> DataFusionResult<Option<HashSet<i64>>> {
-    let Some(scan) = scan else {
-        return Ok(None);
-    };
-    let batches = datafusion::physical_plan::collect(Arc::clone(scan), context).await?;
-    let mut set = HashSet::new();
-    for b in &batches {
-        if b.num_columns() < 2 {
-            continue;
+    fn held_by_files(&self) -> usize {
+        self.files
+            .iter()
+            .map(|(path, file)| path.capacity() + file.as_ref().map_or(0, |f| f.bytes()))
+            .sum()
+    }
+
+    /// The inlined deletions a delete record of the file at `resolved` reads:
+    /// all of them for the file's retirement (`retires_file`), none for its
+    /// other records when it is retired, and otherwise all of them for its
+    /// first record.
+    pub(crate) fn claim(&mut self, resolved: &str, retires_file: bool) -> Vec<(i64, i64)> {
+        let Ok(at) = self
+            .by_path
+            .binary_search_by(|&i| self.files[i].0.as_str().cmp(resolved))
+        else {
+            return Vec::new();
+        };
+        if !retires_file && self.retired.contains(resolved) {
+            return Vec::new();
         }
-        let pos = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("delete `pos` column is not Int64".to_string())
-            })?;
-        for i in 0..pos.len() {
-            if !pos.is_null(i) {
-                set.insert(pos.value(i));
-            }
-        }
+        let index = self.by_path[at];
+        self.files[index]
+            .1
+            .take()
+            .map(|file| file.positions)
+            .unwrap_or_default()
     }
-    Ok(Some(set))
-}
 
-/// Prepend the CDC `snapshot_id` + `rowid` + `change_type` columns to a
-/// table-column batch (official DuckLake column order). `rowid` must have the
-/// same length as `table_batch`.
-fn prepend_cdc_columns(
-    table_batch: &RecordBatch,
-    rowid: Int64Array,
-    snapshot_id: i64,
-    change: ChangeType,
-    output_schema: &SchemaRef,
-) -> DataFusionResult<RecordBatch> {
-    let n = table_batch.num_rows();
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(table_batch.num_columns() + CDC_COLS);
-    cols.push(Arc::new(Int64Array::from(vec![snapshot_id; n])));
-    cols.push(Arc::new(rowid));
-    cols.push(Arc::new(StringArray::from(vec![change.as_str(); n])));
-    cols.extend(table_batch.columns().iter().cloned());
-    RecordBatch::try_new(output_schema.clone(), cols)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-/// How many rows of `rows` carry each `(snapshot_id, rowid)` key.
-fn key_counts(rows: &[KeyedRows]) -> HashMap<(i64, i64), usize> {
-    let mut counts = HashMap::new();
-    for keyed in rows {
-        for i in 0..keyed.rowid.len() {
-            *counts
-                .entry((keyed.snapshot_id, keyed.rowid.value(i)))
-                .or_insert(0) += 1;
-        }
+    /// The files no delete record claimed, in data-file order.
+    pub(crate) fn unclaimed(self) -> Vec<(String, InlinedFileDeletesOfFile)> {
+        self.files
+            .into_iter()
+            .filter_map(|(resolved, file)| file.map(|file| (resolved, file)))
+            .collect()
     }
-    counts
-}
-
-/// The rows of `keyed` whose key the other side holds, each repeated once per
-/// row of the other side with that key (official's join), and the rest.
-fn pair_indices(keyed: &KeyedRows, other: &HashMap<(i64, i64), usize>) -> (Vec<u32>, Vec<u32>) {
-    let mut paired = Vec::new();
-    let mut unpaired = Vec::new();
-    for i in 0..keyed.rowid.len() {
-        let index = u32::try_from(i).expect("a batch holds fewer than 2^32 rows");
-        match other.get(&(keyed.snapshot_id, keyed.rowid.value(i))) {
-            Some(&count) => paired.extend(std::iter::repeat_n(index, count)),
-            None => unpaired.push(index),
-        }
-    }
-    (paired, unpaired)
-}
-
-/// The rows of `keyed` at `indices`, tagged with `change`, with the CDC
-/// columns appended. `None` when `indices` is empty.
-fn take_and_tag(
-    keyed: &KeyedRows,
-    indices: Vec<u32>,
-    change: ChangeType,
-    output_schema: &SchemaRef,
-) -> DataFusionResult<Option<RecordBatch>> {
-    if indices.is_empty() {
-        return Ok(None);
-    }
-    let indices = UInt32Array::from(indices);
-    let take = |array: &dyn Array| {
-        arrow::compute::take(array, &indices, None)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-    };
-    let cols: Vec<ArrayRef> = keyed
-        .table_batch
-        .columns()
-        .iter()
-        .map(|c| take(c.as_ref()))
-        .collect::<DataFusionResult<_>>()?;
-    let taken = RecordBatch::try_new(keyed.table_batch.schema(), cols)?;
-    let rowid = take(&keyed.rowid)?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| DataFusionError::Internal("taken rowid is not Int64".to_string()))?
-        .clone();
-    Ok(Some(prepend_cdc_columns(
-        &taken,
-        rowid,
-        keyed.snapshot_id,
-        change,
-        output_schema,
-    )?))
 }
 
 // ---------------------------------------------------------------------------

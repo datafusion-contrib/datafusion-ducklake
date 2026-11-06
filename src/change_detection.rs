@@ -37,9 +37,11 @@
 //!   `compacted_table`), which move rows or rewrite their files, and the feed
 //!   is read over them, stopping at its first row. A `DELETE` committed in one
 //!   transaction with official's flush records only `inline_flush`; the feed
-//!   reports the deletion. Official's `ducklake_rewrite_data_files` feed
-//!   reports every row it rewrote as an `UPDATE`, so a rewrite counts as a
-//!   change; a merge of adjacent files reports nothing.
+//!   reports the deletion. A rewrite (`ducklake_rewrite_data_files`) and a
+//!   merge of adjacent files report nothing, so neither counts as a change on
+//!   its own (the feed follows official's main branch here, ahead of the
+//!   extension this crate pins, whose feed reports a rewrite's rows as
+//!   `UPDATE`s; see COMPATIBILITY.md).
 //!
 //! [`TableDataChanges::layout_changed`] adds every flush and compaction from
 //! the tokens alone. A cache keyed by row content needs the first; one keyed by

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MetadataProvider::get_inlined_file_deletes_of_files_between`: the inlined deletions of the
+  given data files between two snapshots. The default filters
+  `get_inlined_file_deletes_between`; every built-in provider reads only those files.
 - `DuckLakeTable::update_rowids`: give the live rows with given `rowid`s new values, keeping
   each `rowid`, in one snapshot, as official's `UPDATE` does.
 - `read_columns_by_rowid_with` and `RowIdReadOptions`: a rowid read that charges the batches it
@@ -103,6 +106,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The change feeds stream their rows instead of collecting the window first, and pair updates
+  with hash joins whose memory is charged to the memory pool. **BREAKING**: `InsertedRowsExec`
+  replaces `TableChangesExec`. The window's inlined rows and inlined deletions, read from the
+  catalog at planning, are charged to the pool too as each read returns, for as long as the
+  plan holds them, and each data file's delete positions before they are allocated rather than
+  once read. A window whose rows exceed the pool streams through it; inlined data or pairing
+  keys beyond the pool fail with a resources error. The plan the feed returns runs without the
+  physical optimizer too.
+- **BREAKING** (behaviour): the change feeds (`ducklake_table_changes`,
+  `ducklake_table_insertions`, `ducklake_table_deletions`, and change detection, which reads
+  them) follow official DuckLake's main branch, ahead of the extension this crate pins, in three
+  cases. A rewrite (`rewrite_data_files`, `ducklake_rewrite_data_files`) changes no row and
+  reports nothing: not the files it ends, not the files it writes, nor the rows of its outputs a
+  later merge carries; the pinned extension reports the rewritten rows as `UPDATE` pairs or
+  inserts. A data file retired whole reports its inlined deletions in the window at their own
+  snapshots, its other rows at the retirement, and not the rows deleted inlined before the
+  window; the pinned extension reports only the inlined deletions, or every row again
+  (duckdb/ducklake#1571). A data file dropped in the snapshot that also wrote a delete file for
+  it reports each row once, where the pinned extension reports the delete file's rows twice.
+  The earlier inlined deletions are read for the retired files alone, through the new
+  `MetadataProvider::get_inlined_file_deletes_of_files_between` (a default filters
+  `get_inlined_file_deletes_between`). **BREAKING**: `DeleteFileChange` has a `data_file_id`;
+  a third-party provider must fill it with the data file's catalog id, or a retired file's
+  earlier inlined deletions are not subtracted.
 - A merge of rowid-adjacent files reads the next source partitions while it writes the current
   one, as many as `MergeOptions::read_ahead_partitions` (default 2), so object-store reads
   overlap the writer's encoding again. Each partition read ahead holds at most two decoded

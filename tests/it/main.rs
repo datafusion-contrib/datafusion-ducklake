@@ -124,10 +124,19 @@ mod sql_write_tests;
 mod sqlite_metadata_provider_test;
 mod sqllogictest_runner;
 mod table_build_statistics_tests;
+mod table_changes_composition_tests;
+mod table_changes_memory_tests;
 mod table_changes_tests;
+mod table_changes_upstream_main_tests;
 mod table_deletions_repartition_tests;
 mod table_stats_record_count_tests;
 mod table_tests;
+// The crate's counting allocator, shared with its unit tests. It counts only
+// the allocations of a thread inside `test_alloc::measure`, so the rest of
+// this binary runs as before.
+#[allow(dead_code)]
+#[path = "../../src/test_alloc.rs"]
+mod test_alloc;
 mod time_travel_tests;
 mod topn_file_pruning_tests;
 mod type_promotion_tests;

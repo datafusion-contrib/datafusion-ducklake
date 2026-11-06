@@ -1139,8 +1139,10 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   or a compaction (`inline_flush`, `flushed_inlined`, `merge_adjacent`, `rewrite_delete`,
   `compacted_table`) read the feed, each feed up to its first row: a `DELETE` committed after
   official's flush in one transaction records only `inline_flush`, and the feed lists the
-  deletion; official's `ducklake_rewrite_data_files` lists the rows it rewrote as `UPDATE`
-  pairs, so a rewrite is a change, while a pure flush or merge lists nothing. One case errs
+  deletion; a rewrite, a pure flush and a merge list nothing, so none of them is a change on
+  its own (for a rewrite the feed follows official's main branch; the pinned extension's
+  `ducklake_rewrite_data_files` lists the rows it rewrote as `UPDATE` pairs, see the change
+  feeds below). One case errs
   towards a change: official's flush of inlined deletions of Parquet rows records
   `deleted_from_table`, as a `DELETE` does, with nothing in the feed. `layout_changed` adds
   every flush and compaction from the tokens alone. A snapshot without a
@@ -1468,33 +1470,37 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   deletes and UPDATEs of inlined rows (paired into `update_preimage` /
   `update_postimage` by row id), and inlined deletions of Parquet rows
   (`ducklake_inlined_delete_<table_id>`) surface in all three feeds, on every
-  metadata backend. The feeds keep official's behaviour for a data file with an
-  inlined deletion that is later retired whole (for example by
-  `ducklake_rewrite_data_files`). That behaviour is a known upstream data bug,
-  matched for now because the fix is not small: a window holding both the inlined
-  deletion and the retirement reports only the inlined deletion and the rewritten
-  file's rows as inserts, and a window holding only the retirement reports every row
-  of the file, the one deleted earlier included, so the earlier deletion is reported
-  twice across the two windows. Repro with DuckDB 1.5.5: insert 20 rows to Parquet,
-  delete one inlined at snapshot `S`, rewrite with `delete_threshold => 0.0` at
-  `S+1`; `ducklake_table_changes` over `[S, S+1]` reports the deletion and 19 spurious
-  inserts, and over `[S+1, S+1]` the deletion again with 19 update pairs
-  (duckdb/ducklake#1571). When the inlined deletion was an `UPDATE`'s, official reports the
-  rewritten file's other rows as update pairs with identical pre- and postimages at the
-  rewrite's snapshot (not filed upstream; repro with DuckDB 1.5.5: insert 20 rows to
-  Parquet, update two of them inlined, rewrite with `delete_threshold => 0.0`). This
-  crate reports the same pairs there, except for a file a flush wrote, where it reports
-  no change. As in
-  official, whose `ducklake_table_changes` left-joins the window's insertions and deletions
-  on snapshot and row id, a row that shares that key with several rows of the other side
-  is reported once per such row: a retirement that reports an earlier deletion of a row
-  again, at a snapshot that also deletes and re-inserts it, gives two preimages and two
-  postimages. A sibling this crate does not match (not filed upstream): when the rewritten
-  file also had a delete file, official's `ducklake_table_changes` and
-  `ducklake_table_deletions` report each row of an inlined deletion or inlined update
-  (pre- and postimage) twice in a window holding both the change and the rewrite's
-  snapshot; its `ducklake_table_insertions` and this crate report each once. Repro with
-  DuckDB 1.5.5: insert 20 rows to Parquet, delete 12 of them to a delete file, delete one
-  row and update another inlined, then rewrite with `delete_threshold => 0.0`. On
+  metadata backend. In three cases the feeds follow official's main branch rather than
+  the extension this crate pins, whose behaviour there is a data bug
+  (duckdb/ducklake#1571), and so differ from DuckDB 1.5.5:
+  - A rewrite (`ducklake_rewrite_data_files`, `rewrite_data_files`) changes no row, so
+    the feeds report nothing for its snapshot (a snapshot whose ledger records
+    `rewrite_delete:<table_id>`): not the data files it ends, not the ordinary files it
+    writes, and not the rows of its outputs a later merge carries in a partial file. A
+    rewritten file's inlined deletions in the window are still reported, once, at their own
+    snapshots. The pinned extension reports a window holding an inlined deletion and the
+    rewrite with the deletion and the rewritten rows as inserts, a window of the rewrite
+    alone with every row of the file as an update pair (the row deleted earlier as a
+    deletion again), identical update pairs after an inlined `UPDATE`, and, when the file
+    also had a delete file, each inlined deletion or update twice. Repro with DuckDB 1.5.5:
+    insert 20 rows to Parquet, delete one inlined at snapshot `S`, rewrite with
+    `delete_threshold => 0.0` at `S+1`; `ducklake_table_changes` over `[S, S+1]` reports the
+    deletion and 19 inserts, and over `[S+1, S+1]` the deletion again with 19 update
+    pairs. Upstream main (and this crate): the deletion, and nothing at `S+1`. Upstream
+    main has these since duckdb/ducklake commits `be064992`, `8afaf1a9` and `24967334`.
+  - A data file retired whole other than by a rewrite (this crate's `Replace` write, for
+    example) reports its inlined deletions in the window at their own snapshots and every
+    other row at the retirement, except the rows deleted inlined before the window. The
+    pinned extension reports only the inlined deletions when the window holds some, and
+    otherwise every row, those deleted inlined earlier again.
+  - A data file dropped by the snapshot that also wrote a delete file for it (a transaction
+    that deletes part of a file, then the rest) reports each row once: the drop leaves out
+    the rows of every delete file up to its own snapshot. The pinned extension reports the
+    delete file's rows twice. Repro with DuckDB 1.5.5: insert two rows, then in one
+    transaction delete one and then the other; `ducklake_table_changes` over that snapshot
+    reports the first row twice.
+  As in official, whose `ducklake_table_changes` left-joins the window's insertions and
+  deletions on snapshot and row id, a row that shares that key with several rows of the
+  other side is reported once per such row. On
   encrypted (PME) catalogs, where the feed reads inserts only, inlined inserts surface as
   `insert` rows; inlined deletes do not surface there.

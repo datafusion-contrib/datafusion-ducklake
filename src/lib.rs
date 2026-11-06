@@ -82,6 +82,7 @@ pub mod delete_filter;
 mod delete_memo;
 pub mod encryption;
 pub mod error;
+mod feed_charge;
 pub(crate) mod field_id_adapter;
 pub mod information_schema;
 pub mod inlined_filter;
@@ -105,6 +106,8 @@ pub mod table;
 pub mod table_changes;
 pub mod table_deletions;
 pub mod table_functions;
+#[cfg(test)]
+mod test_alloc;
 pub mod types;
 pub(crate) mod view;
 
