@@ -3948,8 +3948,10 @@ async fn change_detection_counts_a_delete_committed_with_a_flush() {
 ///   deletion, so it is a deletion;
 /// - a flush of inlined rows alone and a merge of adjacent files list
 ///   nothing;
-/// - official's `ducklake_rewrite_data_files` lists every row it rewrote as
-///   an `UPDATE` pair, so it is a row change.
+/// - a `ducklake_rewrite_data_files` changes no row: official's main branch
+///   lists nothing for its snapshot, and this crate follows it, where the
+///   extension the tests run lists every row it rewrote as an `UPDATE` pair
+///   (duckdb/ducklake#1571), so the feed is taken as empty there.
 #[tokio::test(flavor = "multi_thread")]
 async fn change_detection_follows_the_change_feed() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -4011,10 +4013,18 @@ async fn change_detection_follows_the_change_feed() {
             .any(|kind| token.starts_with(kind))
         })
     };
+    let rewrite_only = |made: &str| {
+        made.split(',')
+            .all(|token| token.starts_with("rewrite_delete:"))
+    };
     let mut seen = Vec::new();
     for (snapshot, made) in &ledger {
         let changes = data_changes(&provider, t, snapshot - 1, *snapshot).await;
-        let feed = feed_rows(*snapshot);
+        let feed = if rewrite_only(made) {
+            0
+        } else {
+            feed_rows(*snapshot)
+        };
         if feed > 0 {
             assert!(changes.rows_changed(), "{snapshot} `{made}`: {changes:?}");
         }
@@ -4036,7 +4046,7 @@ async fn change_detection_follows_the_change_feed() {
             ("inline_flush".to_string(), true),
             ("inline_flush".to_string(), false),
             ("merge_adjacent".to_string(), false),
-            ("rewrite_delete".to_string(), true),
+            ("rewrite_delete".to_string(), false),
         ],
         "{ledger:?}"
     );
@@ -4051,8 +4061,11 @@ async fn change_detection_follows_the_change_feed() {
     let changes = data_changes(&provider, t, flush_with_delete - 1, flush_with_delete).await;
     assert!(changes.deleted && changes.flushed, "{changes:?}");
     assert_eq!(changes.last_rows_changed_snapshot, Some(flush_with_delete));
-    // Over the whole history, the latest row change is the rewrite.
-    assert_eq!(last_rows_changed(&provider, t, head).await, Some(head));
+    // Over the whole history, the latest row change is the flush of the
+    // deletions before the rewrite, which changes none.
+    let (rewrite, made) = ledger.last().unwrap();
+    assert!(*rewrite == head && rewrite_only(made), "{ledger:?}");
+    assert_eq!(last_rows_changed(&provider, t, head).await, Some(head - 1));
 }
 
 // ---------------------------------------------------------------------------

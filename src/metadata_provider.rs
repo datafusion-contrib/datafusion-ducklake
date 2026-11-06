@@ -327,7 +327,8 @@ SELECT
     pd.file_size_bytes AS previous_delete_file_size_bytes,
     pd.footer_size AS previous_delete_footer_size,
 
-    cd.begin_snapshot
+    cd.begin_snapshot,
+    data.data_file_id
 FROM current_delete cd
 JOIN ducklake_data_file data
   ON data.data_file_id = cd.data_file_id
@@ -363,13 +364,14 @@ SELECT
     pd.file_size_bytes,
     pd.footer_size,
 
-    data.end_snapshot
+    data.end_snapshot,
+    data.data_file_id
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
     SELECT path, path_is_relative, file_size_bytes, footer_size
     FROM all_deletes ad
     WHERE ad.data_file_id = data.data_file_id
-      AND ad.begin_snapshot < data.end_snapshot
+      AND ad.begin_snapshot <= data.end_snapshot
     ORDER BY ad.begin_snapshot DESC
     LIMIT 1
 ) pd ON true
@@ -1555,12 +1557,16 @@ pub struct InlinedFileDeleteChange {
 
 /// SQL listing the inlined deletions of Parquet-resident rows made in a
 /// change-feed window, each with its data file. Three placeholders, bound in
-/// order to `table_id, start, end`.
+/// order to `table_id, start, end`. `file_ids`, when given, restricts them to
+/// some data files: a condition on `file_id`, such as `IN (1, 2)` (see
+/// [`sql_id_list`]) or `= ANY($4::bigint[])`.
 pub(crate) fn inlined_file_deletes_between_sql(
     inlined_delete_table: &str,
     placeholders: [&str; 3],
+    file_ids: Option<&str>,
 ) -> String {
     let [table_id, start, end] = placeholders;
+    let file_ids = file_ids.map_or_else(String::new, |ids| format!(" AND i.file_id {ids}"));
     format!(
         "SELECT d.data_file_id, d.path, d.path_is_relative, d.file_size_bytes, d.footer_size, \
                 d.row_id_start, d.record_count, d.mapping_id, i.row_id, i.begin_snapshot \
@@ -1568,9 +1574,16 @@ pub(crate) fn inlined_file_deletes_between_sql(
          JOIN ducklake_data_file d ON d.data_file_id = i.file_id \
          WHERE d.table_id = {table_id} \
            AND i.begin_snapshot >= {start} \
-           AND i.begin_snapshot <= {end} \
+           AND i.begin_snapshot <= {end}{file_ids} \
          ORDER BY d.data_file_id, i.row_id"
     )
+}
+
+/// `ids` as the list of an SQL `IN`: `(1, 2)`. Ids are `i64`, so writing
+/// them into the SQL adds no bind parameter and needs no quoting.
+pub(crate) fn sql_id_list(ids: &[i64]) -> String {
+    let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+    format!("IN ({})", ids.join(", "))
 }
 
 /// What a catalog's `ducklake_schema_versions` ledger records.
@@ -2501,6 +2514,8 @@ pub struct DataFileChange {
 #[derive(Debug, Clone)]
 pub struct DeleteFileChange {
     /* -------- Data file being affected -------- */
+    /// Catalog id of the data file.
+    pub data_file_id: i64,
     pub data_file_path: String,
     pub data_file_path_is_relative: bool,
     pub data_file_size_bytes: i64,
@@ -3181,6 +3196,29 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// [`Self::get_inlined_file_deletes_between`], of the data files
+    /// `data_file_ids` only: what official DuckLake reads for the data files a
+    /// change feed's window retires (`file_id IN (...)`).
+    ///
+    /// The default filters [`Self::get_inlined_file_deletes_between`]; the
+    /// crate's providers select by file in the catalog instead.
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: HashSet<i64> = data_file_ids.iter().copied().collect();
+        let mut changes =
+            self.get_inlined_file_deletes_between(table_id, start_snapshot, end_snapshot)?;
+        changes.retain(|change| ids.contains(&change.data_file_id));
+        Ok(changes)
+    }
+
     /// Net number of live rows in a table at a snapshot, accounting for delete
     /// files and inlined positions: `SUM(record_count) - SUM(delete_count) -
     /// distinct inlined positions` over the files visible at `snapshot_id`.
@@ -3340,7 +3378,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// The deletions a change feed over `start_snapshot..=end_snapshot` reads,
     /// selected as official DuckLake selects them: every delete file with
     /// `begin_snapshot <= end_snapshot` (with the latest delete file of its data
-    /// file that begins before it), and every data file retired in the window.
+    /// file that begins before it), and every data file retired in the window
+    /// (with the latest delete file of the data file that begins at or before
+    /// its retirement, so a delete file the retiring snapshot wrote is
+    /// subtracted from it too). The feeds leave out the retirements by a
+    /// rewrite themselves.
     /// A delete file recording each row's deleting snapshot can begin before
     /// the window and still hold deletions in it; the feed windows those per
     /// row, and a delete file without them adds nothing before it begins.

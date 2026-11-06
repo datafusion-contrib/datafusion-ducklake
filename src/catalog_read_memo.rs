@@ -1071,6 +1071,21 @@ impl MetadataProvider for MemoizedMetadataProvider {
             .get_inlined_file_deletes_between(table_id, start_snapshot, end_snapshot)
     }
 
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        self.reader()?.get_inlined_file_deletes_of_files_between(
+            table_id,
+            data_file_ids,
+            start_snapshot,
+            end_snapshot,
+        )
+    }
+
     fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
         self.reader()?.get_table_row_count(table_id, snapshot_id)
     }

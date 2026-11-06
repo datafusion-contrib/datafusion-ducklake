@@ -450,24 +450,54 @@ async fn assert_catalog_feeds_conform(table: &str, path: &Path) -> DataFusionRes
     assert_catalog_feeds_conform_with(table, path, None).await
 }
 
-/// [`assert_catalog_feeds_conform`], where `dedupe_official` reads each
-/// official feed with rows it reports more than once reported once, and
-/// requires that official repeated some row: a history official reports twice.
+/// [`assert_catalog_feeds_conform`], where `rewrite_repeats` names a rewrite
+/// whose window official's pinned extension reports some rows of twice in.
+///
+/// The feeds follow official's main branch for a rewrite
+/// (`ducklake_rewrite_data_files`), ahead of the extension the tests run
+/// (duckdb/ducklake#1571, see COMPATIBILITY.md): a rewrite changes no row, so
+/// upstream main reports nothing at its snapshot, where the pinned extension
+/// reports the rewritten file's rows (as inserts, update pairs, or the
+/// deletions of an earlier window again). A rewrite's snapshot makes no other
+/// change, and the rows the extension reports at other snapshots are upstream
+/// main's, so the expected feed is the extension's without the rows dated at a
+/// rewrite's snapshot.
 async fn assert_catalog_feeds_conform_with(
     table: &str,
     path: &Path,
     rewrite_repeats: Option<(i64, &[i64])>,
 ) -> DataFusionResult<()> {
     let path = path.to_path_buf();
+    let rewrites: Vec<i64> = {
+        let conn = official_connection(&path)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT snapshot_id FROM ducklake_snapshots('c') \
+                 WHERE CAST(changes AS VARCHAR) LIKE '%rewrite_delete%'",
+            )
+            .map_err(box_err)?;
+        stmt.query_map([], |row| row.get(0))
+            .map_err(box_err)?
+            .collect::<Result<_, _>>()
+            .map_err(box_err)?
+    };
+    let upstream_main = |feed: CanonFeed| -> CanonFeed {
+        let rows = feed
+            .rows
+            .into_iter()
+            .filter(|row| !rewrites.contains(&row.snapshot_id))
+            .collect();
+        CanonFeed::new(feed.all_columns, feed.table_columns, rows)
+    };
     // The sibling of duckdb/ducklake#1571 (see COMPATIBILITY.md): when a data
     // file with a delete file and inlined deletions is rewritten at snapshot
-    // `R`, official's change and deletion feeds report every row of the
-    // snapshots that inlined those deletions (`repeated`) twice in a window
-    // that also holds `R`; its insertion feed reports each once. This crate
-    // reports each once: the expected feed is official's with each such row
-    // once, after checking it was repeated exactly twice. Every other window
-    // and row must match as is.
+    // `R`, the pinned extension's change and deletion feeds report every row of
+    // the snapshots that inlined those deletions (`repeated`) twice in a window
+    // that also holds `R`; its insertion feed reports each once. Upstream main
+    // and this crate report each once: the expected feed is the extension's
+    // with each such row once, after checking it was repeated exactly twice.
     let correct = |(a, b): (i64, i64), feed: CanonFeed| -> CanonFeed {
+        let feed = upstream_main(feed);
         let Some((rewrite, repeated)) = rewrite_repeats else {
             return feed;
         };
@@ -523,7 +553,7 @@ async fn assert_catalog_feeds_conform_with(
                 (a, b),
                 correct((a, b), changes),
                 correct((a, b), deletions),
-                insertions,
+                upstream_main(insertions),
             ));
         }
     }
@@ -1908,11 +1938,11 @@ async fn diff_inlined_changes_on_a_large_table() -> DataFusionResult<()> {
 }
 
 /// A data file retired by a rewrite after an inlined deletion of one of its
-/// rows. Official reports a window that holds both the inlined deletion and
-/// the retirement with only the inlined deletion (the retired file's other rows
-/// are not reported deleted, so its rewritten rows surface as inserts), and a
-/// window holding only the retirement with every row of the file, the one
-/// deleted earlier included.
+/// rows. The pinned extension reports a window that holds both the inlined
+/// deletion and the retirement with the inlined deletion and the rewritten
+/// rows as inserts, and a window holding only the retirement with every row
+/// of the file, the one deleted earlier included (duckdb/ducklake#1571).
+/// Upstream main and this crate report nothing at the rewrite's snapshot.
 #[tokio::test]
 async fn diff_rewrite_after_inlined_delete() -> DataFusionResult<()> {
     assert_inlined_cdc_conformance(
@@ -1930,10 +1960,12 @@ async fn diff_rewrite_after_inlined_delete() -> DataFusionResult<()> {
 }
 
 /// A data file with a delete file and inlined deletions, retired by a rewrite.
-/// Official reports each inlined deletion and each inlined update's preimage
-/// and postimage twice in every window that holds both the change and the
-/// rewrite's snapshot, a sibling of duckdb/ducklake#1571's upstream data bug;
-/// a window of the rewrite alone matches #1571. This crate reports each once.
+/// The pinned extension reports each inlined deletion and each inlined
+/// update's preimage and postimage twice in every window that holds both the
+/// change and the rewrite's snapshot, a sibling of duckdb/ducklake#1571; a
+/// window of the rewrite alone matches #1571. Upstream main, whose rewrite
+/// ends no file in the feed, and this crate report each once, and nothing at
+/// the rewrite's snapshot.
 #[tokio::test]
 async fn diff_rewrite_of_file_with_delete_file_and_inlined_deletes() -> DataFusionResult<()> {
     let tmp = TempDir::new().map_err(box_err)?;
@@ -1949,7 +1981,7 @@ async fn diff_rewrite_of_file_with_delete_file_and_inlined_deletes() -> DataFusi
             "CALL ducklake_rewrite_data_files('c', 't', delete_threshold => 0.0);",
         ],
     )?;
-    // Official's actual change feed over [4, 6]: the inlined deletion of
+    // The pinned extension's change feed over [4, 6]: the inlined deletion of
     // snapshot 4 and the inlined update of snapshot 5 each reported twice.
     let row =
         |snapshot: i64, rowid: i64, kind: &str, id: i32| format!("{snapshot},{rowid},{kind},{id}");
@@ -1971,7 +2003,7 @@ async fn diff_rewrite_of_file_with_delete_file_and_inlined_deletes() -> DataFusi
         ],
         "official's feed over [4, 6]"
     );
-    // This crate's: each change once.
+    // This crate's: each change once, and nothing at the rewrite (6).
     let ctx = crate_context(&path).await?;
     let crate_rows = ctx
         .sql(
@@ -1994,6 +2026,7 @@ async fn diff_rewrite_of_file_with_delete_file_and_inlined_deletes() -> DataFusi
             "{expected} in\n{crate_rows}"
         );
     }
+    assert!(!crate_rows.contains("| 6           |"), "{crate_rows}");
     assert_catalog_feeds_conform_with("t", &path, Some((6, &[4, 5]))).await?;
     assert_rowid_scans_conform("t", &path, "").await
 }

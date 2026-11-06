@@ -29,7 +29,7 @@
 //! is left behind. Every query-time source is built through
 //! `session_parquet_source`, which `clippy.toml` enforces by disallowing
 //! `ParquetSource::new` everywhere else — the change feeds build theirs inside
-//! `TableChangesExec`/`DeletedRowsExec` at execution time, where no plan walk
+//! `InsertedRowsExec`/`DeletedRowsExec`, which have no children, where no plan walk
 //! reaches them.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]

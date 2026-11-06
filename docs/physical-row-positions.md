@@ -94,9 +94,10 @@ Consumers take each index explicitly rather than looking a column up by name:
 - `RowLineageExec::try_new(input, LineageColumns { embedded, has_embedded, file_id, row_id_start,
   position }, data_columns, paths)`
 
-Two consumers derive the index arithmetically instead — `table_deletions.rs` and `table_changes.rs`
-compute `table_len + embedded_rowid? + embedded_snapshot?`. Those sites carry a `debug_assert!` that
-the arithmetic agrees with the scan's actual last column. All the internal columns are `Int64`, so a
+Two consumers derive the index from the projection they build instead — `table_deletions.rs` and
+`table_changes.rs` place the position after the projected table columns and whichever of the
+row-count probe, embedded rowid and embedded snapshot they read. Those sites carry a `debug_assert!`
+that the index lands on the position column. All the internal columns are `Int64`, so a
 misalignment would not fail a downcast; it would return wrong rowids.
 
 `DeleteFilterExec` (one data file, positions read at planning) and `RowIdExec` remain in the public

@@ -2433,10 +2433,10 @@ mod known {
     }
 
     /// The sibling of duckdb/ducklake#1571 (see COMPATIBILITY.md): over a
-    /// window that holds a rewrite, official's change feed reports each
-    /// deletion and update row of an earlier step of the window twice. This
-    /// crate reports each once: such a row repeated exactly twice is taken
-    /// once. Repro: `upstream-bugs/m9-repro.sql`.
+    /// window that holds a rewrite, the pinned extension's change feed reports
+    /// each deletion and update row of an earlier step of the window twice.
+    /// Official's main branch and this crate report each once: such a row
+    /// repeated exactly twice is taken once. Repro: `upstream-bugs/m9-repro.sql`.
     pub(super) fn rewrite_repeats(
         history: &History,
         window: (usize, usize),
@@ -2717,11 +2717,11 @@ mod known {
         strip(&theirs) == strip(&left)
     }
 
-    /// The #1571 family (see COMPATIBILITY.md): official's change feed can
-    /// report rows at the snapshot of a rewrite (or a merge, flush or
+    /// The #1571 family (see COMPATIBILITY.md): the pinned extension's change
+    /// feed can report rows at the snapshot of a rewrite (or a merge, flush or
     /// checkpoint), which changes no row: earlier deletions and updates of a
     /// retired file again, or its other rows as identical update pairs. This
-    /// crate reports some of them as official does, and none at others. At a
+    /// crate reports none at a rewrite, as official's main branch does. At a
     /// maintenance step where this crate reports no row, official's rows are
     /// dropped; any row this crate reports at such a step still compares, so
     /// a row it reports there must be official's. Returns official's rows and

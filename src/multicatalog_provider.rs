@@ -521,6 +521,40 @@ impl MulticatalogRead {
 }
 
 impl MulticatalogProvider {
+    /// The inlined deletions of Parquet rows of `table_id` in the inclusive
+    /// window, of the data files `data_file_ids` only when given.
+    fn inlined_file_deletes(
+        &self,
+        table_id: i64,
+        data_file_ids: Option<&[i64]>,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+        block_on(async {
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            let read = self
+                .on_connection_in_transaction(async |connection, in_transaction| {
+                    inlined_file_deletes_between_on(
+                        connection,
+                        in_transaction,
+                        table_id,
+                        data_file_ids,
+                        start_snapshot,
+                        end_snapshot,
+                    )
+                    .await
+                })
+                .await;
+            self.inlined_deletion_tables.rows_or_forget(table_id, read)
+        })
+    }
+
     /// Build a pool from a connection string, then resolve the catalog by name.
     pub async fn new(connection_string: &str, catalog_name: &str) -> Result<Self> {
         let url = connection_string.to_string();
@@ -2350,28 +2384,20 @@ impl MetadataProvider for MulticatalogProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
-        let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
-        block_on(async {
-            if !self
-                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
-                .await?
-            {
-                return Ok(Vec::new());
-            }
-            let read = self
-                .on_connection_in_transaction(async |connection, in_transaction| {
-                    inlined_file_deletes_between_on(
-                        connection,
-                        in_transaction,
-                        table_id,
-                        start_snapshot,
-                        end_snapshot,
-                    )
-                    .await
-                })
-                .await;
-            self.inlined_deletion_tables.rows_or_forget(table_id, read)
-        })
+        self.inlined_file_deletes(table_id, None, start_snapshot, end_snapshot)
+    }
+
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inlined_file_deletes(table_id, Some(data_file_ids), start_snapshot, end_snapshot)
     }
 
     fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
@@ -3197,7 +3223,7 @@ SELECT
     current_delete.path, current_delete.path_is_relative,
     current_delete.file_size_bytes, current_delete.footer_size,
     prev.path, prev.path_is_relative, prev.file_size_bytes, prev.footer_size,
-    current_delete.begin_snapshot
+    current_delete.begin_snapshot, current_delete.data_file_id
 FROM current_delete
 JOIN data_files data USING (data_file_id)
 LEFT JOIN LATERAL (
@@ -3215,14 +3241,14 @@ SELECT
     data.row_id_start, data.record_count, data.mapping_id,
     NULL::VARCHAR, NULL::BOOLEAN, NULL::BIGINT, NULL::BIGINT,
     prev.path, prev.path_is_relative, prev.file_size_bytes, prev.footer_size,
-    data.end_snapshot
+    data.end_snapshot, data.data_file_id
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
     SELECT ddf.path, ddf.path_is_relative, ddf.file_size_bytes, ddf.footer_size
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = data.data_file_id
-      AND ddf.begin_snapshot < data.end_snapshot
+      AND ddf.begin_snapshot <= data.end_snapshot
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true
@@ -3240,6 +3266,7 @@ WHERE data.table_id = $1
             rows.into_iter()
                 .map(|row| {
                     Ok(DeleteFileChange {
+                        data_file_id: row.try_get(16)?,
                         data_file_path: row.try_get(0)?,
                         data_file_path_is_relative: row.try_get(1)?,
                         data_file_size_bytes: row.try_get(2)?,

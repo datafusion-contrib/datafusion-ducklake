@@ -22,7 +22,7 @@ use crate::metadata_provider::{
     block_on, inlined_delete_table_name, inlined_file_delete_change,
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
-    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings, sql_id_list,
 };
 use crate::metadata_provider::{SQL_FILE_SCHEMA_VERSION, SQL_NEXT_FILE_ID};
 use crate::partition::PartitionSpec;
@@ -926,6 +926,37 @@ pub struct SqliteMetadataProvider {
 }
 
 impl SqliteMetadataProvider {
+    /// The inlined deletions of Parquet rows of `table_id` in the inclusive
+    /// window, of the data files `data_file_ids` only when given.
+    fn inlined_file_deletes(
+        &self,
+        table_id: i64,
+        data_file_ids: Option<&[i64]>,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        block_on(async {
+            let table = quote_ident(&inlined_delete_table_name(table_id)?);
+            let file_ids = data_file_ids.map(sql_id_list);
+            let sql =
+                inlined_file_deletes_between_sql(&table, ["?", "?", "?"], file_ids.as_deref());
+            match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+                .bind(table_id)
+                .bind(start_snapshot)
+                .bind(end_snapshot)
+                // Ids written into the SQL make a string per id list: not
+                // one for the connection's statement cache.
+                .persistent(data_file_ids.is_none())
+                .fetch_all(&mut *self.connection().await?)
+                .await
+            {
+                Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
+                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     /// Creates a new provider for an existing DuckLake catalog.
     ///
     /// Connection string format: `sqlite:///path/to/catalog.db` or `sqlite::memory:`
@@ -2604,21 +2635,20 @@ impl MetadataProvider for SqliteMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<InlinedFileDeleteChange>> {
-        block_on(async {
-            let table = quote_ident(&inlined_delete_table_name(table_id)?);
-            let sql = inlined_file_deletes_between_sql(&table, ["?", "?", "?"]);
-            match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(start_snapshot)
-                .bind(end_snapshot)
-                .fetch_all(&mut *self.connection().await?)
-                .await
-            {
-                Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
-                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
-                Err(error) => Err(error.into()),
-            }
-        })
+        self.inlined_file_deletes(table_id, None, start_snapshot, end_snapshot)
+    }
+
+    fn get_inlined_file_deletes_of_files_between(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if data_file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inlined_file_deletes(table_id, Some(data_file_ids), start_snapshot, end_snapshot)
     }
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
@@ -3231,7 +3261,8 @@ SELECT
        AND pd.begin_snapshot < cd.begin_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
-    cd.begin_snapshot AS snapshot_id
+    cd.begin_snapshot AS snapshot_id,
+    data.data_file_id
 FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
 WHERE cd.table_id = ?
@@ -3259,25 +3290,26 @@ SELECT
     (SELECT path FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
-       AND pd.begin_snapshot < data.end_snapshot
+       AND pd.begin_snapshot <= data.end_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path,
     (SELECT path_is_relative FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
-       AND pd.begin_snapshot < data.end_snapshot
+       AND pd.begin_snapshot <= data.end_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path_is_relative,
     (SELECT file_size_bytes FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
-       AND pd.begin_snapshot < data.end_snapshot
+       AND pd.begin_snapshot <= data.end_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_file_size,
     (SELECT footer_size FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
-       AND pd.begin_snapshot < data.end_snapshot
+       AND pd.begin_snapshot <= data.end_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
-    data.end_snapshot AS snapshot_id
+    data.end_snapshot AS snapshot_id,
+    data.data_file_id
 FROM ducklake_data_file data
 WHERE data.table_id = ?
   AND data.end_snapshot >= ?
@@ -3308,6 +3340,7 @@ WHERE data.table_id = ?
                 .map(|row| {
                     Ok(DeleteFileChange {
                         // data file
+                        data_file_id: row.try_get(16)?,
                         data_file_path: row.try_get(0)?,
                         data_file_path_is_relative: row.try_get(1)?,
                         data_file_size_bytes: row.try_get(2)?,
