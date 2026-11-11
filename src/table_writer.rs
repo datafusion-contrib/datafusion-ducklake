@@ -268,7 +268,20 @@ pub struct DuckLakeWriteOptions {
     /// those out pass four times that a thread, unless its own file sequence
     /// has none out. Files written with content-defined chunking, and
     /// encrypted files, are still encoded on the thread that writes.
+    ///
+    /// [`Self::encode_pool`], when set, takes precedence: the write encodes
+    /// on that pool instead, whatever this says.
     pub encode_parallelism: Option<usize>,
+    /// A pool, shared across writes, that encodes this write's row groups
+    /// instead of a pool of the write's own ([`Self::encode_parallelism`],
+    /// which a pool set here overrides); `None` leaves the writer's pool
+    /// unchanged. Its threads and byte budget bound every write sharing it
+    /// together, and a row group it cannot take is encoded on the thread
+    /// that writes rather than refused; see [`EncodePool`]. A write's files
+    /// are those it writes on a pool of its own, whichever pool encodes
+    /// them, so at any `encode_parallelism`, 1 included, they are a parallel
+    /// write's files ([`Self::encode_parallelism`]).
+    pub encode_pool: Option<Arc<EncodePool>>,
     /// Whether inserts honor the table's active sort order where the catalog
     /// stores no `sort_on_insert` setting: a stored table, schema or
     /// catalog-wide setting outranks it, as official has no session override
@@ -467,6 +480,7 @@ impl DuckLakeWriteOptions {
             max_open_partitions: None,
             upload_concurrency: None,
             encode_parallelism: None,
+            encode_pool: None,
             // Official sorts only while the option reads exactly `true`.
             sort_on_insert: Some(
                 settings
@@ -518,6 +532,14 @@ impl DuckLakeWriteOptions {
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Sets the pool, shared across writes, that encodes row groups
+    /// ([`Self::encode_pool`]).
+    #[must_use]
+    pub fn with_encode_pool(mut self, pool: Arc<EncodePool>) -> Self {
+        self.encode_pool = Some(pool);
         self
     }
 
@@ -575,6 +597,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.encode_parallelism.is_some() {
             self.encode_parallelism = overrides.encode_parallelism;
+        }
+        if overrides.encode_pool.is_some() {
+            self.encode_pool.clone_from(&overrides.encode_pool);
         }
         if overrides.sort_on_insert.is_some() {
             self.sort_on_insert = overrides.sort_on_insert;
@@ -927,6 +952,10 @@ pub struct DuckLakeTableWriter {
     /// Threads that encode a write's row groups. Defaults to 1; override via
     /// [`DuckLakeTableWriter::with_encode_parallelism`].
     encode_parallelism: usize,
+    /// A pool shared across writes that encodes row groups in place of a
+    /// pool of the write's own; set via
+    /// [`DuckLakeTableWriter::with_encode_pool`].
+    encode_pool: Option<Arc<EncodePool>>,
     /// Target data file size in approximate encoded bytes. A write rolls over to a
     /// new file once the current file's estimated encoded size reaches this, so a
     /// large write produces several files instead of one. Paired with a sort order,
@@ -992,6 +1021,7 @@ impl DuckLakeTableWriter {
             column_options: HashMap::new(),
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             encode_parallelism: 1,
+            encode_pool: None,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
             data_inlining_row_limit: None,
@@ -1082,9 +1112,19 @@ impl DuckLakeTableWriter {
         self
     }
 
+    /// Encode each write's row groups on `pool`, a pool shared across writes
+    /// ([`EncodePool::try_new`]), rather than on a pool of the write's own.
+    /// Takes precedence over [`Self::with_encode_parallelism`]. See
+    /// [`DuckLakeWriteOptions::encode_pool`].
+    #[must_use]
+    pub fn with_encode_pool(mut self, pool: Arc<EncodePool>) -> Self {
+        self.encode_pool = Some(pool);
+        self
+    }
+
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, data
     /// page limits, rollover target, open-partition cap, upload concurrency,
-    /// encode parallelism). Each field overrides the corresponding setting only
+    /// encode parallelism, encode pool). Each field overrides the corresponding setting only
     /// when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
         if let Some(limit) = options.data_inlining_row_limit {
@@ -1124,6 +1164,9 @@ impl DuckLakeTableWriter {
         if let Some(threads) = options.encode_parallelism {
             self.encode_parallelism = threads.max(1);
         }
+        if let Some(pool) = &options.encode_pool {
+            self.encode_pool = Some(Arc::clone(pool));
+        }
         if let Some(sort_on_insert) = options.sort_on_insert {
             self.sort_on_insert = sort_on_insert;
         }
@@ -1162,6 +1205,14 @@ impl DuckLakeTableWriter {
         builder.build()
     }
 
+    /// The pool that encodes a data file's row groups: the shared one when
+    /// set, else one of the write's own from `encode_parallelism`, or none.
+    fn data_file_pool(&self) -> Option<Arc<EncodePool>> {
+        self.encode_pool
+            .clone()
+            .or_else(|| EncodePool::new(self.encode_parallelism, self.max_row_group_bytes))
+    }
+
     /// The properties shared by every data file write path for a file of
     /// `schema` (the field-id-tagged parquet schema): [`Self::base_writer_props`]
     /// with each configured column's settings on every leaf of that column.
@@ -1170,7 +1221,7 @@ impl DuckLakeTableWriter {
         let base = self.base_writer_props();
         if self.column_options.is_empty() {
             return Ok(DataFileProperties {
-                pool: EncodePool::new(self.encode_parallelism, self.max_row_group_bytes),
+                pool: self.data_file_pool(),
                 ..base.into()
             });
         }
@@ -1212,7 +1263,7 @@ impl DuckLakeTableWriter {
         Ok(DataFileProperties {
             props: builder.build(),
             dictionary_set: Arc::new(dictionary_set),
-            pool: EncodePool::new(self.encode_parallelism, self.max_row_group_bytes),
+            pool: self.data_file_pool(),
         })
     }
 
@@ -6996,6 +7047,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(files, 0);
+    }
+
+    /// A shared encode pool reaches every data file a writer builds, from
+    /// [`DuckLakeTableWriter::with_encode_pool`] or from the options, with
+    /// column settings or without, and wins over `encode_parallelism`;
+    /// overrides keep it unless they set their own.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test]
+    async fn a_shared_encode_pool_takes_precedence_over_encode_parallelism() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let pool = EncodePool::try_new(3, 1 << 20).unwrap();
+        let built_pool = |writer: &DuckLakeTableWriter| {
+            writer
+                .build_writer_props(&schema)
+                .unwrap()
+                .pool
+                .expect("a pool")
+        };
+
+        let writer = props_test_writer(&temp)
+            .await
+            .with_encode_parallelism(4)
+            .with_encode_pool(Arc::clone(&pool));
+        assert!(Arc::ptr_eq(&built_pool(&writer), &pool));
+        let with_columns = writer.clone().with_options(
+            &DuckLakeWriteOptions::default()
+                .with_column_options("id", ColumnWriteOptions::new().with_page_size_limit(1024)),
+        );
+        assert!(Arc::ptr_eq(&built_pool(&with_columns), &pool));
+        // An option set without a pool leaves the writer's.
+        let reconfigured = writer.clone().with_options(&DuckLakeWriteOptions {
+            encode_parallelism: Some(8),
+            ..Default::default()
+        });
+        assert!(Arc::ptr_eq(&built_pool(&reconfigured), &pool));
+
+        let options = DuckLakeWriteOptions {
+            encode_parallelism: Some(4),
+            ..Default::default()
+        }
+        .with_encode_pool(Arc::clone(&pool));
+        let from_options = props_test_writer(&temp).await.with_options(&options);
+        assert!(Arc::ptr_eq(&built_pool(&from_options), &pool));
+
+        // Overrides keep the base's pool unless they set one.
+        let other = EncodePool::try_new(1, 1).unwrap();
+        let kept = options
+            .clone()
+            .with_overrides(&DuckLakeWriteOptions::default());
+        assert!(Arc::ptr_eq(kept.encode_pool.as_ref().unwrap(), &pool));
+        let replaced = options
+            .with_overrides(&DuckLakeWriteOptions::default().with_encode_pool(Arc::clone(&other)));
+        assert!(Arc::ptr_eq(replaced.encode_pool.as_ref().unwrap(), &other));
+
+        // Without one, `encode_parallelism` makes a pool of the write's own,
+        // or none at 1.
+        let own = props_test_writer(&temp).await.with_encode_parallelism(4);
+        assert!(!Arc::ptr_eq(&built_pool(&own), &pool));
+        let single = props_test_writer(&temp).await;
+        assert!(single.build_writer_props(&schema).unwrap().pool.is_none());
+    }
+
+    /// Writes sharing a pool give its whole budget back: a write that
+    /// commits, a write dropped before it finished, and a write whose row
+    /// group failed. Two of them are open on the pool at once, and the
+    /// charges out never pass its budget.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writes_give_a_shared_encode_pool_its_budget_back() {
+        async fn given_back(pool: &EncodePool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while pool.reserved() != 0 || pool.out() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} bytes and {} row groups were never given back",
+                    pool.reserved(),
+                    pool.out()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        // Room for two of the write's 100-row groups at a time, each charged
+        // twice its 800 bytes.
+        let budget = 2 * 2 * 800 + 1;
+        let pool = EncodePool::try_new(2, budget).unwrap();
+        let options = DuckLakeWriteOptions {
+            max_row_group_rows: Some(100),
+            ..Default::default()
+        }
+        .with_data_inlining_row_limit(0)
+        .with_encode_pool(Arc::clone(&pool));
+        let writer = props_test_writer(&temp).await.with_options(&options);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |lo: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow::array::Int64Array::from_iter_values(lo..lo + 250))],
+            )
+            .unwrap()
+        };
+
+        let mut committed = writer
+            .begin_write("main", "committed", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        let mut dropped = writer
+            .begin_write("main", "dropped", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        for i in 0..20 {
+            committed.write_batch(&batch(i * 250)).unwrap();
+            dropped.write_batch(&batch(i * 250)).unwrap();
+        }
+        assert_eq!(committed.finish().await.unwrap().records_written, 20 * 250);
+        drop(dropped);
+        given_back(&pool).await;
+        assert!(pool.peak_out() > 0, "no row group went to the pool");
+        assert!(pool.peak_reserved() <= budget, "{}", pool.peak_reserved());
+
+        pool.set_before_encode(Arc::new(|sequence| {
+            if sequence == 3 {
+                panic!("row group {sequence} failed");
+            }
+        }));
+        let mut failed = writer
+            .begin_write("main", "failed", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        let mut writes = 0;
+        while failed.write_batch(&batch(writes * 250)).is_ok() {
+            writes += 1;
+            assert!(writes < 100, "no write saw the failed row group");
+        }
+        failed
+            .finish()
+            .await
+            .expect_err("a write missing a row group must not commit");
+        given_back(&pool).await;
     }
 
     /// A partition file that fails while it is evicted fails the whole

@@ -18,14 +18,14 @@ use arrow::record_batch::RecordBatch;
 use crate::Result;
 use crate::inlined_filter::{InlinedDataScan, InlinedFilter, InlinedScanRead};
 use crate::metadata_provider::{
-    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange, DuckLakeFileData,
-    DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
-    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
-    DuckLakeNameMapping, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableField,
-    DuckLakeTableFile, DuckLakeTag, FILE_METADATA_BATCH_SIZE, FileWithTable,
-    InlinedFileDeleteChange, InlinedRowSelection, MetadataProvider, ObjectTag, SchemaMetadata,
-    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget,
-    ViewMetadata, ViewWithSchema,
+    ColumnTag, ColumnWithTable, ConsistentRead, DataFileChange, DeleteFileChange,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData,
+    DuckLakeInlinedDelete, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
+    DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableField, DuckLakeTableFile, DuckLakeTag, FILE_METADATA_BATCH_SIZE, FileWithTable,
+    InlinedFileDeleteChange, InlinedRowSelection, InlinedRowsAfter, MetadataProvider, ObjectTag,
+    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    TagTarget, ViewMetadata, ViewWithSchema,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -820,6 +820,28 @@ impl MetadataProvider for MemoizedMetadataProvider {
         })))
     }
 
+    /// The wrapped provider's read pinned to the state of the read this
+    /// provider serves, behind a provider that serves it as it serves that
+    /// read.
+    fn pin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        let Some(pinned) = self.reader()?.pin_consistent_read()? else {
+            return Ok(None);
+        };
+        // A feed's inlined rows are read through the wrapped read whatever
+        // the memo holds, so they stream with its cursor.
+        let cursor = pinned.inlined_cursor().cloned();
+        let read = Arc::new(LazyRead {
+            inner: Arc::clone(&self.inner),
+            state: Mutex::new(LazyState::Open(pinned)),
+        });
+        let provider = self.with_consistent(Some(Arc::clone(&read)));
+        let pinned = ConsistentRead::new(Arc::new(provider), move || read.end());
+        Ok(Some(match cursor {
+            Some(cursor) => pinned.with_inlined_cursor(cursor),
+            None => pinned,
+        }))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         self.reader()?.get_current_snapshot()
     }
@@ -945,6 +967,15 @@ impl MetadataProvider for MemoizedMetadataProvider {
         }
     }
 
+    fn get_data_file_column_statistics(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+    ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
+        self.reader()?
+            .get_data_file_column_statistics(table_id, data_file_ids)
+    }
+
     fn get_inlined_data(
         &self,
         table_id: i64,
@@ -1059,6 +1090,19 @@ impl MetadataProvider for MemoizedMetadataProvider {
         }
         self.reader()?
             .read_inlined_rows(table_id, columns, selection, filter)
+    }
+
+    fn read_inlined_rows_page(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        self.reader()?
+            .read_inlined_rows_page(table_id, columns, selection, filter, after, limit)
     }
 
     fn get_inlined_file_deletes_between(

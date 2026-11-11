@@ -14,13 +14,15 @@ use crate::metadata_provider::{
     DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics,
     DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile,
     DuckLakeTableStatistics, DuckLakeTag, FileWithTable, InlinedColumnMapping,
-    InlinedFileDeleteChange, InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection,
+    InlinedCursorRequest, InlinedFileDeleteChange, InlinedFileDeleteRow, InlinedPageBound,
+    InlinedPageTable, InlinedReadShape, InlinedRowSelection, InlinedRowsAfter, InlinedRowsCursor,
     InlinedTableLayout, InlinedVersionColumn, MetadataProvider, MetadataSetting, ObjectTag,
-    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SchemaVersionLedger, SnapshotChangeMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
-    block_on, inlined_delete_table_name, inlined_file_delete_change,
-    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
+    OpenInlinedRowsCursor, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_NAME_MAPPING,
+    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS, SchemaMetadata,
+    SchemaVersionLedger, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
+    inlined_file_delete_change, inlined_file_deletes_between_sql,
+    inlined_file_deletes_for_flush_sql, inlined_missing_scalar, inlined_page_tables,
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
     reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings, sql_id_list,
 };
@@ -401,7 +403,86 @@ async fn read_sqlite_inlined_table(
     selection: InlinedRowSelection,
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
+    page: Option<InlinedPageBound>,
 ) -> Result<Option<DuckLakeInlinedRows>> {
+    let read = prepare_sqlite_inlined_read(
+        &mut *connection,
+        table_id,
+        table,
+        ledger,
+        columns,
+        selection,
+        filter,
+        shape,
+        page,
+    )
+    .await?;
+    let rows =
+        bind_sqlite_inlined_values(sqlx::query(AssertSqlSafe(read.sql.as_str())), &read.binds)?
+            .fetch_all(&mut *connection)
+            .await?;
+    read.decoder.decode(&rows)
+}
+
+/// A read of one inlined-data table, prepared on a connection: the `SELECT`,
+/// the values it binds in placeholder order, and how its rows decode.
+struct SqliteInlinedRead {
+    sql: String,
+    binds: Vec<InlinedSqlBind>,
+    decoder: SqliteInlinedDecoder,
+}
+
+/// How the rows of a [`SqliteInlinedRead`] decode: the system columns by
+/// position, then each physical column by its catalog name.
+struct SqliteInlinedDecoder {
+    table: String,
+    columns: Vec<DuckLakeTableColumn>,
+    schema: SchemaRef,
+    decode_schema: SchemaRef,
+    decode_columns: Vec<DuckLakeTableColumn>,
+    physical_types: HashMap<String, String>,
+    mapping: InlinedColumnMapping,
+    // The names of the `SELECT`'s result columns, in order.
+    result_names: Vec<String>,
+}
+
+/// `query` with `binds` bound in order.
+fn bind_sqlite_inlined_values<'q>(
+    mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
+    binds: &[InlinedSqlBind],
+) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>> {
+    for bind in binds {
+        query = match bind.clone() {
+            InlinedSqlBind::Bool(value) => query.bind(value),
+            InlinedSqlBind::I64(value) => query.bind(value),
+            InlinedSqlBind::U64(value) => query.bind(i64::try_from(value).map_err(|_| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "SQLite inlined filter cannot represent unsigned value {value}"
+                ))
+            })?),
+            InlinedSqlBind::F64(value) => query.bind(value),
+            InlinedSqlBind::Text(value) => query.bind(value),
+            InlinedSqlBind::Bytes(value) => query.bind(value),
+        };
+    }
+    Ok(query)
+}
+
+/// Prepare the read of `selection` of the inlined-data table `table` (see
+/// [`read_sqlite_inlined_table`]), reading the table's layout and schema
+/// version on `connection`.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_sqlite_inlined_read(
+    connection: &mut SqliteConnection,
+    table_id: i64,
+    table: &str,
+    ledger: SchemaVersionLedger,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    shape: InlinedReadShape,
+    page: Option<InlinedPageBound>,
+) -> Result<SqliteInlinedRead> {
     let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
@@ -425,6 +506,17 @@ async fn read_sqlite_inlined_table(
         .iter()
         .map(|column| (*column).to_string())
         .collect::<Vec<_>>();
+    let result_names: Vec<String> = select_list
+        .iter()
+        .cloned()
+        .chain(
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mapping.physical(*index).is_some())
+                .map(|(_, column)| column.column_name.clone()),
+        )
+        .collect();
     select_list.extend(columns.iter().enumerate().filter_map(|(index, column)| {
         mapping.physical(index).map(|physical| {
             format!(
@@ -444,72 +536,265 @@ async fn read_sqlite_inlined_table(
             2,
         )
     });
-    let pushed = rendered
-        .as_ref()
-        .map(|rendered| format!(" AND ({})", rendered.sql))
-        .unwrap_or_default();
+    let (first, second) = selection.bounds();
+    let mut binds = vec![InlinedSqlBind::I64(first), InlinedSqlBind::I64(second)];
+    let pushed = match rendered {
+        Some(rendered) => {
+            binds.extend(rendered.binds);
+            format!(" AND ({})", rendered.sql)
+        },
+        None => String::new(),
+    };
+    let (keyset, order_by, limit) = match page {
+        Some(page) => {
+            if let Some((snapshot, row_id)) = page.after {
+                binds.extend([InlinedSqlBind::I64(snapshot), InlinedSqlBind::I64(row_id)]);
+            }
+            let limit = match page.limit_value() {
+                Some(limit) => {
+                    binds.push(InlinedSqlBind::I64(limit));
+                    " LIMIT ?"
+                },
+                None => "",
+            };
+            (
+                page.predicate(&system, selection, "?", "?"),
+                page.order_by(&system, selection),
+                limit,
+            )
+        },
+        None => (String::new(), shape.order_by(&system, selection), ""),
+    };
     let sql = format!(
-        "SELECT {} FROM {} WHERE {}{pushed} ORDER BY {}",
+        "SELECT {} FROM {} WHERE {}{pushed}{keyset} ORDER BY {order_by}{limit}",
         select_list.join(", "),
         quote_ident(table),
         selection.predicate(&system, "?", "?"),
-        shape.order_by(&system, selection),
     );
-    let (first, second) = selection.bounds();
-    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .bind(first)
-        .bind(second);
-    if let Some(rendered) = rendered {
-        for bind in rendered.binds {
-            query = match bind {
-                InlinedSqlBind::Bool(value) => query.bind(value),
-                InlinedSqlBind::I64(value) => query.bind(value),
-                InlinedSqlBind::U64(value) => query.bind(i64::try_from(value).map_err(|_| {
-                    crate::DuckLakeError::Unsupported(format!(
-                        "SQLite inlined filter cannot represent unsigned value {value}"
-                    ))
-                })?),
-                InlinedSqlBind::F64(value) => query.bind(value),
-                InlinedSqlBind::Text(value) => query.bind(value),
-                InlinedSqlBind::Bytes(value) => query.bind(value),
-            };
+    Ok(SqliteInlinedRead {
+        sql,
+        binds,
+        decoder: SqliteInlinedDecoder {
+            table: table.to_string(),
+            columns: columns.to_vec(),
+            schema,
+            decode_schema,
+            decode_columns,
+            physical_types,
+            mapping,
+            result_names,
+        },
+    })
+}
+
+impl SqliteInlinedDecoder {
+    /// The row versions `rows` hold; `None` when there are none.
+    fn decode(&self, rows: &[sqlx::sqlite::SqliteRow]) -> Result<Option<DuckLakeInlinedRows>> {
+        if rows.is_empty() {
+            return Ok(None);
         }
+        let row_ids = rows
+            .iter()
+            .map(|row| row.try_get(0))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let snapshots = rows
+            .iter()
+            .map(|row| row.try_get(1))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let end_snapshots = rows
+            .iter()
+            .map(|row| row.try_get(2))
+            .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
+        let batch = self.mapping.adapt(
+            build_inlined_batch(
+                &self.decode_schema,
+                &self.decode_columns,
+                &self.mapping.present(&self.columns),
+                &self.physical_types,
+                rows,
+            )?,
+            Arc::clone(&self.schema),
+            &self.columns,
+        )?;
+        Ok(Some(DuckLakeInlinedRows {
+            table_name: self.table.clone(),
+            row_ids,
+            snapshots,
+            end_snapshots,
+            batch,
+            next_file_id: None,
+        }))
     }
-    let rows = query.fetch_all(&mut *connection).await?;
-    if rows.is_empty() {
-        return Ok(None);
+}
+
+/// Names each temporary table a [`SqliteInlinedRowsCursor`] creates, unique
+/// on any connection.
+static NEXT_INLINED_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A change feed's inlined row versions after a position, streamed inside a
+/// pinned read (see `MetadataProvider::pin_consistent_read`): for each
+/// physical inlined-data table, in name order, the table's whole remaining
+/// selection is written once, in order, into a temporary table keyed by its
+/// position (`INSERT INTO temp... SELECT ... ORDER BY`), and read back a page
+/// at a time by that key. Each table's query therefore runs once however many
+/// pages it spans, where a keyset query per page would scan and sort the
+/// unindexed table once a page.
+///
+/// SQLite has no server-side cursor, and a statement stepped across pages
+/// would keep the pinned connection busy between them, so the other nodes of
+/// the plan reading through the same read would wait on it, and could wait
+/// forever on a node that waits on them. The temporary table lives in SQLite's
+/// temporary storage, not in the plan: a file behind the page cache, unless
+/// the library or the connection keeps temporary storage in memory
+/// (`SQLITE_TEMP_STORE`, `PRAGMA temp_store`), where it holds the whole
+/// remaining selection. It is dropped once read, and rolled back with the
+/// read otherwise.
+pub(crate) struct SqliteInlinedRowsCursor {
+    // A provider bound to the pinned read: every statement runs inside it.
+    provider: SqliteMetadataProvider,
+    request: InlinedCursorRequest,
+    // The tables left to read, listed when the first page is read.
+    tables: Option<std::collections::VecDeque<InlinedPageTable<i64>>>,
+    open: Option<OpenInlinedCursor>,
+    done: bool,
+}
+
+/// The temporary table of the inlined table a [`SqliteInlinedRowsCursor`]
+/// is reading.
+struct OpenInlinedCursor {
+    name: String,
+    next_file_id: i64,
+    decoder: SqliteInlinedDecoder,
+    // The `SELECT` of a page, binding the last position read and the limit.
+    page_sql: String,
+    // The rows read so far: the position of the last.
+    read: i64,
+}
+
+impl SqliteInlinedRowsCursor {
+    async fn read_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        let mut out = Vec::new();
+        if self.done {
+            return Ok(out);
+        }
+        let request = &self.request;
+        if self.tables.is_none() {
+            let tables = self
+                .provider
+                .registered_inlined_tables_and_next_file_id(request.table_id)
+                .await?;
+            self.tables = Some(inlined_page_tables(tables, Some(&request.after)).into());
+        }
+        let ledger = self.provider.schema_version_ledger().await?;
+        let mut connection = self.provider.connection().await?;
+        if !connection.in_read() {
+            return Err(crate::DuckLakeError::Internal(
+                "the catalog read this change feed's inlined rows are read through has ended"
+                    .to_string(),
+            ));
+        }
+        let mut remaining = request.page_rows;
+        while remaining > 0 {
+            if self.open.is_none() {
+                let Some((table, next_file_id, after)) =
+                    self.tables.as_mut().and_then(|tables| tables.pop_front())
+                else {
+                    self.done = true;
+                    break;
+                };
+                let read = prepare_sqlite_inlined_read(
+                    &mut connection,
+                    request.table_id,
+                    &table,
+                    ledger,
+                    &request.columns,
+                    request.selection,
+                    request.filter.as_ref(),
+                    InlinedReadShape::Changes,
+                    Some(InlinedPageBound {
+                        after,
+                        limit: None,
+                    }),
+                )
+                .await?;
+                let name = format!(
+                    "ducklake_inlined_feed_{}",
+                    NEXT_INLINED_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                // Columns without a declared type keep each value exactly as
+                // the `SELECT` returned it; a page reads them back under the
+                // `SELECT`'s own result names.
+                let names = &read.decoder.result_names;
+                let slots: Vec<String> = (0..names.len()).map(|slot| format!("c{slot}")).collect();
+                sqlx::query(AssertSqlSafe(format!(
+                    "CREATE TEMP TABLE {name} (position INTEGER PRIMARY KEY, {})",
+                    slots.join(", ")
+                )))
+                .persistent(false)
+                .execute(&mut *connection)
+                .await?;
+                let insert = format!(
+                    "INSERT INTO temp.{name} ({}) {}",
+                    slots.join(", "),
+                    read.sql
+                );
+                bind_sqlite_inlined_values(
+                    sqlx::query(AssertSqlSafe(insert.as_str())).persistent(false),
+                    &read.binds,
+                )?
+                .execute(&mut *connection)
+                .await?;
+                let selected = slots
+                    .iter()
+                    .zip(names)
+                    .map(|(slot, name)| format!("{slot} AS {}", quote_ident(name)))
+                    .collect::<Vec<_>>();
+                let page_sql = format!(
+                    "SELECT {} FROM temp.{name} WHERE position > ? ORDER BY position LIMIT ?",
+                    selected.join(", ")
+                );
+                self.open = Some(OpenInlinedCursor {
+                    name,
+                    next_file_id,
+                    decoder: read.decoder,
+                    page_sql,
+                    read: 0,
+                });
+            }
+            let Some(open) = &mut self.open else {
+                break;
+            };
+            // A fresh table numbers its rows 1, 2, ... in insertion order.
+            let rows = sqlx::query(AssertSqlSafe(open.page_sql.as_str()))
+                .persistent(false)
+                .bind(open.read)
+                .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection)
+                .await?;
+            let fetched = rows.len();
+            open.read += i64::try_from(fetched).unwrap_or(i64::MAX);
+            if let Some(mut page) = open.decoder.decode(&rows)? {
+                page.next_file_id = Some(open.next_file_id);
+                out.push(page);
+            }
+            if fetched < remaining {
+                // The table is read to its end.
+                sqlx::query(AssertSqlSafe(format!("DROP TABLE temp.{}", open.name)))
+                    .persistent(false)
+                    .execute(&mut *connection)
+                    .await?;
+                self.open = None;
+            }
+            remaining -= fetched;
+        }
+        Ok(out)
     }
-    let row_ids = rows
-        .iter()
-        .map(|row| row.try_get(0))
-        .collect::<std::result::Result<Vec<i64>, _>>()?;
-    let snapshots = rows
-        .iter()
-        .map(|row| row.try_get(1))
-        .collect::<std::result::Result<Vec<i64>, _>>()?;
-    let end_snapshots = rows
-        .iter()
-        .map(|row| row.try_get(2))
-        .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
-    let batch = mapping.adapt(
-        build_inlined_batch(
-            &decode_schema,
-            &decode_columns,
-            &mapping.present(columns),
-            &physical_types,
-            &rows,
-        )?,
-        schema,
-        columns,
-    )?;
-    Ok(Some(DuckLakeInlinedRows {
-        table_name: table.to_string(),
-        row_ids,
-        snapshots,
-        end_snapshots,
-        batch,
-        next_file_id: None,
-    }))
+}
+
+impl InlinedRowsCursor for SqliteInlinedRowsCursor {
+    fn next_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(self.read_page())
+    }
 }
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
@@ -1085,9 +1370,53 @@ impl SqliteMetadataProvider {
                 selection,
                 filter,
                 shape,
+                None,
             )
             .await?
             {
+                rows.next_file_id = Some(next_file_id);
+                out.push(rows);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One page of [`Self::read_inlined_rows_sqlite`]'s change-feed read. See
+    /// [`MetadataProvider::read_inlined_rows_page`].
+    async fn read_inlined_rows_page_sqlite(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        let mut out = Vec::new();
+        let ledger = self.schema_version_ledger().await?;
+        let mut remaining = limit;
+        for (table, next_file_id, after) in inlined_page_tables(
+            self.registered_inlined_tables_and_next_file_id(table_id)
+                .await?,
+            after,
+        ) {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(mut rows) = read_sqlite_inlined_table(
+                &mut *self.connection().await?,
+                table_id,
+                &table,
+                ledger,
+                columns,
+                selection,
+                filter,
+                InlinedReadShape::Changes,
+                Some(InlinedPageBound::new(after, limit, remaining)),
+            )
+            .await?
+            {
+                remaining = remaining.saturating_sub(rows.row_ids.len());
                 rows.next_file_id = Some(next_file_id);
                 out.push(rows);
             }
@@ -1222,6 +1551,97 @@ impl MetadataProvider for SqliteMetadataProvider {
         Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
             Ok(block_on(read.commit())?)
         })))
+    }
+
+    /// One pooled connection inside `BEGIN`, in WAL mode only, and only when
+    /// its snapshot shows the catalog the open read shows.
+    ///
+    /// SQLite cannot hand a snapshot to another connection, so the new read
+    /// takes its own and compares it: SQLite commits one writer at a time, and
+    /// a commit that changes a table's inlined row versions adds a snapshot
+    /// (an insert, a delete or update, a flush) or removes some (expiring
+    /// them), so two reads that find the same latest snapshot and the same
+    /// number of snapshots read the same row versions. When a commit falls
+    /// between the two, the read is not pinned.
+    ///
+    /// In rollback-journal mode the read would hold a shared lock that a
+    /// writer's commit waits on for as long as the read lasts, so it is not
+    /// pinned either. In WAL mode a writer commits beside it; the read only
+    /// keeps the log from being checkpointed past its snapshot until it ends.
+    ///
+    /// Nor is it pinned on a connection that refuses writes (`PRAGMA
+    /// query_only`): its pages stream from a temporary table, which such a
+    /// connection cannot create.
+    ///
+    /// Nor is it pinned when every connection the pool may hold is taken: it
+    /// does not wait for an idle connection, though it can wait briefly when
+    /// it races another task for the pool's last free place and loses
+    /// (`ReadTransaction::try_begin`).
+    fn pin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        let Some(read) = self.read.as_ref().filter(|read| read.is_open()) else {
+            return Ok(None);
+        };
+        const STATE: &str = "SELECT COALESCE(MAX(snapshot_id), 0), COUNT(*) FROM ducklake_snapshot";
+        let pinned = block_on(async {
+            let state: (i64, i64) = {
+                let Some(mut connection) = read.connection().await else {
+                    return Ok(None);
+                };
+                sqlx::query_as(STATE).fetch_one(&mut *connection).await?
+            };
+            let Some(pinned) = ReadTransaction::try_begin(&self.pool, &["BEGIN"]).await else {
+                return Ok(None);
+            };
+            {
+                let Some(mut connection) = pinned.connection().await else {
+                    return Ok(None);
+                };
+                let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if !mode.eq_ignore_ascii_case("wal") {
+                    return Ok(None);
+                }
+                let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if query_only != 0 {
+                    return Ok(None);
+                }
+                let pinned_state: (i64, i64) =
+                    sqlx::query_as(STATE).fetch_one(&mut *connection).await?;
+                if pinned_state != state {
+                    return Ok(None);
+                }
+            }
+            Ok::<_, crate::DuckLakeError>(Some(pinned))
+        })?;
+        let Some(pinned) = pinned else {
+            return Ok(None);
+        };
+        let pinned = Arc::new(pinned);
+        let provider = Self {
+            read: Some(Arc::clone(&pinned)),
+            ..self.clone()
+        };
+        let cursor: OpenInlinedRowsCursor = {
+            let provider = provider.clone();
+            Arc::new(move |request| {
+                Ok(Box::new(SqliteInlinedRowsCursor {
+                    provider: provider.clone(),
+                    request,
+                    tables: None,
+                    open: None,
+                    done: false,
+                }) as Box<dyn InlinedRowsCursor>)
+            })
+        };
+        // Rolled back rather than committed, which drops every temporary
+        // table a cursor left behind with the read.
+        Ok(Some(
+            ConsistentRead::new(Arc::new(provider), move || Ok(block_on(pinned.rollback())?))
+                .with_inlined_cursor(cursor),
+        ))
     }
 
     fn get_current_snapshot(&self) -> Result<i64> {
@@ -2217,6 +2637,47 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn get_data_file_column_statistics(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+    ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
+        block_on(async {
+            let mut out = Vec::new();
+            for ids in data_file_ids.chunks(crate::metadata_provider::FILE_STATISTICS_ID_CHUNK) {
+                let placeholders = vec!["?"; ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT data_file_id, column_id, column_size_bytes, value_count,
+                            null_count, min_value, max_value, contains_nan
+                     FROM ducklake_file_column_stats
+                     WHERE table_id = ? AND data_file_id IN ({placeholders})"
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(table_id);
+                for id in ids {
+                    query = query.bind(*id);
+                }
+                let rows = match query.fetch_all(&mut *self.connection().await?).await {
+                    Ok(rows) => rows,
+                    Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                    Err(error) => return Err(error.into()),
+                };
+                for row in rows {
+                    out.push(DuckLakeFileColumnStatistics {
+                        data_file_id: row.try_get(0)?,
+                        column_id: row.try_get(1)?,
+                        column_size_bytes: row.try_get(2)?,
+                        value_count: row.try_get(3)?,
+                        null_count: row.try_get(4)?,
+                        min_value: row.try_get(5)?,
+                        max_value: row.try_get(6)?,
+                        contains_nan: row.try_get(7)?,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_inlined_data(
         &self,
         table_id: i64,
@@ -2467,6 +2928,20 @@ impl MetadataProvider for SqliteMetadataProvider {
         ))
     }
 
+    fn read_inlined_rows_page(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(
+            self.read_inlined_rows_page_sqlite(table_id, columns, selection, filter, after, limit),
+        )
+    }
+
     fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
         let ledger = block_on(self.schema_version_ledger())?;
         let mut oldest: Option<i64> = None;
@@ -2563,6 +3038,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     InlinedRowSelection::WrittenUpTo(snapshot_id),
                     None,
                     InlinedReadShape::Flush,
+                    None,
                 )
                 .await
             })? {
@@ -3172,7 +3648,8 @@ impl MetadataProvider for SqliteMetadataProvider {
                     data.encryption_key,
                     data.row_id_start,
                     {pm},
-                    data.mapping_id
+                    data.mapping_id,
+                    data.data_file_id
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = ?1
                   AND data.begin_snapshot <= ?3
@@ -3198,6 +3675,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
                         mapping_id: row.try_get(8)?,
+                        data_file_id: row.try_get(9)?,
                     })
                 })
                 .collect()

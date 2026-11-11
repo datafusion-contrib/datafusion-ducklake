@@ -25,6 +25,9 @@
 //! here: the extension the tests run fails its history (a flush of inlined
 //! deletions and two `DELETE`s in one transaction) with an internal error, and
 //! this crate's writers commit no such transaction.
+//!
+//! One history more checks the feeds this crate reads a page of inlined rows
+//! at a time against official's own feeds over the same catalog.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "metadata-duckdb"))]
 
@@ -598,6 +601,88 @@ async fn inlined_deletes_then_delete_rest(metadata: &Metadata, data: &Path) {
     assert!(of_files(&[], (0, d3)).is_empty());
 }
 
+/// Inlined inserts, then inline deletes and updates of inlined rows (inlining
+/// limit 10): the feeds this crate reads over official's catalog, a page of 2
+/// inlined rows at a time and in one page, answer as official's own. On
+/// PostgreSQL, a catalog read can be pinned, so the paged feeds stream their
+/// pages at execution.
+async fn inlined_rows_in_pages(metadata: &Metadata, data: &Path) {
+    // `ducklake_{function}` of `t` over the window, each row its cells joined
+    // by `|`, on both sides.
+    let queries = |(a, b): (i64, i64), args: &str| {
+        [
+            ("table_insertions", "concat_ws('|', id, v)"),
+            ("table_deletions", "concat_ws('|', id, v)"),
+            (
+                "table_changes",
+                "concat_ws('|', snapshot_id, rowid, change_type, id, v)",
+            ),
+        ]
+        .map(|(function, select)| {
+            format!("SELECT {select} FROM ducklake_{function}({args}, {a}, {b})")
+        })
+    };
+    let (window, expected) = {
+        let official = Official::attach(metadata, data, 10);
+        official.run("CREATE TABLE dl.t (id INTEGER, v VARCHAR)");
+        let created = official.head();
+        for start in (0..24).step_by(4) {
+            official.run(&format!(
+                "INSERT INTO dl.t SELECT i, 'v' || i FROM range({start}, {}) r(i)",
+                start + 4
+            ));
+        }
+        official.run("DELETE FROM dl.t WHERE id % 3 = 0");
+        official.run("UPDATE dl.t SET v = 'u' || id WHERE id % 3 = 1");
+        let window = (created + 1, official.head());
+        let expected = queries(window, "'dl', 'main', 't'").map(|sql| {
+            let mut lines =
+                crate::inlined_mutation_differential_tests::query_lines(&official.connection, &sql);
+            lines.sort();
+            lines
+        });
+        (window, expected)
+    };
+    // The 24 rows inserted and the 8 an update wrote.
+    assert_eq!(expected[0].len(), 32, "{:?}", expected[0]);
+    for batch_size in [2, 8192] {
+        let provider = crate_provider(metadata).await;
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_batch_size(batch_size),
+        );
+        register_ducklake_functions(&ctx, provider);
+        for (sql, want) in queries(window, "'main.t'").iter().zip(&expected) {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e}"))
+                .create_physical_plan()
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+            if batch_size == 2 && matches!(metadata, Metadata::Postgres(_)) {
+                assert!(streams_pages(&plan), "`{sql}`: the pages are not streamed");
+            }
+            let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+            let mut got = Vec::new();
+            for batch in &batches {
+                for row in 0..batch.num_rows() {
+                    got.push(array_value_to_string(batch.column(0), row).unwrap());
+                }
+            }
+            got.sort();
+            assert_eq!(&got, want, "batch size {batch_size}, `{sql}`");
+        }
+    }
+}
+
+/// Whether some node of `plan` reads inlined rows a page at a time at
+/// execution.
+fn streams_pages(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> bool {
+    plan.name() == "InlinedPagesExec" || plan.children().into_iter().any(streams_pages)
+}
+
 fn data_dir(dir: &Path, name: &str) -> std::path::PathBuf {
     let data = dir.join(format!("{name}_data"));
     std::fs::create_dir_all(&data).unwrap();
@@ -649,6 +734,7 @@ official_history!(rewrite_data_files);
 official_history!(rewrite_merged_twice);
 official_history!(rewritten_inlined_deletes);
 official_history!(inlined_deletes_then_delete_rest);
+official_history!(inlined_rows_in_pages);
 
 // ---------------------------------------------------------------------------
 // Histories written by this crate

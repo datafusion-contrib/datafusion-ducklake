@@ -2857,6 +2857,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
                         mapping_id: row.try_get(8)?,
+                        data_file_id: None,
                     })
                 })
                 .collect()

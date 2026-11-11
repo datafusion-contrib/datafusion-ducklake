@@ -1421,6 +1421,135 @@ impl InlinedRowSelection {
     }
 }
 
+/// Where a paged read of inlined row versions
+/// ([`MetadataProvider::read_inlined_rows_page`]) resumes: after the row
+/// version `(snapshot_id, row_id)` of the physical inlined-data table
+/// `table_name`, in the order such a read returns them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InlinedRowsAfter {
+    /// The physical inlined-data table of the last row version read.
+    pub table_name: String,
+    /// That version's reported snapshot (see [`DuckLakeInlinedRows::snapshots`]).
+    pub snapshot_id: i64,
+    /// That version's row id.
+    pub row_id: i64,
+}
+
+impl InlinedRowsAfter {
+    pub fn new(table_name: impl Into<String>, snapshot_id: i64, row_id: i64) -> Self {
+        Self {
+            table_name: table_name.into(),
+            snapshot_id,
+            row_id,
+        }
+    }
+
+    /// The position after the last row version of `rows`, the last entry of a
+    /// page; `None` when it holds none.
+    pub fn after_last(rows: &[DuckLakeInlinedRows]) -> Option<Self> {
+        let last = rows.iter().rev().find(|rows| !rows.row_ids.is_empty())?;
+        Some(Self::new(
+            last.table_name.clone(),
+            *last.snapshots.last()?,
+            *last.row_ids.last()?,
+        ))
+    }
+}
+
+/// One page of a paged inlined-row read in one physical table: the versions
+/// after `after` (`(reported snapshot, row id)`), at most `limit` of them (all
+/// of them when `None`), in that order. See
+/// [`MetadataProvider::read_inlined_rows_page`].
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlinedPageBound {
+    pub(crate) after: Option<(i64, i64)>,
+    pub(crate) limit: Option<usize>,
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+impl InlinedPageBound {
+    /// The keyset conjunct, ` AND (snapshot, row_id) > (first, second)`, or
+    /// nothing on the first page.
+    pub(crate) fn predicate(
+        &self,
+        system: &InlinedSystemColumns,
+        selection: InlinedRowSelection,
+        first: &str,
+        second: &str,
+    ) -> String {
+        match self.after {
+            Some(_) => format!(
+                " AND ({}, {}) > ({first}, {second})",
+                selection.snapshot_column(system),
+                system.row_id
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// The order a page is read in: the keyset's.
+    pub(crate) fn order_by(
+        &self,
+        system: &InlinedSystemColumns,
+        selection: InlinedRowSelection,
+    ) -> String {
+        format!("{}, {}", selection.snapshot_column(system), system.row_id)
+    }
+
+    /// The limit, as a SQL bind value; `None` when the read has none.
+    pub(crate) fn limit_value(&self) -> Option<i64> {
+        self.limit
+            .map(|limit| i64::try_from(limit).unwrap_or(i64::MAX))
+    }
+
+    /// The bound of a page of at most `limit` versions, `remaining` of which
+    /// are left to read; no limit when `limit` is `usize::MAX`, which reads
+    /// the rest of the selection in one statement.
+    pub(crate) fn new(after: Option<(i64, i64)>, limit: usize, remaining: usize) -> Self {
+        Self {
+            after,
+            limit: (limit != usize::MAX).then_some(remaining),
+        }
+    }
+}
+
+/// A physical table of a paged inlined-row read: its name, what the caller
+/// carries with it, and the keyset it is read after.
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+pub(crate) type InlinedPageTable<T> = (String, T, Option<(i64, i64)>);
+
+/// Split a paged inlined-row read over `tables` (each a physical table's name
+/// and whatever the caller carries with it): the tables in name order, each
+/// with the page bound to read it with, from the table `after` names on. The
+/// caller reads them in turn, lowering `limit` by what each returned, and stops
+/// at zero.
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+pub(crate) fn inlined_page_tables<T>(
+    mut tables: Vec<(String, T)>,
+    after: Option<&InlinedRowsAfter>,
+) -> Vec<InlinedPageTable<T>> {
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+    tables
+        .into_iter()
+        .filter_map(|(name, extra)| match after {
+            None => Some((name, extra, None)),
+            Some(after) => match name.as_str().cmp(after.table_name.as_str()) {
+                std::cmp::Ordering::Less => None,
+                std::cmp::Ordering::Equal => {
+                    Some((name, extra, Some((after.snapshot_id, after.row_id))))
+                },
+                std::cmp::Ordering::Greater => Some((name, extra, None)),
+            },
+        })
+        .collect()
+}
+
+/// How many data file ids one statement of
+/// [`MetadataProvider::get_data_file_column_statistics`] binds.
+pub(crate) const FILE_STATISTICS_ID_CHUNK: usize = 500;
+
 /// Number of columns [`InlinedRowSelection::system_select`] puts before the
 /// data columns of an inlined-row query.
 pub(crate) const INLINED_SYSTEM_SELECT_WIDTH: usize = 3;
@@ -2509,6 +2638,11 @@ pub struct DataFileChange {
     /// rows outside the query window filtered out. `None` for ordinary files
     /// (all rows belong to `begin_snapshot`).
     pub partial_max: Option<i64>,
+    /// The file's catalog id (`data_file_id`), or `None` when the provider
+    /// does not report it. A change feed looks up the file's column
+    /// statistics by it ([`MetadataProvider::get_data_file_column_statistics`])
+    /// to skip files a filter cannot match; without it every file is read.
+    pub data_file_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2894,6 +3028,28 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         self.get_table_file_metadata_page(table_id, snapshot_id, after_data_file_id, limit)
     }
 
+    /// The catalog column statistics (`ducklake_file_column_stats`) of the data
+    /// files `data_file_ids` of `table_id`, whatever snapshots they are visible
+    /// at: a change feed reads files that have since been deleted or merged
+    /// away. Rows of ids that name no file, or no file of the table, are not
+    /// returned; neither is any order promised.
+    ///
+    /// The change feeds prune the data files of their window with them: a file
+    /// whose statistics prove it holds no row a filter can match is not read.
+    /// Returning fewer rows (or none) only prunes less. Rows that misstate a
+    /// file lose rows silently, as they would for a table scan, which prunes
+    /// with the same statistics.
+    ///
+    /// The default returns none, which keeps external providers working
+    /// unchanged and makes their feeds read every file.
+    fn get_data_file_column_statistics(
+        &self,
+        _table_id: i64,
+        _data_file_ids: &[i64],
+    ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
+        Ok(Vec::new())
+    }
+
     /// Read rows that DuckDB's *data-inlining* optimization stored directly in
     /// the catalog database (not in Parquet), for `table_id` visible at
     /// `snapshot_id`, materialized as Arrow batches in `columns`' physical
@@ -3172,6 +3328,48 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         }
     }
 
+    /// One page of [`Self::read_inlined_rows`] for a change feed's
+    /// [`InlinedRowSelection::InsertedBetween`] or
+    /// [`InlinedRowSelection::DeletedBetween`]: at most `limit` row versions,
+    /// those after `after` (from the start when `None`).
+    ///
+    /// The versions come in one total order: physical inlined-data tables by
+    /// name, and each table's versions by `(reported snapshot, row id)`, a pair
+    /// that names one version (a version ends only where the one superseding
+    /// it begins, and a version that begins and ends in one snapshot is never
+    /// written). [`InlinedRowsAfter::after_last`] of a page is where the next
+    /// one starts; a page shorter than `limit` is the last.
+    ///
+    /// Consecutive pages are separate reads. What keeps them one state of the
+    /// catalog is the caller's: the change feeds read every page of a
+    /// selection inside one consistent read, the plan's or one pinned to its
+    /// state ([`Self::pin_consistent_read`]), since a flush committed between
+    /// two pages moves the window's row versions out of the inlined tables.
+    /// Each call is a query of its own, and the inlined-data tables have no
+    /// index on the order: a page scans the tables it reads whole. The change
+    /// feeds read their first page with this, and the rest with one call of
+    /// `limit` `usize::MAX` (no limit), or, through a read pinned by a
+    /// built-in provider, from one statement per inlined table.
+    ///
+    /// The default reads the whole selection as the first page, ignoring
+    /// `limit`, and returns nothing after it: correct, but not bounded. The
+    /// built-in SQLite and PostgreSQL providers page in the catalog query.
+    fn read_inlined_rows_page(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        let _ = limit;
+        match after {
+            None => self.read_inlined_rows(table_id, columns, selection, filter),
+            Some(_) => Ok(Vec::new()),
+        }
+    }
+
     /// Inlined deletions of Parquet-resident rows of `table_id`
     /// (`ducklake_inlined_delete_<table_id>`) made in the inclusive window, each
     /// with the data file it applies to, ordered by data file and position.
@@ -3442,6 +3640,42 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     fn begin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
         Ok(None)
     }
+
+    /// Begin a consistent read, on a catalog connection of its own, that sees
+    /// the catalog exactly as the open consistent read this provider is bound
+    /// to sees it, and that outlives that read: it stays open until the
+    /// returned read ends or its last handle drops.
+    ///
+    /// A change feed reads the pages of its inlined row versions after the
+    /// first through one while its plan executes, so a flush that commits
+    /// after planning moves no row out from under the pages, as official
+    /// DuckLake reads a whole feed in one transaction.
+    ///
+    /// The read holds one catalog connection, inside an open transaction,
+    /// from the feed's planning until its plan has executed to its last page,
+    /// failed, or been dropped: a plan built and executed later, or a feed
+    /// read slowly, holds it all that time. That connection counts against the
+    /// pool the caller sized for its queries, and the database keeps the row
+    /// versions the read shows until it ends. A server timeout on idle
+    /// transactions (PostgreSQL's `idle_in_transaction_session_timeout`) that
+    /// is shorter than the gap between planning and execution, or between two
+    /// pages, ends the read, and the feed fails with the error.
+    ///
+    /// Returns `None` when this provider is not bound to an open consistent
+    /// read, or cannot begin one at that state with only a read snapshot,
+    /// holding nothing a writer waits on. Returns `None` as well when no
+    /// catalog connection is free: the read is an optimisation, so when every
+    /// connection the pool may hold is taken it does not wait for an idle
+    /// one, and a busy pool never fails the query that asked. It can still
+    /// wait briefly when it races another task for the pool's last free
+    /// place and loses, as any acquire would. The caller then
+    /// reads what it needs inside the open read. The default returns `None`.
+    ///
+    /// A wrapping provider forwards this as it forwards
+    /// [`Self::begin_consistent_read`], wrapping the read it gets back.
+    fn pin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        Ok(None)
+    }
 }
 
 /// The catalog reads [`MetadataProvider::begin_consistent_read`] began: a
@@ -3460,6 +3694,77 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 pub struct ConsistentRead {
     provider: Arc<dyn MetadataProvider>,
     end: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,
+    // How a change feed streams its inlined row versions through this read,
+    // when its provider can do better than one keyset query per page.
+    inlined_cursor: Option<OpenInlinedRowsCursor>,
+}
+
+/// What a change feed reads through an [`InlinedRowsCursor`]: the inlined
+/// row versions of `table_id` that `selection` picks (narrowed by `filter`),
+/// after `after` in the order of [`MetadataProvider::read_inlined_rows_page`],
+/// `page_rows` at a time.
+#[derive(Debug, Clone)]
+pub(crate) struct InlinedCursorRequest {
+    pub(crate) table_id: i64,
+    pub(crate) columns: Arc<Vec<DuckLakeTableColumn>>,
+    pub(crate) selection: InlinedRowSelection,
+    pub(crate) filter: Option<InlinedFilter>,
+    pub(crate) after: InlinedRowsAfter,
+    pub(crate) page_rows: usize,
+}
+
+/// The pages of an [`InlinedCursorRequest`], in order.
+pub(crate) trait InlinedRowsCursor: Send {
+    /// The next page: `page_rows` versions, fewer only for the last page
+    /// (none once every version has been read).
+    fn next_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>>;
+}
+
+/// Opens an [`InlinedRowsCursor`] inside a [`ConsistentRead`].
+pub(crate) type OpenInlinedRowsCursor =
+    Arc<dyn Fn(InlinedCursorRequest) -> Result<Box<dyn InlinedRowsCursor>> + Send + Sync>;
+
+/// The cursor of a catalog with no inlined-data tables.
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+pub(crate) struct NoInlinedRows;
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-sqlite"))]
+impl InlinedRowsCursor for NoInlinedRows {
+    fn next_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        Ok(Vec::new())
+    }
+}
+
+/// The cursor of a read whose provider has no cursor of its own: one
+/// [`MetadataProvider::read_inlined_rows_page`] per page, each resuming after
+/// the last version of the page before.
+struct KeysetInlinedRowsCursor {
+    provider: Arc<dyn MetadataProvider>,
+    request: InlinedCursorRequest,
+    // Where the next page starts; `None` once the last page was read.
+    after: Option<InlinedRowsAfter>,
+}
+
+impl InlinedRowsCursor for KeysetInlinedRowsCursor {
+    fn next_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        let Some(after) = self.after.take() else {
+            return Ok(Vec::new());
+        };
+        let request = &self.request;
+        let rows = self.provider.read_inlined_rows_page(
+            request.table_id,
+            &request.columns,
+            request.selection,
+            request.filter.as_ref(),
+            Some(&after),
+            request.page_rows,
+        )?;
+        let read: usize = rows.iter().map(|rows| rows.row_ids.len()).sum();
+        if read >= request.page_rows {
+            self.after = InlinedRowsAfter::after_last(&rows);
+        }
+        Ok(rows)
+    }
 }
 
 impl ConsistentRead {
@@ -3474,6 +3779,7 @@ impl ConsistentRead {
         Self {
             provider,
             end: Some(Box::new(end)),
+            inlined_cursor: None,
         }
     }
 
@@ -3483,12 +3789,46 @@ impl ConsistentRead {
         Self {
             provider,
             end: None,
+            inlined_cursor: None,
         }
     }
 
     /// The provider every read of this one goes through.
     pub fn provider(&self) -> &Arc<dyn MetadataProvider> {
         &self.provider
+    }
+
+    /// This read, streaming a change feed's inlined row versions with `open`
+    /// rather than with one keyset query per page.
+    #[cfg_attr(
+        not(any(feature = "metadata-postgres", feature = "metadata-sqlite")),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_inlined_cursor(mut self, open: OpenInlinedRowsCursor) -> Self {
+        self.inlined_cursor = Some(open);
+        self
+    }
+
+    /// How this read streams inlined row versions, for a read that wraps it.
+    pub(crate) fn inlined_cursor(&self) -> Option<&OpenInlinedRowsCursor> {
+        self.inlined_cursor.as_ref()
+    }
+
+    /// The pages of `request`, read inside this read: through the cursor its
+    /// provider streams them with, else one
+    /// [`MetadataProvider::read_inlined_rows_page`] per page.
+    pub(crate) fn open_inlined_rows_cursor(
+        &self,
+        request: InlinedCursorRequest,
+    ) -> Result<Box<dyn InlinedRowsCursor>> {
+        match &self.inlined_cursor {
+            Some(open) => open(request),
+            None => Ok(Box::new(KeysetInlinedRowsCursor {
+                provider: Arc::clone(&self.provider),
+                after: Some(request.after.clone()),
+                request,
+            })),
+        }
     }
 
     /// End the read. Reads through [`Self::provider`] after this see the
@@ -3506,6 +3846,7 @@ impl std::fmt::Debug for ConsistentRead {
         f.debug_struct("ConsistentRead")
             .field("provider", &self.provider)
             .field("ends", &self.end.is_some())
+            .field("inlined_cursor", &self.inlined_cursor.is_some())
             .finish()
     }
 }

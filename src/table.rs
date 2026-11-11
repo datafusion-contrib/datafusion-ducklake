@@ -7480,6 +7480,83 @@ fn restate_in_physical_row_space(
     }
 }
 
+/// The ids of the data files of `files` (each with its catalog id) whose
+/// catalog column statistics prove they hold no row matching every one of
+/// `predicates`, built against `schema` (the catalog columns `columns`).
+///
+/// A change feed reads a data file's rows whatever was deleted from it since,
+/// so each file's recorded bounds describe exactly the rows the feed reads
+/// from it (a superset, for a merged partial file it reads a window of): the
+/// statistics are built as for a file without deletes, by the table scan's own
+/// [`build_datafusion_statistics`], and pruned on by its
+/// [`FilePruningStatistics`]. The row count is left unknown rather than taken
+/// from a column's `value_count`, so null-count pruning never rests on it. Any
+/// pruning error prunes nothing.
+pub(crate) fn feed_files_pruned_by_statistics(
+    schema: &SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    files: &[(i64, &crate::metadata_provider::DataFileChange)],
+    statistics: Vec<DuckLakeFileColumnStatistics>,
+    predicates: &[PruningPredicate],
+) -> Vec<i64> {
+    if files.is_empty() || predicates.is_empty() {
+        return Vec::new();
+    }
+    let table_files: Vec<DuckLakeTableFile> = files
+        .iter()
+        .map(|(data_file_id, file)| {
+            let mut table_file = DuckLakeTableFile::new(DuckLakeFileData::new(
+                file.path.clone(),
+                file.path_is_relative,
+                file.file_size_bytes,
+            ));
+            table_file.data_file_id = *data_file_id;
+            table_file
+        })
+        .collect();
+    let (_, mut by_file) = build_datafusion_statistics(
+        schema.as_ref(),
+        columns,
+        &table_files,
+        DuckLakeStatistics {
+            files: statistics,
+            ..Default::default()
+        },
+        false,
+        false,
+    );
+    let per_file: Vec<Arc<Statistics>> = table_files
+        .iter()
+        .map(|file| {
+            let mut statistics = by_file
+                .remove(&file.data_file_id)
+                .unwrap_or_else(|| Arc::new(Statistics::new_unknown(schema)));
+            Arc::make_mut(&mut statistics).num_rows = Precision::Absent;
+            statistics
+        })
+        .collect();
+    let pruning = FilePruningStatistics::new(per_file, Arc::clone(schema));
+    let mut keep = vec![true; table_files.len()];
+    for predicate in predicates {
+        match predicate.prune(&pruning) {
+            Ok(mask) => {
+                for (keep, matches) in keep.iter_mut().zip(mask) {
+                    *keep &= matches;
+                }
+            },
+            Err(error) => {
+                tracing::debug!(%error, "skipping change-feed file pruning");
+                return Vec::new();
+            },
+        }
+    }
+    table_files
+        .iter()
+        .zip(keep)
+        .filter_map(|(file, keep)| (!keep).then_some(file.data_file_id))
+        .collect()
+}
+
 struct FilePruningStatistics {
     base: PrunableStatistics,
     statistics: Vec<Arc<Statistics>>,

@@ -126,6 +126,7 @@ mod sqllogictest_runner;
 mod table_build_statistics_tests;
 mod table_changes_composition_tests;
 mod table_changes_memory_tests;
+mod table_changes_pushdown_tests;
 mod table_changes_tests;
 mod table_changes_upstream_main_tests;
 mod table_deletions_repartition_tests;

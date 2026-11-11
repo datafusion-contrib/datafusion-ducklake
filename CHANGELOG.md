@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MetadataProvider::get_data_file_column_statistics` and `DataFileChange::data_file_id`: the
+  catalog column statistics of given data files at any snapshot; the default returns none.
+- `MetadataProvider::read_inlined_rows_page` and `InlinedRowsAfter`: read a change feed's
+  inlined row versions a page at a time; the default returns them all as the first page.
+- `MetadataProvider::pin_consistent_read`: a read on a connection of its own that sees an open
+  consistent read's catalog state and outlives it (#394); the default pins nothing.
+- `InsertedRowsExec::file_scans` / `estimated_scan_bytes` and the same on `DeletedRowsExec`: the
+  Parquet scans these change-feed nodes run without exposing them as children, and their bytes.
 - `DuckLakeWriteOptions::encode_parallelism` and `DuckLakeTableWriter::with_encode_parallelism`:
   encode a write's row groups on a pool of several threads, shared by every file, partition and
   lane of the write, and append them to their files in write order. Official's writer (DuckDB's
@@ -27,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails the write for good: every later write and the finish return an error, and nothing commits.
   That holds for every file of a partitioned write, including a partition file that fails while it
   is closed to make room for another partition's.
+- `EncodePool`, `DuckLakeWriteOptions::encode_pool` and `DuckLakeTableWriter::with_encode_pool`:
+  one pool of encoding threads and one memory budget that a caller shares across its writes.
 - `WrittenLeafStats::merge_ordered`: fold in the stats of rows written after the ones covered, as
   one pass over all of them would, except that a string or blob bound truncated short of a value's
   256th byte combines as the later rows' own bound.
@@ -134,6 +144,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ducklake_table_insertions` and the rows `ducklake_table_changes` reports skip the data files
+  and row groups a filter rules out, with unchanged answers; official prunes no feed's files.
+- The change feeds read a window's inlined rows in pages of the session's `batch_size`; a plan
+  streaming them holds a catalog connection until it finishes, and executes only once (#394).
 - The change feeds stream their rows instead of collecting the window first, and pair updates
   with hash joins whose memory is charged to the memory pool. **BREAKING**: `InsertedRowsExec`
   replaces `TableChangesExec`. The window's inlined rows and inlined deletions, read from the

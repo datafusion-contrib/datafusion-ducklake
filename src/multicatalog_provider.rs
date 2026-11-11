@@ -28,14 +28,16 @@ use crate::metadata_provider::{
 };
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
-    InlinedFileDeleteChange, InlinedReadShape, InlinedRowSelection,
+    InlinedFileDeleteChange, InlinedReadShape, InlinedRowSelection, InlinedRowsAfter,
 };
 use crate::metadata_provider_postgres::{
     CAPABILITY_BITS, CONSISTENT_READ_BEGIN, CapabilityMemo, InlinedDeletionTables,
-    PostgresStatsDialect, StatsFilterSql, delete_file_begin_snapshot_on, fetch_data_file_page,
-    first_inlined_snapshot_on, inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on,
-    inlined_table_for_flush_on, inlined_version_snapshot_on, missing_table_as_none,
-    partition_count_facts_on, read_inlined_rows_on, registered_inlined_tables_on,
+    PostgresStatsDialect, SnapshotExportProbe, StatsFilterSql, begin_read_at_snapshot_of,
+    delete_file_begin_snapshot_on, fetch_data_file_page, file_column_statistics_on,
+    file_column_statistics_row, first_inlined_snapshot_on, inlined_file_deletes_between_on,
+    inlined_file_deletes_for_flush_on, inlined_rows_cursor_opener, inlined_table_for_flush_on,
+    inlined_version_snapshot_on, missing_table_as_none, partition_count_facts_on,
+    read_inlined_rows_on, read_inlined_rows_page_on, registered_inlined_tables_on,
     scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
@@ -422,13 +424,17 @@ pub struct MulticatalogProvider {
     // Set once the store's layout version is found readable (see
     // `require_readable`). Shared across clones.
     readable: Arc<tokio::sync::OnceCell<()>>,
+    // Whether the server exports snapshots, once probed (see
+    // `SnapshotExportProbe`). Shared across clones.
+    snapshot_export: Arc<SnapshotExportProbe>,
 }
 
 /// A consistent read of a [`MulticatalogProvider`]: a transaction on a pooled
 /// connection of its own, or on the provider's read session.
 #[derive(Debug)]
 enum MulticatalogRead {
-    Pooled(ReadTransaction<Postgres>),
+    // An `Arc` so a change feed's cursor can hold the read it streams in.
+    Pooled(Arc<ReadTransaction<Postgres>>),
     Session(SessionRead),
 }
 
@@ -594,6 +600,7 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::default(),
+            snapshot_export: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read_session: None,
             consistent: None,
@@ -618,6 +625,7 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::default(),
+            snapshot_export: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read_session: None,
             consistent: None,
@@ -1350,9 +1358,9 @@ impl MetadataProvider for MulticatalogProvider {
                     }));
                 }
             }
-            Ok(MulticatalogRead::Pooled(
+            Ok(MulticatalogRead::Pooled(Arc::new(
                 ReadTransaction::begin(&self.pool, &[CONSISTENT_READ_BEGIN]).await?,
-            ))
+            )))
         })?;
         let read = Arc::new(read);
         let provider = Self {
@@ -1362,6 +1370,49 @@ impl MetadataProvider for MulticatalogProvider {
         Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
             Ok(block_on(read.end())?)
         })))
+    }
+
+    /// A pooled connection of its own, never the read session's, inside a
+    /// read-only `REPEATABLE READ` transaction that imports the snapshot of
+    /// the open read, so the pinned read outlives the session too (see
+    /// `begin_read_at_snapshot_of`).
+    fn pin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        let Some(read) = self.consistent.as_deref() else {
+            return Ok(None);
+        };
+        let pinned = block_on(async {
+            if !read.is_open().await {
+                return Ok(None);
+            }
+            self.on_connection_in_transaction(async |connection, in_transaction| {
+                if !in_transaction {
+                    return Ok(None);
+                }
+                begin_read_at_snapshot_of(connection, &self.pool, &self.snapshot_export).await
+            })
+            .await
+        })?;
+        let Some(pinned) = pinned else {
+            return Ok(None);
+        };
+        let transaction = Arc::new(pinned);
+        let pinned = Arc::new(MulticatalogRead::Pooled(Arc::clone(&transaction)));
+        let provider = Self {
+            consistent: Some(Arc::clone(&pinned)),
+            read_session: None,
+            ..self.clone()
+        };
+        let cursor = {
+            let provider = provider.clone();
+            inlined_rows_cursor_opener(transaction, Some(self.catalog_id), move || {
+                let caps = block_on(provider.schema_capabilities())?;
+                Ok(caps.inlined_data_tables.then(|| caps.ledger()))
+            })
+        };
+        Ok(Some(
+            ConsistentRead::new(Arc::new(provider), move || Ok(block_on(pinned.end())?))
+                .with_inlined_cursor(cursor),
+        ))
     }
 
     fn get_current_snapshot(&self) -> Result<i64> {
@@ -2184,6 +2235,29 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
+    fn get_data_file_column_statistics(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+    ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            let mut out = Vec::new();
+            for ids in data_file_ids.chunks(crate::metadata_provider::FILE_STATISTICS_ID_CHUNK) {
+                let rows = self
+                    .read_if_present(caps.file_column_stats, async |connection| {
+                        file_column_statistics_on(connection, table_id, ids).await
+                    })
+                    .await?
+                    .unwrap_or_default();
+                for row in rows {
+                    out.push(file_column_statistics_row(&row)?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         block_on(async {
             let caps = self.schema_capabilities().await?;
@@ -2376,6 +2450,39 @@ impl MetadataProvider for MulticatalogProvider {
             filter,
             InlinedReadShape::Changes,
         )
+    }
+
+    fn read_inlined_rows_page(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            if !caps.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let ledger = caps.ledger();
+            self.on_connection(async |connection| {
+                read_inlined_rows_page_on(
+                    connection,
+                    ledger,
+                    Some(self.catalog_id),
+                    table_id,
+                    columns,
+                    selection,
+                    filter,
+                    after,
+                    limit,
+                )
+                .await
+            })
+            .await
+        })
     }
 
     fn get_inlined_file_deletes_between(
@@ -3148,7 +3255,8 @@ impl MetadataProvider for MulticatalogProvider {
                     data.encryption_key,
                     data.row_id_start,
                     {pm},
-                    data.mapping_id
+                    data.mapping_id,
+                    data.data_file_id
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = $1
                   AND data.begin_snapshot <= $3
@@ -3174,6 +3282,7 @@ impl MetadataProvider for MulticatalogProvider {
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
                         mapping_id: row.try_get(8)?,
+                        data_file_id: row.try_get(9)?,
                     })
                 })
                 .collect()

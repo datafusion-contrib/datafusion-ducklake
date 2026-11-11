@@ -33,7 +33,7 @@ use tempfile::TempDir;
 use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
     ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DuckLakeCatalog, DuckLakeError,
-    DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter, SnapshotCommitMetadata,
+    DuckLakeTableWriter, DuckLakeWriteOptions, EncodePool, MetadataWriter, SnapshotCommitMetadata,
     SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, TableWriteSession, WriteMode,
     WriteSetupResult,
 };
@@ -1756,6 +1756,63 @@ async fn lanes_sharing_an_encode_pool_read_back_in_lane_order() {
     assert_eq!(read_back(&env.conn_str).await, expected);
     let writes = env.store.writes();
     assert!(writes.values().all(|n| *n == 1), "{writes:?}");
+    assert_eq!(env.parquet_on_disk(), env.committed_files().await);
+}
+
+/// Writes at once on one shared encode pool whose budget holds about two of
+/// their row groups, so many row groups are encoded on the threads that
+/// write instead: four lanes of an unpartitioned write, and a partitioned
+/// write with one partition file open at a time. Every row of each reads back
+/// once, in order, with its values.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_sharing_a_small_encode_pool_read_back_as_written() {
+    let env = Env::new(None).await;
+    env.set_per_thread_output("true");
+    create_partitioned_table(&env.writer);
+    // A 64-row group of `t` holds 512 bytes, charged twice that.
+    let pool = EncodePool::try_new(2, 2 * 1024).unwrap();
+
+    let events = events_batches(30);
+    let mut options = rolling_write_options();
+    options.max_row_group_rows = Some(16);
+    let store: Arc<dyn ObjectStore> = env.store.clone();
+    let mut partitioned = DuckLakeTableWriter::new(env.writer.clone(), store)
+        .unwrap()
+        .with_options(&options.with_encode_pool(Arc::clone(&pool)))
+        .with_target_file_size(4 * 1024)
+        .with_max_open_partitions(1)
+        .begin_write(
+            "main",
+            "events",
+            events[0].schema().as_ref(),
+            WriteMode::Append,
+        )
+        .unwrap();
+    let partitioned = tokio::task::spawn_blocking(move || {
+        for batch in &events {
+            partitioned.write_batch(batch).unwrap();
+        }
+        partitioned
+    });
+
+    let schema = table_schema();
+    let input = batches(&schema, 200);
+    let mut session = env
+        .table_writer(4)
+        .with_encode_pool(Arc::clone(&pool))
+        .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    write_in_lanes(&mut session, consecutive_parts(&input, 4)).await;
+
+    let partitioned = partitioned.await.unwrap();
+    let result = session.finish().await.unwrap();
+    assert_eq!(result.records_written as usize, rows_in_order(&input).len());
+    assert_eq!(
+        partitioned.finish().await.unwrap().records_written,
+        30 * 200
+    );
+    assert_eq!(read_back(&env.conn_str).await, rows_in_order(&input));
+    assert_eq!(read_back_events(&env.conn_str).await, events_rows(30));
     assert_eq!(env.parquet_on_disk(), env.committed_files().await);
 }
 
