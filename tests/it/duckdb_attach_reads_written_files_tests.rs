@@ -1785,3 +1785,238 @@ async fn an_append_creating_a_duckdb_table_past_an_expired_base_commits() {
         ["first", "appended", "second"]
     );
 }
+
+/// Run `parts` through `session` split into one lane per part, each lane
+/// written on a blocking thread of its own, all at once, joined in order.
+async fn write_in_lanes(
+    session: &mut datafusion_ducklake::TableWriteSession,
+    parts: Vec<Vec<RecordBatch>>,
+) {
+    let lanes = session.lanes(parts.len()).unwrap();
+    assert_eq!(
+        lanes.len(),
+        parts.len(),
+        "per_thread_output must give one lane per part"
+    );
+    let tasks: Vec<_> = lanes
+        .into_iter()
+        .zip(parts)
+        .map(|(mut lane, part)| {
+            tokio::task::spawn_blocking(move || {
+                for batch in &part {
+                    lane.write_batch(batch).unwrap();
+                }
+                lane
+            })
+        })
+        .collect();
+    let mut joined = Vec::new();
+    for task in tasks {
+        joined.push(task.await.unwrap());
+    }
+    session.join_lanes(joined).unwrap();
+}
+
+/// `(id, region)` batches for ids `range`, `per` rows a batch, regions cycling.
+fn region_batches(range: Range<i32>, per: i32) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    range
+        .clone()
+        .step_by(per as usize)
+        .map(|start| {
+            let ids: Vec<i32> = (start..(start + per).min(range.end)).collect();
+            let regions: Vec<&str> = ids
+                .iter()
+                .map(|id| ["us", "eu", "ap"][(*id % 3) as usize])
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(regions))],
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// A write split into lanes, on a table whose `per_thread_output` is on, is
+/// read by official DuckDB as one insert: every row once, with row ids in the
+/// order the lanes were joined, across the lanes' files.
+/// Partitioned, the write splits into one lane, as official never writes a
+/// partitioned insert per thread, and each partition holds exactly its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn official_duckdb_reads_a_write_split_into_lanes() {
+    for partitioned in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("catalog.ducklake");
+        let database = database.to_str().unwrap().to_string();
+        let data_path = temp.path().join("data");
+        std::fs::create_dir_all(&data_path).unwrap();
+        let writer = Arc::new(DuckdbMetadataWriter::new_with_init(&database).unwrap());
+        writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+        writer
+            .set_global_setting("per_thread_output", "true")
+            .unwrap();
+
+        let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
+        let table_writer = || {
+            DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+                .unwrap()
+                .with_options(&options)
+        };
+        // The table, with its first rows, before the split write.
+        let created = table_writer()
+            .write_table("main", "t", &region_batches(0..900, 300))
+            .await
+            .unwrap();
+        if partitioned {
+            let table_id = created.table_id;
+            writer
+                .set_partition_spec(
+                    table_id,
+                    &[(
+                        "region".to_string(),
+                        datafusion_ducklake::partition::PartitionTransform::Identity,
+                    )],
+                )
+                .unwrap();
+        }
+
+        let input = region_batches(900..12_900, 400);
+        let parts: Vec<Vec<RecordBatch>> = input.chunks(10).map(<[RecordBatch]>::to_vec).collect();
+        let mut session = table_writer()
+            .begin_write("main", "t", input[0].schema().as_ref(), WriteMode::Append)
+            .unwrap();
+        if partitioned {
+            let mut lanes = session.lanes(parts.len()).unwrap();
+            assert_eq!(lanes.len(), 1, "a partitioned write is not split");
+            for batch in parts.iter().flatten() {
+                lanes[0].write_batch(batch).unwrap();
+            }
+            session.join_lanes(lanes).unwrap();
+        } else {
+            write_in_lanes(&mut session, parts).await;
+        }
+        let result = session.finish().await.unwrap();
+        assert!(
+            result.files_written >= 3,
+            "every lane, or every partition, writes a file of its own: {}",
+            result.files_written
+        );
+        drop(writer);
+
+        let oracle = duckdb::Connection::open_in_memory().unwrap();
+        oracle
+            .execute_batch(&format!(
+                "LOAD ducklake; ATTACH 'ducklake:{database}' AS lake (READ_ONLY);"
+            ))
+            .unwrap();
+        let mut statement = oracle
+            .prepare("SELECT rowid, id FROM lake.main.t ORDER BY rowid")
+            .unwrap();
+        let rows: Vec<(i64, i32)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let ids: Vec<i32> = rows.iter().map(|(_, id)| *id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..12_900).collect::<Vec<_>>(),
+            "partitioned={partitioned}: every row once"
+        );
+        let rowids: Vec<i64> = rows.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            rowids,
+            (0..12_900).collect::<Vec<_>>(),
+            "partitioned={partitioned}: row ids dense"
+        );
+        if !partitioned {
+            assert_eq!(
+                ids,
+                (0..12_900).collect::<Vec<_>>(),
+                "row ids follow the lanes' order"
+            );
+        }
+        if partitioned {
+            let mut statement = oracle
+                .prepare("SELECT region, count(*) FROM lake.main.t GROUP BY 1 ORDER BY 1")
+                .unwrap();
+            let per_region: Vec<(String, i64)> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                per_region,
+                vec![
+                    ("ap".to_string(), 4_300),
+                    ("eu".to_string(), 4_300),
+                    ("us".to_string(), 4_300)
+                ]
+            );
+        }
+    }
+}
+
+/// Official DuckDB reads files whose row groups were encoded on several
+/// threads and appended in order, across many row groups and files: every
+/// row once, in write order, and filters through the files' statistics and
+/// bloom filters find exactly the rows they should.
+#[tokio::test(flavor = "multi_thread")]
+async fn official_duckdb_reads_row_groups_encoded_on_several_threads() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("catalog.ducklake");
+    let database = database.to_str().unwrap().to_string();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(DuckdbMetadataWriter::new_with_init(&database).unwrap());
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
+    options.max_row_group_rows = Some(512);
+    let result = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&options)
+        .with_target_file_size(4 * 1024)
+        .with_encode_parallelism(4)
+        .write_table("main", "t", &region_batches(0..20_000, 1_700))
+        .await
+        .unwrap();
+    assert!(result.files_written > 1, "{} files", result.files_written);
+    drop(writer);
+
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; ATTACH 'ducklake:{database}' AS lake (READ_ONLY);"
+        ))
+        .unwrap();
+    let mut statement = oracle
+        .prepare("SELECT rowid, id FROM lake.main.t ORDER BY rowid")
+        .unwrap();
+    let rows: Vec<(i64, i32)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        (0..20_000)
+            .map(|id| (i64::from(id), id))
+            .collect::<Vec<_>>()
+    );
+    let count = |sql: &str| -> i64 { oracle.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT count(*) FROM lake.main.t WHERE id BETWEEN 7000 AND 7099"),
+        100
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM lake.main.t WHERE region = 'eu'"),
+        6_667
+    );
+}

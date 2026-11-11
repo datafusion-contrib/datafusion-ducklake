@@ -201,6 +201,32 @@ impl StringBounds {
         self.has_stats = true;
     }
 
+    /// Take in the bounds of the values written after these: a later bound
+    /// replaces one only when strictly beyond it, later bounds of no values
+    /// change nothing, and a later failure ends the bounds for good.
+    fn merge(&mut self, later: &StringBounds) {
+        if self.failed {
+            return;
+        }
+        if later.failed {
+            self.failed = true;
+            self.has_stats = false;
+            self.min.clear();
+            self.max.clear();
+            return;
+        }
+        if !later.has_stats {
+            return;
+        }
+        if !self.has_stats || later.min < self.min {
+            self.min.clone_from(&later.min);
+        }
+        if !self.has_stats || later.max > self.max {
+            self.max.clone_from(&later.max);
+        }
+        self.has_stats = true;
+    }
+
     /// The `(min, max)` the file records, as statistic values.
     fn bounds(&self) -> Option<(ScalarValue, ScalarValue)> {
         if !self.has_stats {
@@ -296,6 +322,26 @@ impl FloatBounds {
                 }
                 if value > *max {
                     *max = value;
+                }
+            },
+        }
+    }
+
+    /// Take in the bounds of the values written after these: a later bound
+    /// replaces one only when strictly beyond it, so among equal zeros the
+    /// earlier stays, as [`Self::update`] keeps the first.
+    fn merge(&mut self, later: &FloatBounds) {
+        let Some((later_min, later_max)) = later.bounds else {
+            return;
+        };
+        match &mut self.bounds {
+            None => self.bounds = later.bounds,
+            Some((min, max)) => {
+                if later_min < *min {
+                    *min = later_min;
+                }
+                if later_max > *max {
+                    *max = later_max;
                 }
             },
         }
@@ -410,6 +456,51 @@ impl WrittenLeafStats {
                     _ => {},
                 }
             });
+        }
+    }
+
+    /// Fold in the stats of rows written after the ones these stats cover,
+    /// so stats a file's row groups gathered apart combine in the file's row
+    /// order: as one [`Self::accumulate`] pass over all of them would, but
+    /// for the string and blob bounds below.
+    ///
+    /// NaN flags combine exactly: a leaf has NaN when the rows of either side
+    /// do. Float bounds combine exactly too: a later bound replaces one only
+    /// when strictly beyond it, so the earlier of two equal zeros stays.
+    /// String and blob bounds: each group's bounds, truncated as
+    /// [`StringBounds`] truncates them, replace the earlier ones only when
+    /// strictly beyond them; a group of no values leaves them as they are;
+    /// and a group whose maximum could not be truncated leaves the leaf
+    /// without bounds. That is one pass over the values unless a value over
+    /// 256 bytes truncates short of its 256th byte (a
+    /// `VARCHAR` character crossing it, or a maximum whose last bytes cannot
+    /// be incremented): one pass compares the next values with that
+    /// truncated bound, and can then keep a tighter bound, or keep bounds at
+    /// all, where the merge takes the later group's. Every bound kept is
+    /// still a bound of the values.
+    pub fn merge_ordered(&mut self, later: &WrittenLeafStats) {
+        if self.nan_flags.len() < later.nan_flags.len() {
+            self.nan_flags.resize(later.nan_flags.len(), None);
+        }
+        for (slot, flag) in self.nan_flags.iter_mut().zip(&later.nan_flags) {
+            if let Some(has) = flag {
+                *slot = Some(slot.unwrap_or(false) || *has);
+            }
+        }
+        if self.bounds.len() < later.bounds.len() {
+            self.bounds.resize(later.bounds.len(), None);
+        }
+        for (slot, other) in self.bounds.iter_mut().zip(&later.bounds) {
+            let Some(other) = other else {
+                continue;
+            };
+            match (slot, other) {
+                (slot @ None, other) => *slot = Some(other.clone()),
+                (Some(LeafBounds::Text(mine)), LeafBounds::Text(theirs)) => mine.merge(theirs),
+                (Some(LeafBounds::Float(mine)), LeafBounds::Float(theirs)) => mine.merge(theirs),
+                // One leaf is one type in every row group.
+                (Some(_), _) => {},
+            }
         }
     }
 }
@@ -931,5 +1022,162 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A deterministic xorshift stream, so a failing split can be replayed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// `rows` rows of every kind of value the merge treats apart: doubles and
+    /// floats with both zeros, NaN and NULL; text short, multi-byte and over
+    /// 256 bytes; blobs over 256 bytes, and one whose maximum cannot be
+    /// truncated when `untruncatable`; a column of NULLs only; and a double
+    /// inside a struct.
+    fn mixed_batch(rng: &mut Rng, rows: usize, untruncatable: bool) -> RecordBatch {
+        use arrow::array::{BinaryArray, StringArray, StructArray};
+        use arrow::datatypes::{Fields, Schema};
+        use std::sync::Arc;
+        let double = |rng: &mut Rng| match rng.below(8) {
+            0 => None,
+            1 => Some(-0.0),
+            2 => Some(0.0),
+            3 => Some(f64::NAN),
+            4 => Some(1e300),
+            _ => Some(rng.below(7) as f64 - 3.0),
+        };
+        let doubles: Vec<Option<f64>> = (0..rows).map(|_| double(rng)).collect();
+        let floats: Vec<Option<f32>> = (0..rows).map(|_| double(rng).map(|v| v as f32)).collect();
+        let nested: Vec<Option<f64>> = (0..rows).map(|_| double(rng)).collect();
+        // Text over 256 bytes keeps ASCII at its 256th byte and after it, so
+        // its truncation ends there, as DuckDB's does for most text.
+        let letters = |rng: &mut Rng, n: usize| -> String {
+            (0..n)
+                .map(|_| char::from(b'a' + rng.below(3) as u8))
+                .collect()
+        };
+        let texts: Vec<Option<String>> = (0..rows)
+            .map(|_| match rng.below(6) {
+                0 => None,
+                1 => Some(["é", "日本", "a", "b"][rng.below(4)].to_string()),
+                2 => Some(format!(
+                    "{}{}",
+                    "é".repeat(rng.below(40)),
+                    letters(rng, 300)
+                )),
+                3 => {
+                    let n = 250 + rng.below(20);
+                    Some(letters(rng, n))
+                },
+                _ => {
+                    let n = 1 + rng.below(5);
+                    Some(letters(rng, n))
+                },
+            })
+            .collect();
+        let untruncatable_at = untruncatable.then(|| rng.below(rows));
+        let blobs: Vec<Option<Vec<u8>>> = (0..rows)
+            .map(|row| {
+                if untruncatable_at == Some(row) {
+                    return Some(vec![0xFF; 300]);
+                }
+                match rng.below(4) {
+                    0 => None,
+                    1 => Some((0..300).map(|_| rng.below(0xFF) as u8).collect()),
+                    _ => Some((0..1 + rng.below(4)).map(|_| rng.below(4) as u8).collect()),
+                }
+            })
+            .collect();
+        let point = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Float64, true)]),
+            vec![Arc::new(Float64Array::from(nested))],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Float64, true),
+            Field::new("f", DataType::Float32, true),
+            Field::new("t", DataType::Utf8, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("empty", DataType::Utf8, true),
+            Field::new("point", point.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(doubles)),
+                Arc::new(Float32Array::from(floats)),
+                Arc::new(StringArray::from(texts)),
+                Arc::new(BinaryArray::from_iter(blobs)),
+                Arc::new(StringArray::from(vec![None::<&str>; rows])),
+                Arc::new(point),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Stats gathered over consecutive parts of the rows and merged in order
+    /// are the stats of one pass over them all, however the rows are split.
+    #[test]
+    fn merged_parts_are_one_pass_over_every_row() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200 {
+            let rows = 1 + rng.below(300);
+            let batch = mixed_batch(&mut rng, rows, round % 3 == 0);
+            let columns = batch.num_columns();
+            let mut one_pass = WrittenLeafStats::default();
+            one_pass.accumulate(&batch, columns);
+
+            // Cut the rows into parts, each part into batches, and gather
+            // each part's stats apart.
+            let mut merged = WrittenLeafStats::default();
+            let mut start = 0;
+            while start < rows {
+                let part = (1 + rng.below(rows)).min(rows - start);
+                let mut stats = WrittenLeafStats::default();
+                let mut at = start;
+                while at < start + part {
+                    let len = (1 + rng.below(part)).min(start + part - at);
+                    stats.accumulate(&batch.slice(at, len), columns);
+                    at += len;
+                }
+                merged.merge_ordered(&stats);
+                start += part;
+            }
+            assert_eq!(
+                format!("{merged:?}"),
+                format!("{one_pass:?}"),
+                "round {round}"
+            );
+        }
+    }
+
+    /// Where one pass compares a value with a bound truncated short of its
+    /// 256th byte, the merge takes the later row group's own bound. Both
+    /// bound the values.
+    #[test]
+    fn a_bound_truncated_early_merges_to_the_later_row_groups_bound() {
+        // Its maximum truncates to "b": no byte after the first is below 0x7F.
+        let late = format!("a{}", "é".repeat(150));
+        let mut earlier = StringBounds::new(false);
+        earlier.update("a😀".as_bytes());
+        let mut one_pass = earlier.clone();
+        one_pass.update(late.as_bytes());
+        assert_eq!(one_pass.max, "a😀".as_bytes(), "one pass keeps the max");
+        let mut later = StringBounds::new(false);
+        later.update(late.as_bytes());
+        earlier.merge(&later);
+        assert_eq!(earlier.max, b"b");
+        assert!(earlier.max.as_slice() > late.as_bytes());
     }
 }

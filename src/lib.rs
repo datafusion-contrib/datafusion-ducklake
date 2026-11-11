@@ -170,6 +170,8 @@ pub mod metadata_writer_sqlite;
 pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
 pub mod multicatalog_provider;
+#[cfg(feature = "write")]
+mod parallel_encode;
 #[cfg(feature = "restore")]
 pub mod restore;
 #[cfg(feature = "write")]
@@ -263,7 +265,7 @@ pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{
     ColumnWriteOptions, DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction,
-    InlinedFlushPolicy, TableWriteOptions, TableWriteSession,
+    InlinedFlushPolicy, TableWriteOptions, TableWriteSession, WriteLane,
 };
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;
