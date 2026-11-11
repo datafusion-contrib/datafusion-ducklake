@@ -23,6 +23,11 @@
 //! The file's first row group is decided exactly as DuckDB decides it. A later
 //! row group follows the first one's choice, apart from that fallback.
 //!
+//! A file whose row groups are encoded on several threads
+//! ([`crate::parallel_encode`]) instead decides every row group from its own
+//! rows, as DuckDB decides each column chunk: its row groups are encoded
+//! before it is known which file they land in.
+//!
 //! Only top-level columns are tuned. Nested columns, booleans, intervals and
 //! dictionary-typed arrays keep arrow-rs's defaults, as do fixed-length byte
 //! array columns under Parquet V1, where arrow-rs writes no dictionary for them.
@@ -42,6 +47,8 @@ use parquet::file::properties::{DEFAULT_MAX_ROW_GROUP_ROW_COUNT, WriterPropertie
 use parquet::schema::types::ColumnPath;
 
 use crate::Result;
+use crate::parallel_encode::{EncodePool, ParallelFileWriter, RowGroupQueue};
+use crate::stats_collect::WrittenLeafStats;
 
 /// DuckDB keeps a column chunk's dictionary only while its distinct values number
 /// at most `row group rows / DICTIONARY_ROWS_PER_ENTRY`.
@@ -163,12 +170,17 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
     Ok(distinct.len())
 }
 
-/// The writer properties a data file starts from, and the top-level columns
-/// whose dictionary the caller set, which [`props_for_row_group`] leaves alone.
+/// The writer properties a data file starts from, the top-level columns whose
+/// dictionary the caller set, which [`props_for_row_group`] leaves alone, and
+/// the pool that encodes the file's row groups.
 #[derive(Clone, Debug)]
 pub(crate) struct DataFileProperties {
     pub(crate) props: WriterProperties,
     pub(crate) dictionary_set: Arc<HashSet<String>>,
+    /// The threads that encode the file's row groups, shared by every file of
+    /// the write ([`crate::parallel_encode`]); `None` encodes on the writing
+    /// thread.
+    pub(crate) pool: Option<Arc<EncodePool>>,
 }
 
 impl From<WriterProperties> for DataFileProperties {
@@ -176,6 +188,7 @@ impl From<WriterProperties> for DataFileProperties {
         Self {
             props,
             dictionary_set: Arc::default(),
+            pool: None,
         }
     }
 }
@@ -258,7 +271,7 @@ fn closed() -> crate::error::DuckLakeError {
 /// Bytes `batch`'s buffers hold for its own rows. A slice of a larger batch counts
 /// only its share, where [`RecordBatch::get_array_memory_size`] would count the
 /// whole parent allocation.
-fn sliced_memory_size(batch: &RecordBatch) -> usize {
+pub(crate) fn sliced_memory_size(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
@@ -376,6 +389,72 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         }
         let writer = self.writer.take().expect("writer opened above");
         Ok(writer.into_inner()?)
+    }
+}
+
+/// One data file and the [`WrittenLeafStats`] of every row written to it:
+/// encoded on the writing thread by a [`RowGroupSampledWriter`], or row group
+/// by row group on the pool of its properties ([`crate::parallel_encode`]),
+/// which notes the stats on the pool's threads too.
+#[derive(Debug)]
+pub(crate) enum DataFileWriter<W: Write + Send> {
+    Sampled {
+        writer: Box<RowGroupSampledWriter<W>>,
+        leaf_stats: WrittenLeafStats,
+        stats_columns: usize,
+    },
+    RowGroups(Box<ParallelFileWriter<W>>),
+}
+
+impl<W: Write + Send> DataFileWriter<W> {
+    /// A file of `schema` on `sink`, whose leaf stats cover the first
+    /// `stats_columns` columns.
+    pub(crate) fn try_new(
+        sink: W,
+        schema: SchemaRef,
+        props: DataFileProperties,
+        stats_columns: usize,
+    ) -> Result<Self> {
+        if let Some(queue) = RowGroupQueue::try_new(schema.clone(), &props, stats_columns)? {
+            return Ok(Self::RowGroups(Box::new(ParallelFileWriter::try_new(
+                sink,
+                schema,
+                &props.props,
+                queue,
+            )?)));
+        }
+        Ok(Self::Sampled {
+            writer: Box::new(RowGroupSampledWriter::new(sink, schema, props)),
+            leaf_stats: WrittenLeafStats::default(),
+            stats_columns,
+        })
+    }
+
+    /// Write `batch`, which must carry the file's parquet schema.
+    pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        match self {
+            Self::Sampled {
+                writer,
+                leaf_stats,
+                stats_columns,
+            } => {
+                leaf_stats.accumulate(batch, *stats_columns);
+                writer.write(batch)
+            },
+            Self::RowGroups(writer) => writer.write(batch),
+        }
+    }
+
+    /// Write the footer and return the sink and the file's leaf stats.
+    pub(crate) fn into_inner(self) -> Result<(W, WrittenLeafStats)> {
+        match self {
+            Self::Sampled {
+                writer,
+                leaf_stats,
+                ..
+            } => Ok((writer.into_inner()?, leaf_stats)),
+            Self::RowGroups(writer) => writer.into_inner(),
+        }
     }
 }
 

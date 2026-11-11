@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeWriteOptions::encode_parallelism` and `DuckLakeTableWriter::with_encode_parallelism`:
+  encode a write's row groups on a pool of several threads, shared by every file, partition and
+  lane of the write, and append them to their files in write order. Official's writer (DuckDB's
+  Parquet `COPY`) also prepares row groups on several threads, but appends them in the order they
+  finish, as an insert does not preserve insertion order; write order is one it can produce.
+  Defaults to 1, which writes as before. The files hold the same rows, in the same order, as a
+  single-threaded write but are not byte for byte the same: row groups close at the row cap or
+  once their input reaches the byte cap (official also cuts by buffered input), each row group
+  chooses its own dictionaries and bloom filters, and files roll over at row-group boundaries.
+  Statistics match a single-threaded write's except that column sizes follow the encoding, files
+  that roll at other rows carry their own rows' statistics, and a string or blob bound cut short of
+  a value's 256th byte can be looser, or missing. Files written with content-defined chunking, and
+  encrypted files, are still encoded on the thread that writes.
+  At most `2 × threads` row groups are out at once across the write, plus one for each other file
+  sequence, open partition file or lane holding rows. A row group that fails to encode or append
+  fails the write for good: every later write and the finish return an error, and nothing commits.
+  That holds for every file of a partitioned write, including a partition file that fails while it
+  is closed to make room for another partition's.
+- `WrittenLeafStats::merge_ordered`: fold in the stats of rows written after the ones covered, as
+  one pass over all of them would, except that a string or blob bound truncated short of a value's
+  256th byte combines as the later rows' own bound.
+- `TableWriteSession::lanes`, `TableWriteSession::join_lanes` and `WriteLane`: split a write
+  into lanes that write their own data files at once on different threads, and commit them all
+  in one snapshot, in join order. This is official's per-thread output: an unpartitioned write
+  honours the table's `per_thread_output` option, and splits into one lane while that is off (the
+  default). A partitioned write always splits into one lane, as official never writes a
+  partitioned insert per thread. A split write within the inlining limit is inlined, its rows
+  counted across every lane, as official's are across its threads.
 - `MetadataProvider::get_inlined_file_deletes_of_files_between`: the inlined deletions of the
   given data files between two snapshots. The default filters
   `get_inlined_file_deletes_between`; every built-in provider reads only those files.

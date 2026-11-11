@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -28,10 +29,11 @@ use crate::metadata_writer::{
     SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode, WriteResult,
     WriteSetupResult, validate_delete_entries,
 };
+use crate::parallel_encode::{EncodePool, EncodedRowGroup, RowGroupAppender, RowGroupQueue};
 use crate::path_resolver::{join_paths, parse_object_store_url};
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::{DELETE_POS_COL, delete_file_schema};
-use crate::write_encoding::{DataFileProperties, RowGroupSampledWriter};
+use crate::write_encoding::{DataFileProperties, DataFileWriter, RowGroupSampledWriter};
 
 // The partition-group shape is shared with the split logic in `partition`.
 pub use crate::partition::PartitionGroup;
@@ -231,6 +233,42 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
+    /// How many threads encode a write's data files, row group by row group;
+    /// `None` leaves the writer default (1: the thread that writes, one batch
+    /// at a time). Clamped to at least 1. Above 1, each row group is encoded
+    /// as a job of its own on a pool of this many threads, shared by every
+    /// file, partition and lane of the write, and appended to its file in
+    /// write order. Official DuckLake's writer (DuckDB's Parquet writer) also
+    /// prepares row groups on several threads, but appends them in the order
+    /// they finish, as an insert does not preserve insertion order; write
+    /// order is one of the orders it can produce.
+    ///
+    /// The files hold the same rows, in the same order, as the files one
+    /// thread writes, but not the same bytes. Row groups close at
+    /// [`Self::max_row_group_rows`] exactly, or once their rows' size in
+    /// memory reaches [`Self::max_row_group_bytes`], as DuckDB closes them by
+    /// buffered input, rather than by the running estimate of their encoded
+    /// size; each row group's dictionaries and bloom filters are chosen from
+    /// its own rows, as DuckDB chooses each column chunk's, rather than from
+    /// the file's first row group; and files roll over at row group
+    /// boundaries. The statistics are those of one thread's files but for
+    /// three things: the column sizes follow the different encoding; files
+    /// that roll at other rows have other per-file statistics; and a string
+    /// or blob bound is gathered per row group and combined
+    /// ([`crate::stats_collect::WrittenLeafStats::merge_ordered`]), so where
+    /// a value over 256 bytes truncates short of its 256th byte, the bound
+    /// recorded can be looser than one thread's, or missing where one thread
+    /// records one. Every bound recorded still bounds the values.
+    ///
+    /// The pool has at most `2 × threads` row groups out (handed to it and
+    /// not yet appended) across the whole write, plus one for each other
+    /// file sequence, open partition file or lane holding rows, each as
+    /// large as the row group size makes it. With `max_row_group_bytes` set,
+    /// a row group is also held back while the input and encoded pages of
+    /// those out pass four times that a thread, unless its own file sequence
+    /// has none out. Files written with content-defined chunking, and
+    /// encrypted files, are still encoded on the thread that writes.
+    pub encode_parallelism: Option<usize>,
     /// Whether inserts honor the table's active sort order where the catalog
     /// stores no `sort_on_insert` setting: a stored table, schema or
     /// catalog-wide setting outranks it, as official has no session override
@@ -428,6 +466,7 @@ impl DuckLakeWriteOptions {
             )?,
             max_open_partitions: None,
             upload_concurrency: None,
+            encode_parallelism: None,
             // Official sorts only while the option reads exactly `true`.
             sort_on_insert: Some(
                 settings
@@ -533,6 +572,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.upload_concurrency.is_some() {
             self.upload_concurrency = overrides.upload_concurrency;
+        }
+        if overrides.encode_parallelism.is_some() {
+            self.encode_parallelism = overrides.encode_parallelism;
         }
         if overrides.sort_on_insert.is_some() {
             self.sort_on_insert = overrides.sort_on_insert;
@@ -882,6 +924,9 @@ pub struct DuckLakeTableWriter {
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
     upload_concurrency: usize,
+    /// Threads that encode a write's row groups. Defaults to 1; override via
+    /// [`DuckLakeTableWriter::with_encode_parallelism`].
+    encode_parallelism: usize,
     /// Target data file size in approximate encoded bytes. A write rolls over to a
     /// new file once the current file's estimated encoded size reaches this, so a
     /// large write produces several files instead of one. Paired with a sort order,
@@ -946,6 +991,7 @@ impl DuckLakeTableWriter {
             write_batch_size: None,
             column_options: HashMap::new(),
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            encode_parallelism: 1,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
             data_inlining_row_limit: None,
@@ -1025,9 +1071,21 @@ impl DuckLakeTableWriter {
         self
     }
 
+    /// Encode each write's data files row group by row group on a pool of
+    /// `threads` threads. Defaults to 1, the thread that writes. Values below 1
+    /// are clamped to 1. The files hold the same rows, in the same order, at
+    /// any value, but not the same bytes, and some statistics can differ; see
+    /// [`DuckLakeWriteOptions::encode_parallelism`].
+    #[must_use]
+    pub fn with_encode_parallelism(mut self, threads: usize) -> Self {
+        self.encode_parallelism = threads.max(1);
+        self
+    }
+
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, data
-    /// page limits, rollover target, open-partition cap, upload concurrency). Each field overrides the
-    /// corresponding setting only when present.
+    /// page limits, rollover target, open-partition cap, upload concurrency,
+    /// encode parallelism). Each field overrides the corresponding setting only
+    /// when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
         if let Some(limit) = options.data_inlining_row_limit {
             self.data_inlining_row_limit = Some(limit);
@@ -1062,6 +1120,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
+        }
+        if let Some(threads) = options.encode_parallelism {
+            self.encode_parallelism = threads.max(1);
         }
         if let Some(sort_on_insert) = options.sort_on_insert {
             self.sort_on_insert = sort_on_insert;
@@ -1108,7 +1169,10 @@ impl DuckLakeTableWriter {
     fn build_writer_props(&self, schema: &Schema) -> Result<DataFileProperties> {
         let base = self.base_writer_props();
         if self.column_options.is_empty() {
-            return Ok(base.into());
+            return Ok(DataFileProperties {
+                pool: EncodePool::new(self.encode_parallelism, self.max_row_group_bytes),
+                ..base.into()
+            });
         }
         let parquet_schema = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
         let mut builder = base.into_builder();
@@ -1148,6 +1212,7 @@ impl DuckLakeTableWriter {
         Ok(DataFileProperties {
             props: builder.build(),
             dictionary_set: Arc::new(dictionary_set),
+            pool: EncodePool::new(self.encode_parallelism, self.max_row_group_bytes),
         })
     }
 
@@ -1561,7 +1626,12 @@ impl DuckLakeTableWriter {
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        let writer = DataFileWriter::try_new(
+            staging,
+            schema_with_ids.clone(),
+            props,
+            schema_with_ids.fields().len(),
+        )?;
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1597,6 +1667,7 @@ impl DuckLakeTableWriter {
                             self.upload_concurrency,
                         ),
                         staged_values: Vec::new(),
+                        failed: false,
                     }),
                 },
             };
@@ -1652,10 +1723,11 @@ impl DuckLakeTableWriter {
             path_is_relative,
             mode,
             row_count: 0,
-            leaf_stats: Default::default(),
             partition_sink,
             roller,
             rolled,
+            token: NEXT_SESSION_TOKEN.fetch_add(1, Ordering::Relaxed),
+            split: None,
             commit_metadata: SnapshotCommitMetadata::default(),
         })
     }
@@ -2165,12 +2237,12 @@ impl DuckLakeTableWriter {
         );
         let mut files = Vec::new();
         for batch in batches {
-            if let Some(staged) = roller.write(batch)? {
+            for staged in roller.write(batch)? {
                 written.push(staged.object_path.clone());
                 files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
             }
         }
-        if let Some(staged) = roller.finish()? {
+        for staged in roller.finish()? {
             written.push(staged.object_path.clone());
             files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
         }
@@ -2290,9 +2362,16 @@ impl DuckLakeTableWriter {
 
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        // The writer notes NaN presence and string bounds of the catalog
+        // columns as the batches stream to disk: the footer records neither
+        // as official does.
+        let mut writer = DataFileWriter::try_new(
+            staging,
+            schema_with_ids.clone(),
+            props,
+            stats_column_ids.len(),
+        )?;
         let mut row_count: i64 = 0;
-        let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
             let batch = batch?;
             if batch.num_columns() != schema_with_ids.fields().len() {
@@ -2303,11 +2382,10 @@ impl DuckLakeTableWriter {
                 )));
             }
             let batch_with_ids = apply_field_ids(&batch, schema_with_ids.clone())?;
-            leaf_stats.accumulate(&batch, stats_column_ids.len());
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
-        let staged = writer.into_inner()?;
+        let (staged, leaf_stats) = writer.into_inner()?;
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
@@ -3467,11 +3545,11 @@ impl DuckLakeTableWriter {
         );
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
-            if let Some(staged) = roller.write(batch)? {
+            for staged in roller.write(batch)? {
                 files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
             }
         }
-        if let Some(staged) = roller.finish()? {
+        for staged in roller.finish()? {
             files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
         }
         Ok(files)
@@ -4440,10 +4518,31 @@ pub(crate) fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -
     out
 }
 
+/// A local staging file a data file is written to.
+type StagingFile = std::io::BufWriter<std::fs::File>;
+
+/// How an [`OpenFile`] is encoded.
+#[derive(Debug)]
+enum OpenWriter {
+    /// Batch by batch, on the writing thread.
+    Sampled(Box<RowGroupSampledWriter<StagingFile>>),
+    /// Row group by row group, encoded on a pool ([`crate::parallel_encode`]).
+    RowGroups(Box<RowGroupAppender<StagingFile>>),
+}
+
+impl OpenWriter {
+    fn into_inner(self) -> Result<StagingFile> {
+        match self {
+            Self::Sampled(writer) => writer.into_inner(),
+            Self::RowGroups(writer) => writer.into_inner(),
+        }
+    }
+}
+
 /// One parquet file being written to local staging.
 #[derive(Debug)]
 struct OpenFile {
-    writer: RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>,
+    writer: OpenWriter,
     temp: NamedTempFile,
     /// Path relative to the table directory (includes any Hive subpath).
     catalog_path: String,
@@ -4477,9 +4576,15 @@ struct StagedFile {
 /// the other. It was forgotten once already: a partitioned write left
 /// `target_file_size` unenforceable within a partition.
 ///
+/// With a pool in its properties, row groups are encoded on the pool ahead of
+/// the files ([`crate::parallel_encode`]): each one finished is appended, in
+/// order, to the file in progress, and the file is finished as soon as one
+/// takes it past the target, so the row groups after it go to the next file.
+/// A file overshoots the target by at most one row group either way.
+///
 /// Deliberately synchronous, and deliberately does NOT upload: `write` returns the
-/// finished [`StagedFile`] whenever a roll happened and leaves the upload policy to the
-/// caller. That is what lets the streaming session keep
+/// finished [`StagedFile`]s whenever a roll happened and leaves the upload policy to
+/// the caller. That is what lets the streaming session keep
 /// [`TableWriteSession::write_batch`] synchronous (it hands each file to a background
 /// [`StagedUploads`]) while the buffered path awaits each upload in turn.
 #[derive(Debug)]
@@ -4492,6 +4597,9 @@ struct RollingFileWriter {
     props: DataFileProperties,
     target_file_size: usize,
     open: Option<OpenFile>,
+    /// Row groups being encoded on the pool of `props`, created by the first
+    /// write; `None` without a pool.
+    queue: Option<RowGroupQueue>,
     /// Catalog path to use for the FIRST file instead of minting a fresh name.
     ///
     /// A streaming session pre-computes its output path at `begin_write` and exposes it
@@ -4521,60 +4629,135 @@ impl RollingFileWriter {
             props,
             target_file_size,
             open: None,
+            queue: None,
         }
     }
 
-    /// Append `batch`, opening a file if none is in progress. Returns the finished
-    /// [`StagedFile`] when this batch pushed the current file to `target_file_size`
-    /// (rollover is evaluated at batch boundaries, so a file always holds a whole
-    /// number of batches and any input ordering is preserved *across* files). A
-    /// file reports no size until its first row group is complete, so it never
-    /// rolls before holding one; see [`crate::write_encoding`].
+    /// Append `batch`, opening a file if none is in progress. Returns the
+    /// finished [`StagedFile`]s, in order, of the files this batch pushed past
+    /// `target_file_size`.
+    ///
+    /// Encoded on the writing thread, a file rolls at a batch boundary, so it
+    /// holds a whole number of batches; it reports no size until its first
+    /// row group is complete, so it never rolls before holding one (see
+    /// [`crate::write_encoding`]). Encoded on a pool, a file rolls at a row
+    /// group boundary, and the row groups of one batch can fill several
+    /// files. Either way rows keep their order across files.
     ///
     /// `batch` must carry the table's data columns positionally; the field-id-tagged
     /// schema is re-imposed here.
-    fn write(&mut self, batch: &RecordBatch) -> Result<Option<StagedFile>> {
+    fn write(&mut self, batch: &RecordBatch) -> Result<Vec<StagedFile>> {
+        let mut finished = Vec::new();
         if batch.num_rows() == 0 {
-            return Ok(None);
-        }
-        if self.open.is_none() {
-            self.open = Some(self.open_file()?);
+            return Ok(finished);
         }
         let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
+        if self.queue.is_none() {
+            self.queue = RowGroupQueue::try_new(
+                self.schema_with_ids.clone(),
+                &self.props,
+                self.data_column_count,
+            )?;
+        }
+        if let Some(mut queue) = self.queue.take() {
+            let pushed = queue.push(&batch_with_ids, &mut |group| {
+                self.append_row_group(group, &mut finished)
+            });
+            self.queue = Some(queue);
+            pushed?;
+            return Ok(finished);
+        }
+
+        if self.open.is_none() {
+            self.open = Some(self.open_file(false)?);
+        }
         let open = self.open.as_mut().expect("file opened above");
+        let OpenWriter::Sampled(writer) = &mut open.writer else {
+            return Err(crate::error::DuckLakeError::Internal(
+                "a file of encoded row groups was given a batch".to_string(),
+            ));
+        };
         open.leaf_stats
             .accumulate(&batch_with_ids, self.data_column_count);
-        open.writer.write(&batch_with_ids)?;
+        writer.write(&batch_with_ids)?;
         open.row_count += batch.num_rows() as i64;
 
         // Estimated encoded size = finished row groups + the in-progress one.
         // Strictly greater, matching official's parquet rotate predicate
         // (`FileSize() > file_size_bytes`), so a write landing exactly on the target
         // stays in one file.
-        if open.writer.bytes_written() + open.writer.in_progress_size() > self.target_file_size {
-            return Ok(Some(finalize_open_file(
-                self.open.take().expect("file open"),
-            )?));
+        if writer.bytes_written() + writer.in_progress_size() > self.target_file_size {
+            finished.push(finalize_open_file(self.open.take().expect("file open"))?);
         }
-        Ok(None)
+        Ok(finished)
     }
 
-    /// Finish the trailing (or only) file, if any rows were written.
-    fn finish(&mut self) -> Result<Option<StagedFile>> {
-        match self.open.take() {
-            Some(open) => Ok(Some(finalize_open_file(open)?)),
-            None => Ok(None),
+    /// Append an encoded row group to the file in progress, opening one if
+    /// none is, and finish the file once the row group takes it past
+    /// `target_file_size`, by the predicate [`Self::write`] uses.
+    fn append_row_group(
+        &mut self,
+        group: EncodedRowGroup,
+        finished: &mut Vec<StagedFile>,
+    ) -> Result<()> {
+        if self.open.is_none() {
+            self.open = Some(self.open_file(true)?);
         }
+        let open = self.open.as_mut().expect("file opened above");
+        let OpenWriter::RowGroups(writer) = &mut open.writer else {
+            return Err(crate::error::DuckLakeError::Internal(
+                "a file of batches was given an encoded row group".to_string(),
+            ));
+        };
+        let (rows, leaf_stats) = writer.append(group)?;
+        open.row_count += rows as i64;
+        open.leaf_stats.merge_ordered(&leaf_stats);
+        if writer.bytes_written() > self.target_file_size {
+            finished.push(finalize_open_file(self.open.take().expect("file open"))?);
+        }
+        Ok(())
     }
 
-    /// Whether a file is currently in progress (any rows written since the last roll).
+    /// Finish the trailing (or only) files, if any rows were written: every
+    /// row group still encoding is appended first, which can roll files too.
+    fn finish(&mut self) -> Result<Vec<StagedFile>> {
+        let mut finished = Vec::new();
+        if let Some(mut queue) = self.queue.take() {
+            let drained = queue.finish(&mut |group| self.append_row_group(group, &mut finished));
+            self.queue = Some(queue);
+            drained?;
+        }
+        if let Some(open) = self.open.take() {
+            finished.push(finalize_open_file(open)?);
+        }
+        Ok(finished)
+    }
+
+    /// Whether rows written since the last roll are yet to be finished: a file
+    /// in progress, or row groups still encoding.
     fn has_open_file(&self) -> bool {
-        self.open.is_some()
+        self.open.is_some() || self.queue.as_ref().is_some_and(|q| !q.is_empty())
     }
 
-    /// Open the next file. Its encoding is chosen from its first row group; see
+    /// A roller writing the same table with the same settings, with no file
+    /// in progress, whose files are named afresh. It shares the pool.
+    fn fresh(&self) -> Self {
+        Self::new(
+            self.table_key.clone(),
+            self.rel_prefix.clone(),
+            self.schema_with_ids.clone(),
+            self.data_column_count,
+            self.props.clone(),
+            self.target_file_size,
+            None,
+        )
+    }
+
+    /// Open the next file, for encoded row groups when `row_groups` is set
+    /// and for batches otherwise. Encoded on the writing thread, a file's
+    /// encoding is chosen from its first row group; see
     /// [`crate::write_encoding`].
-    fn open_file(&mut self) -> Result<OpenFile> {
+    fn open_file(&mut self, row_groups: bool) -> Result<OpenFile> {
         let catalog_path = match self.first_catalog_path.take() {
             Some(path) => path,
             None => {
@@ -4589,8 +4772,19 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer =
-            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
+        let writer = if row_groups {
+            OpenWriter::RowGroups(Box::new(RowGroupAppender::try_new(
+                staging,
+                self.schema_with_ids.clone(),
+                &self.props.props,
+            )?))
+        } else {
+            OpenWriter::Sampled(Box::new(RowGroupSampledWriter::new(
+                staging,
+                self.schema_with_ids.clone(),
+                self.props.clone(),
+            )))
+        };
         Ok(OpenFile {
             writer,
             temp,
@@ -4659,6 +4853,17 @@ async fn upload_staged_file(
     )
 }
 
+/// Hand `finished` files to `uploads` in order, or, with none, let the
+/// uploads already waiting start.
+fn stage_all(uploads: &mut StagedUploads, finished: Vec<StagedFile>) {
+    if finished.is_empty() {
+        uploads.advance();
+    }
+    for staged in finished {
+        uploads.add(staged);
+    }
+}
+
 /// How a streaming write session handles a partitioned target.
 #[derive(Debug, Clone, Copy)]
 enum StreamPartitionMode {
@@ -4707,11 +4912,24 @@ struct PartitionSink {
     uploads: StagedUploads,
     /// The partition values of each file handed to `uploads`, in the same order.
     staged_values: Vec<Vec<Option<String>>>,
+    /// Set by the first write or close that failed. A failure can drop rows
+    /// with no roller left to report it: an evicted partition's roller leaves
+    /// `open` before its finish, which is where a row group that failed to
+    /// encode on the pool surfaces. So every later write, close and finish
+    /// refuses, and the write commits nothing.
+    failed: bool,
 }
 
 impl PartitionSink {
     /// Split `batch` by partition and write each group to that partition's roller.
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.check_not_failed()?;
+        let written = self.write_batch_inner(batch);
+        self.failed |= written.is_err();
+        written
+    }
+
+    fn write_batch_inner(&mut self, batch: &RecordBatch) -> Result<()> {
         let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
         let groups = crate::partition::split_batches_by_partition(
             &self.schema_with_ids,
@@ -4740,8 +4958,8 @@ impl PartitionSink {
                     // is complete on disk, and start its upload. That partition
                     // simply gets another file if more of its rows arrive.
                     let (evicted_values, mut evicted) = self.open.remove(0);
-                    if let Some(staged) = evicted.finish()? {
-                        self.stage(evicted_values, staged);
+                    for staged in evicted.finish()? {
+                        self.stage(evicted_values.clone(), staged);
                     }
                 }
                 let rel = if self.hive_file_pattern {
@@ -4770,13 +4988,62 @@ impl PartitionSink {
         };
 
         let (partition_values, roller) = &mut self.open[index];
-        if let Some(staged) = roller.write(batch)? {
+        let finished = roller.write(batch)?;
+        if !finished.is_empty() {
             let partition_values = partition_values.clone();
-            self.stage(partition_values, staged);
-            // The roller rolled its file; drop it from `open` unless it already has a
-            // fresh one in progress, so the open-file cap counts real open files.
+            for staged in finished {
+                self.stage(partition_values.clone(), staged);
+            }
+            // The roller rolled its file; drop it from `open` unless it already has
+            // rows in progress, so the open-file cap counts real open files.
             if !self.open[index].1.has_open_file() {
                 self.open.remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    /// A sink writing the same table with the same settings, with no file open
+    /// and nothing staged.
+    fn fresh(&self) -> Self {
+        Self {
+            spec: self.spec.clone(),
+            key_names: self.key_names.clone(),
+            table_key: self.table_key.clone(),
+            schema_with_ids: self.schema_with_ids.clone(),
+            props: self.props.clone(),
+            target_file_size: self.target_file_size,
+            max_open: self.max_open,
+            hive_file_pattern: self.hive_file_pattern,
+            open: Vec::new(),
+            uploads: self.uploads.fresh(),
+            staged_values: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// Refuse to go on once an earlier write or close of this sink failed.
+    fn check_not_failed(&self) -> Result<()> {
+        if self.failed {
+            return Err(crate::error::DuckLakeError::Internal(
+                "an earlier write to this partitioned write's files failed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Finish every open file, staging it for upload; the uploads go on.
+    fn close_open_files(&mut self) -> Result<()> {
+        self.check_not_failed()?;
+        let closed = self.close_open_files_inner();
+        self.failed |= closed.is_err();
+        closed
+    }
+
+    fn close_open_files_inner(&mut self) -> Result<()> {
+        for (values, mut roller) in std::mem::take(&mut self.open) {
+            for staged in roller.finish()? {
+                self.stage(values.clone(), staged);
             }
         }
         Ok(())
@@ -4790,11 +5057,15 @@ impl PartitionSink {
 
     /// Finish every open file and wait for every upload, returning the files to
     /// commit — each [`DataFileInfo`] stamped with its partition.
+    ///
+    /// Fails, and removes every file it already uploaded, once any write or close
+    /// of this sink failed.
     async fn finish_uploads(&mut self) -> Result<UploadedFiles> {
-        for (values, mut roller) in std::mem::take(&mut self.open) {
-            if let Some(staged) = roller.finish()? {
-                self.stage(values, staged);
+        if let Err(error) = self.close_open_files() {
+            for failure in self.uploads.remove_started().await {
+                tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
             }
+            return Err(error);
         }
         let mut uploaded = self.uploads.finish().await?;
         // `zip` is positional and truncates silently; `finish` returns one info per
@@ -4909,6 +5180,15 @@ impl StagedUploads {
             runtime: None,
             settled: false,
         }
+    }
+
+    /// Uploads to the same store, at the same concurrency, with nothing staged.
+    fn fresh(&self) -> Self {
+        Self::new(
+            Arc::clone(&self.object_store),
+            &self.column_ids,
+            self.concurrency,
+        )
     }
 
     /// Queue a finished file and start whatever uploads now fit. Never blocks.
@@ -5183,6 +5463,153 @@ pub(crate) async fn remove_objects(
     failures
 }
 
+/// Where one lane of a split write sends its rows: a rolling file sequence
+/// or a partition sink, with its own uploads.
+#[derive(Debug)]
+enum LaneTarget {
+    // Boxed, both: a lane moves between threads, and the writers are large.
+    Rolling {
+        roller: Box<RollingFileWriter>,
+        uploads: Box<StagedUploads>,
+    },
+    Partitioned(Box<PartitionSink>),
+}
+
+impl LaneTarget {
+    /// Write `batch` to the lane's files, starting the upload of any file it
+    /// finishes. Returns an upload failure as soon as it is observed.
+    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        match self {
+            Self::Rolling {
+                roller,
+                uploads,
+            } => {
+                stage_all(uploads, roller.write(batch)?);
+                uploads.check()
+            },
+            Self::Partitioned(sink) => {
+                sink.write_batch(batch)?;
+                sink.uploads.advance();
+                sink.uploads.check()
+            },
+        }
+    }
+
+    fn uploads_mut(&mut self) -> &mut StagedUploads {
+        match self {
+            Self::Rolling {
+                uploads,
+                ..
+            } => uploads,
+            Self::Partitioned(sink) => &mut sink.uploads,
+        }
+    }
+
+    /// Finish the file in progress (or every open partition file) and stage
+    /// it for upload. The uploads go on.
+    fn close(&mut self) -> Result<()> {
+        match self {
+            Self::Rolling {
+                roller,
+                uploads,
+            } => {
+                stage_all(uploads, roller.finish()?);
+                Ok(())
+            },
+            Self::Partitioned(sink) => sink.close_open_files(),
+        }
+    }
+
+    /// Wait for every upload and hand over the files, in the order written,
+    /// each stamped with its partition where the table has one.
+    async fn finish(&mut self) -> Result<UploadedFiles> {
+        match self {
+            Self::Rolling {
+                roller,
+                uploads,
+            } => {
+                stage_all(uploads, roller.finish()?);
+                uploads.finish().await
+            },
+            Self::Partitioned(sink) => sink.finish_uploads().await,
+        }
+    }
+}
+
+/// One of the parallel writers of a split [`TableWriteSession`]
+/// ([`TableWriteSession::lanes`]).
+///
+/// A lane writes its own data files, with the session's settings, and
+/// uploads them as it finishes them; it commits nothing. It can be moved to
+/// another thread, so several lanes write at once. Hand it back to the
+/// session it came from with [`TableWriteSession::join_lanes`]; the session's
+/// commit then registers its files after those of every lane before it.
+#[derive(Debug)]
+pub struct WriteLane {
+    /// The [`TableWriteSession::token`] of the session that split.
+    session: u64,
+    target: LaneTarget,
+    schema_with_ids: SchemaRef,
+    validation_schema: SchemaRef,
+    rows: i64,
+    /// Set while the write may still be inlined: the lane then holds its rows
+    /// rather than writing them to Parquet.
+    held: Option<LaneHeld>,
+}
+
+/// The rows a [`WriteLane`] holds while those of the whole split write
+/// number at most the table's `data_inlining_row_limit`.
+#[derive(Debug)]
+struct LaneHeld {
+    limit: usize,
+    /// The rows held across the session and all its lanes.
+    total: Arc<AtomicUsize>,
+    batches: Vec<RecordBatch>,
+}
+
+impl WriteLane {
+    /// Write `batch` to this lane's files, as [`TableWriteSession::write_batch`]
+    /// writes to the session's.
+    ///
+    /// While the rows of the session and every lane together number at most
+    /// the table's inlining limit, the lane holds `batch` instead; the batch
+    /// that takes them past it writes what the lane holds to Parquet first, as
+    /// official's insert passes a thread's inlined rows through once its
+    /// threads together pass the limit (`ducklake_inline_data.cpp`).
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        validate_batch_for(&self.schema_with_ids, &self.validation_schema, batch)?;
+        let rows = batch.num_rows();
+        if let Some(held) = &mut self.held {
+            let total = held.total.fetch_add(rows, Ordering::SeqCst) + rows;
+            if total <= held.limit {
+                if rows > 0 {
+                    held.batches.push(batch.clone());
+                }
+                self.rows += rows as i64;
+                return Ok(());
+            }
+            for held in self.held.take().expect("checked above").batches {
+                self.target.write(&held)?;
+            }
+        }
+        self.target.write(batch)?;
+        self.rows += rows as i64;
+        Ok(())
+    }
+
+    /// [`Self::write_batch`], then wait until every finished file has started
+    /// uploading, as [`TableWriteSession::write_batch_async`] does.
+    pub async fn write_batch_async(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch(batch)?;
+        self.target.uploads_mut().wait_for_room().await
+    }
+
+    /// Rows written to this lane.
+    pub fn rows(&self) -> i64 {
+        self.rows
+    }
+}
+
 /// Streaming write session. Batches stream to local staging files. A rolling or
 /// partitioned session uploads each file as soon as it is finished; a single-file
 /// session uploads its one file in `finish()`. Nothing is committed before
@@ -5237,7 +5664,10 @@ pub struct TableWriteSession {
     /// written to disk as they arrive rather than buffered in memory, so peak
     /// memory stays bounded by the parquet row-group size regardless of table
     /// size. The finished file is streamed to object storage in `finish()`.
-    writer: Option<RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>>,
+    /// It also notes what the batches show of each Parquet leaf that the
+    /// footer does not record exactly (NaN presence, DuckDB's string and blob
+    /// bounds), for `collect_own_written_column_stats` at finish.
+    writer: Option<DataFileWriter<std::io::BufWriter<std::fs::File>>>,
     /// Local staging file backing `writer`. Kept alive for the session; the
     /// finished parquet is uploaded from it and the file is removed on drop.
     temp: Option<NamedTempFile>,
@@ -5249,10 +5679,6 @@ pub struct TableWriteSession {
     /// (for Replace) prior-generation retirement commit atomically with the file.
     mode: WriteMode,
     row_count: i64,
-    /// What the written batches showed of each Parquet leaf that the footer
-    /// does not record exactly: NaN presence and DuckDB's string and blob
-    /// bounds. Fed into `collect_own_written_column_stats` at finish.
-    leaf_stats: crate::stats_collect::WrittenLeafStats,
     /// Set when the target table is partitioned: batches are routed here, one file
     /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
     /// every file the sink produced in a single snapshot.
@@ -5265,7 +5691,39 @@ pub struct TableWriteSession {
     roller: Option<RollingFileWriter>,
     /// Uploads the files the roller finishes, as it finishes them.
     rolled: StagedUploads,
+    /// Tells this session's lanes from another's: every [`WriteLane`] it
+    /// hands out carries it.
+    token: u64,
+    /// Set by [`Self::lanes`]: the session itself takes no more rows.
+    split: Option<Split>,
     commit_metadata: SnapshotCommitMetadata,
+}
+
+/// Source of [`TableWriteSession::token`].
+static NEXT_SESSION_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+/// What a [`TableWriteSession`] split into lanes knows of them.
+#[derive(Debug)]
+struct Split {
+    /// Lanes handed out by [`TableWriteSession::lanes`].
+    issued: usize,
+    /// Lanes handed back by [`TableWriteSession::join_lanes`], in join order:
+    /// their rows come after the session's own, in that order.
+    joined: Vec<JoinedLane>,
+    /// Set when a [`TableWriteSession::join_lanes`] failed: the lanes it was
+    /// handed are lost, so the write cannot commit.
+    failed: bool,
+    /// The rows the session and its lanes hold to inline, counted across all
+    /// of them; `None` when the session could not inline when it split.
+    held_rows: Option<Arc<AtomicUsize>>,
+}
+
+/// A lane handed back to its session.
+#[derive(Debug)]
+struct JoinedLane {
+    target: LaneTarget,
+    /// The lane's rows, while it holds them to inline ([`LaneHeld`]).
+    held: Option<Vec<RecordBatch>>,
 }
 
 /// The rows a [`TableWriteSession`] holds while they number at most the
@@ -5288,8 +5746,21 @@ impl TableWriteSession {
     /// Whether the rows written so far are still held to be committed inlined:
     /// they number at most the table's `data_inlining_row_limit` (see
     /// [`DuckLakeTableWriter::begin_write`]).
+    ///
+    /// A write split into lanes ([`Self::lanes`]) counts the rows of every
+    /// lane with the session's own.
     pub fn is_inlining(&self) -> bool {
-        self.inline_buffer.is_some()
+        let Some(buffer) = &self.inline_buffer else {
+            return false;
+        };
+        match self
+            .split
+            .as_ref()
+            .and_then(|split| split.held_rows.as_ref())
+        {
+            Some(held) => held.load(Ordering::SeqCst) <= buffer.limit,
+            None => true,
+        }
     }
 
     /// Write the held rows to the Parquet output, once they exceed the limit
@@ -5314,17 +5785,85 @@ impl TableWriteSession {
         }
     }
 
+    /// Write every row the session and its joined lanes hold to inline to
+    /// their Parquet output: the session's to its own files, each lane's to
+    /// that lane's.
+    fn spill_held_rows(&mut self) -> Result<()> {
+        self.spill_inline_buffer()?;
+        if let Some(split) = &mut self.split {
+            for lane in &mut split.joined {
+                for batch in lane.held.take().unwrap_or_default() {
+                    lane.target.write(&batch)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows to commit inlined, in write order, when the write ends with
+    /// rows but no more than the table's limit, of values the backend
+    /// inlines; else `None`, every held row written to Parquet.
+    ///
+    /// A write split into lanes is counted whole, the session's rows and
+    /// every lane's, as official's insert counts the rows of all its threads
+    /// against the limit (`ducklake_inline_data.cpp`).
     fn take_inlinable_rows(&mut self) -> Result<Option<Vec<RecordBatch>>> {
+        self.check_lanes_joined()?;
         let Some(buffer) = self.inline_buffer.as_ref() else {
             return Ok(None);
         };
-        if buffer.rows > 0 && self.metadata.supports_data_inlining_values(&buffer.batches) {
-            let buffer = self.inline_buffer.take().expect("checked above");
-            validate_not_null_batches(&self.validation_schema, &buffer.batches)?;
-            return Ok(Some(buffer.batches));
+        let lanes: &[JoinedLane] = self.split.as_ref().map_or(&[], |split| &split.joined);
+        let mut rows = buffer.rows;
+        let mut batches = buffer.batches.clone();
+        let mut all_held = true;
+        for lane in lanes {
+            match &lane.held {
+                Some(held) => {
+                    rows += held.iter().map(RecordBatch::num_rows).sum::<usize>();
+                    batches.extend(held.iter().cloned());
+                },
+                // The lane wrote its rows to Parquet: together they passed the limit.
+                None => all_held = false,
+            }
         }
-        self.spill_inline_buffer()?;
+        if all_held
+            && rows > 0
+            && rows <= buffer.limit
+            && self.metadata.supports_data_inlining_values(&batches)
+        {
+            validate_not_null_batches(&self.validation_schema, &batches)?;
+            self.inline_buffer = None;
+            if let Some(split) = &mut self.split {
+                for lane in &mut split.joined {
+                    lane.held = None;
+                }
+            }
+            return Ok(Some(batches));
+        }
+        self.spill_held_rows()?;
         Ok(None)
+    }
+
+    /// Refuse to commit a write split into lanes unless every lane was
+    /// joined back, by joins that all succeeded.
+    fn check_lanes_joined(&self) -> Result<()> {
+        let Some(split) = &self.split else {
+            return Ok(());
+        };
+        if split.failed {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "joining this write's lanes failed, so the write cannot commit".to_string(),
+            ));
+        }
+        if split.joined.len() != split.issued {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "{} of this write's {} lanes were joined: every lane must be joined before \
+                 the write commits",
+                split.joined.len(),
+                split.issued
+            )));
+        }
+        Ok(())
     }
 
     // Keep the read plan's snapshot for source-scoped conflict checks without
@@ -5366,6 +5905,11 @@ impl TableWriteSession {
     /// Returns an upload failure as soon as it is observed. The session must then be
     /// dropped or [aborted](Self::abort), which removes what it uploaded.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.split.is_some() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "this write was split into lanes: write to the lanes".to_string(),
+            ));
+        }
         if self.inline_buffer.is_some() {
             self.validate_batch_schema(batch)?;
             let rows = batch.num_rows();
@@ -5394,10 +5938,7 @@ impl TableWriteSession {
         if let Some(roller) = &mut self.roller {
             let rows = batch.num_rows() as i64;
             // `roller` and `rolled` are distinct fields, so both can be borrowed here.
-            match roller.write(batch)? {
-                Some(staged) => self.rolled.add(staged),
-                None => self.rolled.advance(),
-            }
+            stage_all(&mut self.rolled, roller.write(batch)?);
             self.row_count += rows;
             return self.rolled.check();
         }
@@ -5416,11 +5957,6 @@ impl TableWriteSession {
         self.validate_batch_schema(batch)?;
 
         let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
-        // Note NaN presence and string bounds before the batch streams to disk
-        // (the footer records neither as official does). Only the catalog data
-        // columns.
-        self.leaf_stats
-            .accumulate(&batch_with_ids, self.schema_with_ids.fields().len());
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch_with_ids)?;
         self.row_count += batch.num_rows() as i64;
@@ -5445,6 +5981,193 @@ impl TableWriteSession {
         Ok(())
     }
 
+    /// Split the rest of this write into lanes, which can write at once on
+    /// different threads: `n` lanes (at least one) when the table is
+    /// unpartitioned and its `per_thread_output` option reads `true`, and one
+    /// lane otherwise. Each lane writes its own data files with this
+    /// session's settings, and uploads them as it goes.
+    ///
+    /// Lanes are official DuckLake's per-thread output: with the table's
+    /// `per_thread_output` on, official's insert into an unpartitioned table
+    /// writes separate files on each thread, and with it off (the default)
+    /// one output it all goes through. An insert into a partitioned table is
+    /// a partitioned copy, which DuckDB never writes per thread whatever the
+    /// option says, so a partitioned write always splits into one lane. The
+    /// option is read here, table over schema over catalog-wide, as official
+    /// reads it when it plans an insert, and only when `n` is over one and
+    /// the table unpartitioned.
+    ///
+    /// The write is still one write: hand every lane back with
+    /// [`Self::join_lanes`], and [`Self::finish`] commits every file in one
+    /// snapshot, the session's own first, then each lane's in the order the
+    /// lanes were joined. A write with a lane not joined back, or whose join
+    /// failed, cannot commit. Rows get their row ids in that order, so a
+    /// caller that gives lane `i` the `i`-th part of its input, and joins the
+    /// lanes in order, numbers its rows as one writer would. Splitting only
+    /// adds files: each lane fills its own, so a lane's last file can be
+    /// smaller than the target size.
+    ///
+    /// Each lane runs its own uploads and holds its own open file: a write
+    /// split into `n` lanes has up to `n` × `upload_concurrency` uploads in
+    /// flight. The lanes share the session's `encode_parallelism` encoding
+    /// threads, their memory budget and their count of row groups out
+    /// ([`DuckLakeTableWriter::with_encode_parallelism`]). A lane uploads in
+    /// the background on the tokio runtime of the thread that writes to it; a
+    /// lane written on a thread without one uploads its files only when the
+    /// write finishes.
+    ///
+    /// After this the session takes no rows itself. The write is inlined as
+    /// one write is: rows the session holds to inline stay held, each lane
+    /// holds its rows while the rows of the session and every lane together
+    /// number at most the table's inlining limit, and a write that ends there
+    /// commits all of them inlined. A single-file session cannot split.
+    pub fn lanes(&mut self, n: usize) -> Result<Vec<WriteLane>> {
+        if self.split.is_some() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "this write was already split into lanes".to_string(),
+            ));
+        }
+        if self.roller.is_none() && self.partition_sink.is_none() {
+            return Err(crate::error::DuckLakeError::Unsupported(
+                "a write to one caller-determined file cannot be split into lanes".to_string(),
+            ));
+        }
+        // Official sets `partition_output` on a partitioned insert, and
+        // DuckDB's copy takes that path before `per_thread_output`; an
+        // unpartitioned insert writes a file per thread only while the option
+        // reads exactly `true` (`ducklake_insert.cpp`).
+        let n = if n > 1
+            && self.roller.is_some()
+            && self
+                .metadata
+                .table_setting(&self.schema_name, &self.table_name, "per_thread_output")?
+                .as_deref()
+                == Some("true")
+        {
+            n
+        } else {
+            1
+        };
+        let held_rows = self
+            .inline_buffer
+            .as_ref()
+            .map(|buffer| (buffer.limit, Arc::new(AtomicUsize::new(buffer.rows))));
+        let mut lanes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let target = match (&self.roller, &self.partition_sink) {
+                (Some(roller), _) => LaneTarget::Rolling {
+                    roller: Box::new(roller.fresh()),
+                    uploads: Box::new(self.rolled.fresh()),
+                },
+                (None, Some(sink)) => LaneTarget::Partitioned(Box::new(sink.fresh())),
+                (None, None) => unreachable!("checked above"),
+            };
+            lanes.push(WriteLane {
+                session: self.token,
+                target,
+                schema_with_ids: self.schema_with_ids.clone(),
+                validation_schema: self.validation_schema.clone(),
+                rows: 0,
+                held: held_rows.as_ref().map(|(limit, total)| LaneHeld {
+                    limit: *limit,
+                    total: Arc::clone(total),
+                    batches: Vec::new(),
+                }),
+            });
+        }
+        self.split = Some(Split {
+            issued: n,
+            joined: Vec::new(),
+            failed: false,
+            held_rows: held_rows.map(|(_, total)| total),
+        });
+        Ok(lanes)
+    }
+
+    /// Take back lanes of [`Self::lanes`], in the order their rows come in
+    /// the write, finishing the file each has in progress. Their uploads go
+    /// on; [`Self::finish`] waits for them. Called more than once, each call's
+    /// lanes come after the last's.
+    ///
+    /// Refuses a lane of another session. A join that fails loses the lanes
+    /// it was handed, so the write can then only be aborted or dropped: every
+    /// finish refuses it.
+    pub fn join_lanes(&mut self, lanes: Vec<WriteLane>) -> Result<()> {
+        let token = self.token;
+        let Some(split) = self.split.as_mut() else {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "lanes were joined to a write that was not split".to_string(),
+            ));
+        };
+        let mut rows = 0;
+        let joined = || -> Result<()> {
+            for mut lane in lanes {
+                if lane.session != token {
+                    return Err(crate::error::DuckLakeError::InvalidConfig(
+                        "a lane of another write was joined to this one".to_string(),
+                    ));
+                }
+                lane.target.close()?;
+                rows += lane.rows;
+                split.joined.push(JoinedLane {
+                    target: lane.target,
+                    held: lane.held.map(|held| held.batches),
+                });
+            }
+            Ok(())
+        };
+        let result = joined();
+        if result.is_err() {
+            split.failed = true;
+        }
+        self.row_count += rows;
+        result
+    }
+
+    /// Upload the files this session wrote, then each joined lane's, and hand
+    /// them over in that order. Takes the session's roller or partition sink.
+    ///
+    /// On a failure every file already handed over is removed; the lanes not
+    /// yet finished stay in the session, whose drop or abort removes theirs.
+    async fn finish_file_uploads(&mut self) -> Result<UploadedFiles> {
+        let own = if let Some(mut roller) = self.roller.take() {
+            match roller.finish() {
+                Ok(finished) => {
+                    stage_all(&mut self.rolled, finished);
+                    self.rolled.finish().await
+                },
+                Err(e) => Err(e),
+            }
+        } else if let Some(mut sink) = self.partition_sink.take() {
+            sink.finish_uploads().await
+        } else {
+            Ok(UploadedFiles {
+                infos: Vec::new(),
+                objects: Vec::new(),
+            })
+        };
+        let mut out = own?;
+        let Some(split) = &mut self.split else {
+            return Ok(out);
+        };
+        for lane in &mut split.joined {
+            match lane.target.finish().await {
+                Ok(uploaded) => {
+                    out.infos.extend(uploaded.infos);
+                    out.objects.extend(uploaded.objects);
+                },
+                Err(e) => {
+                    for failure in remove_objects(&self.object_store, out.objects).await {
+                        tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
+                    }
+                    return Err(e);
+                },
+            }
+        }
+        split.joined.clear();
+        Ok(out)
+    }
+
     /// Abandon the write without committing, and remove every file it already
     /// uploaded.
     ///
@@ -5455,6 +6178,11 @@ impl TableWriteSession {
         let mut failures = self.rolled.remove_started().await;
         if let Some(sink) = &mut self.partition_sink {
             failures.extend(sink.uploads.remove_started().await);
+        }
+        if let Some(split) = &mut self.split {
+            for lane in &mut split.joined {
+                failures.extend(lane.target.uploads_mut().remove_started().await);
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -5467,8 +6195,20 @@ impl TableWriteSession {
     }
 
     fn validate_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
+        validate_batch_for(&self.schema_with_ids, &self.validation_schema, batch)
+    }
+}
+
+/// Check `batch` against a write's field-id-tagged schema and its NOT NULL
+/// constraints, as every batch a session or one of its lanes takes is checked.
+fn validate_batch_for(
+    schema_with_ids: &SchemaRef,
+    validation_schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<()> {
+    {
         let batch_schema = batch.schema();
-        let expected_schema = &self.schema_with_ids;
+        let expected_schema = schema_with_ids;
 
         if batch_schema.fields().len() != expected_schema.fields().len() {
             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
@@ -5484,7 +6224,7 @@ impl TableWriteSession {
             .zip(expected_schema.fields().iter())
             .enumerate()
         {
-            if !Self::data_type_contains_ignoring_nested_names(
+            if !TableWriteSession::data_type_contains_ignoring_nested_names(
                 expected_field.data_type(),
                 batch_field.data_type(),
             ) {
@@ -5496,10 +6236,12 @@ impl TableWriteSession {
                 )));
             }
         }
-        validate_not_null_batches(&self.validation_schema, std::slice::from_ref(batch))?;
+        validate_not_null_batches(validation_schema, std::slice::from_ref(batch))?;
         Ok(())
     }
+}
 
+impl TableWriteSession {
     fn data_type_contains_ignoring_nested_names(expected: &DataType, actual: &DataType) -> bool {
         match (expected, actual) {
             (DataType::List(expected), DataType::List(actual))
@@ -5573,100 +6315,50 @@ impl TableWriteSession {
             let batches = self.inline_order(batches)?;
             return self.commit_inlined(batches);
         }
-        // Rolling: finish the in-progress file, upload every file this session
-        // produced, and commit them in ONE snapshot.
-        if let Some(mut roller) = self.roller.take() {
-            if let Some(staged) = roller.finish()? {
-                self.rolled.add(staged);
-            }
-            let uploaded = self.rolled.finish().await?;
-            if uploaded.infos.is_empty() {
-                // No rows arrived. Fall through to the single-file path, which
-                // registers the 0-row marker a Replace needs to retire the prior
-                // generation.
-                return self.finish_single_file().await;
-            }
-            let file_infos = uploaded.infos;
-            let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = match self.with_inlining_limit(|| {
-                self.metadata.register_data_files_with_commit_metadata(
-                    self.table_id,
-                    &self.schema_name,
-                    &self.table_name,
-                    self.snapshot_id,
-                    &file_infos,
-                    self.mode,
-                    self.base_snapshot_id,
-                    &self.columns,
-                    &self.field_ids,
-                    &self.commit_metadata,
-                    self.expected_base_snapshot_id,
-                )
-            }) {
-                Ok(committed) => committed,
-                Err(e) => {
-                    return Err(release_after_failed_commit(
-                        &self.object_store,
-                        e,
-                        uploaded.objects,
-                    )
-                    .await);
-                },
-            };
-            return Ok(WriteResult {
-                snapshot_id: committed.snapshot_id,
-                table_id: committed.table_id,
-                schema_id: committed.schema_id,
-                files_written: file_infos.len(),
-                records_written,
-            });
+        // Rolling or partitioned, with any lanes: upload every file this
+        // session and its lanes produced, and commit them in ONE snapshot, so
+        // a write of many files is as atomic as one of a single file.
+        if self.roller.is_none() && self.partition_sink.is_none() && self.split.is_none() {
+            return self.finish_single_file().await;
         }
-        // Partitioned: commit every file the sink produced in ONE snapshot, so a
-        // partitioned streaming write is as atomic as an unpartitioned one.
-        if let Some(mut sink) = self.partition_sink.take() {
-            let uploaded = sink.finish_uploads().await?;
-            if uploaded.infos.is_empty() {
-                // No rows reached any partition. Fall through to the single-file
-                // path, which registers the 0-row marker that carries a Replace
-                // truncation (and is exempt from the partition fence).
-                return self.finish_single_file().await;
-            }
-            let file_infos = uploaded.infos;
-            let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = match self.with_inlining_limit(|| {
-                self.metadata.register_data_files_with_commit_metadata(
-                    self.table_id,
-                    &self.schema_name,
-                    &self.table_name,
-                    self.snapshot_id,
-                    &file_infos,
-                    self.mode,
-                    self.base_snapshot_id,
-                    &self.columns,
-                    &self.field_ids,
-                    &self.commit_metadata,
-                    self.expected_base_snapshot_id,
-                )
-            }) {
-                Ok(committed) => committed,
-                Err(e) => {
-                    return Err(release_after_failed_commit(
-                        &self.object_store,
-                        e,
-                        uploaded.objects,
-                    )
-                    .await);
-                },
-            };
-            return Ok(WriteResult {
-                snapshot_id: committed.snapshot_id,
-                table_id: committed.table_id,
-                schema_id: committed.schema_id,
-                files_written: file_infos.len(),
-                records_written,
-            });
+        let uploaded = self.finish_file_uploads().await?;
+        if uploaded.infos.is_empty() {
+            // No rows arrived. Fall through to the single-file path, which
+            // registers the 0-row marker a Replace needs to retire the prior
+            // generation (and which is exempt from the partition fence).
+            return self.finish_single_file().await;
         }
-        self.finish_single_file().await
+        let file_infos = uploaded.infos;
+        let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
+        let committed = match self.with_inlining_limit(|| {
+            self.metadata.register_data_files_with_commit_metadata(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &file_infos,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.field_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )
+        }) {
+            Ok(committed) => committed,
+            Err(e) => {
+                return Err(
+                    release_after_failed_commit(&self.object_store, e, uploaded.objects).await,
+                );
+            },
+        };
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: file_infos.len(),
+            records_written,
+        })
     }
 
     /// Commit the session's rows inlined, in one snapshot, as
@@ -5927,7 +6619,17 @@ impl TableWriteSession {
     /// [`DataFileInfo`] and object key. A session with no rows yields the 0-row
     /// single file, whose marker is what carries a Replace truncation.
     async fn finish_appended(&mut self) -> Result<(Vec<DataFileInfo>, Vec<ObjectPath>)> {
-        self.spill_inline_buffer()?;
+        self.check_lanes_joined()?;
+        self.spill_held_rows()?;
+        if self.split.is_some() {
+            let uploaded = self.finish_file_uploads().await?;
+            if !uploaded.infos.is_empty() {
+                return Ok((uploaded.infos, uploaded.objects));
+            }
+            // No rows arrived: the 0-row marker carries a Replace truncation.
+            let (info, object) = self.upload_staged().await?;
+            return Ok((vec![info], vec![object]));
+        }
         Ok(if let Some(mut sink) = self.partition_sink.take() {
             let uploaded = sink.finish_uploads().await?;
             if uploaded.infos.is_empty() {
@@ -5941,9 +6643,7 @@ impl TableWriteSession {
             }
         } else if let Some(mut roller) = self.roller.take() {
             // `finish` writes the last file's parquet footer locally.
-            if let Some(staged) = roller.finish()? {
-                self.rolled.add(staged);
-            }
+            stage_all(&mut self.rolled, roller.finish()?);
             let uploaded = self.rolled.finish().await?;
             if uploaded.infos.is_empty() {
                 // No rows arrived. Fall through to the single-file path, whose
@@ -6001,7 +6701,7 @@ impl TableWriteSession {
         // Finalise the parquet footer, then unwrap the `BufWriter` (its
         // `into_inner` flushes any buffered footer bytes to the OS file) so the
         // staging file on disk is the complete parquet.
-        let staged = writer.into_inner()?;
+        let (staged, leaf_stats) = writer.into_inner()?;
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
@@ -6034,7 +6734,7 @@ impl TableWriteSession {
             temp.path(),
             &self.column_ids,
             self.row_count,
-            &self.leaf_stats,
+            &leaf_stats,
         );
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
@@ -6234,6 +6934,201 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row group that fails to encode while rows are still being written
+    /// fails the write for good: the write that sees it fails, and so do
+    /// every later write and the finish, which commits nothing rather than a
+    /// file missing the row group's rows.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_group_failed_mid_write_fails_the_finish_and_commits_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let options = DuckLakeWriteOptions {
+            max_row_group_rows: Some(100),
+            ..Default::default()
+        }
+        .with_data_inlining_row_limit(0);
+        let writer = props_test_writer(&temp)
+            .await
+            .with_options(&options)
+            .with_encode_parallelism(2);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |lo: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow::array::Int64Array::from_iter_values(lo..lo + 100))],
+            )
+            .unwrap()
+        };
+        let mut session = writer
+            .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        session
+            .roller
+            .as_ref()
+            .and_then(|roller| roller.props.pool.as_ref())
+            .expect("a rolling session with an encode pool")
+            .set_before_encode(Arc::new(|sequence| {
+                if sequence == 0 {
+                    panic!("row group {sequence} failed");
+                }
+            }));
+        // A write sees the failure at the latest once the pool is full and
+        // the first row group must be appended.
+        let mut writes = 0;
+        while session.write_batch(&batch(writes * 100)).is_ok() {
+            writes += 1;
+            assert!(writes < 100, "no write saw the failed row group");
+        }
+        assert!(
+            session.write_batch(&batch(0)).is_err(),
+            "a write after the failure must fail"
+        );
+        let error = session
+            .finish()
+            .await
+            .expect_err("a write missing a row group must not commit");
+        assert!(error.to_string().contains("earlier row group"), "{error}");
+        let url = format!("sqlite:{}", temp.path().join("c.db").display());
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let (files,): (i64,) = sqlx::query_as("SELECT count(*) FROM ducklake_data_file")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(files, 0);
+    }
+
+    /// A partition file that fails while it is evicted fails the whole
+    /// partitioned write. With one partition file open, the switch to a second
+    /// partition evicts the first, and finishing it is where its failed row
+    /// group surfaces; that roller has already left the open set, so only the
+    /// sink remembers the failure. Every later write and the finish then fail,
+    /// and nothing commits, rather than the other partitions' rows without the
+    /// evicted one's.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partition_file_failed_on_eviction_fails_the_finish_and_commits_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", temp.path().join("c.db").display());
+        let metadata = Arc::new(
+            crate::SqliteMetadataWriter::new_with_init(&url)
+                .await
+                .unwrap(),
+        );
+        metadata
+            .set_data_path(temp.path().to_str().unwrap())
+            .unwrap();
+        let cols = vec![
+            ColumnDef::from_arrow("id", &DataType::Int64, false).unwrap(),
+            ColumnDef::from_arrow("region", &DataType::Utf8, false).unwrap(),
+        ];
+        let begun = metadata
+            .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+            .unwrap();
+        metadata
+            .publish_snapshot(
+                begun.table_id,
+                "main",
+                "events",
+                begun.snapshot_id,
+                WriteMode::Replace,
+                begun.base_snapshot_id,
+                &cols,
+                &begun.column_ids,
+            )
+            .unwrap();
+        metadata
+            .set_partition_spec(
+                begun.table_id,
+                &[(
+                    "region".to_string(),
+                    crate::partition::PartitionTransform::Identity,
+                )],
+            )
+            .unwrap();
+        let options = DuckLakeWriteOptions {
+            max_row_group_rows: Some(100),
+            ..Default::default()
+        }
+        .with_data_inlining_row_limit(0);
+        let writer = DuckLakeTableWriter::new(
+            metadata,
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        )
+        .unwrap()
+        .with_options(&options)
+        .with_max_open_partitions(1)
+        .with_encode_parallelism(2);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let batch = |region: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from_iter_values(0..100)),
+                    Arc::new(arrow::array::StringArray::from(vec![region; 100])),
+                ],
+            )
+            .unwrap()
+        };
+        let mut session = writer
+            .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        session
+            .partition_sink
+            .as_ref()
+            .and_then(|sink| sink.props.pool.as_ref())
+            .expect("a partitioned session with an encode pool")
+            .set_before_encode({
+                // Sequences are per queue, so fail only the first row group
+                // encoded at all: the "us" file's. The "eu" file encodes
+                // normally, and only the sink's memory of the failure can
+                // fail what follows.
+                let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                Arc::new(move |sequence| {
+                    if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        panic!("row group {sequence} failed");
+                    }
+                })
+            });
+        // The encode failure may already be reported by the time this write
+        // looks, so either outcome is fine here.
+        let _ = session.write_batch(&batch("us"));
+        let _ = session.write_batch(&batch("eu"));
+        session
+            .write_batch(&batch("eu"))
+            .expect_err("a write after the failure must fail");
+        session
+            .finish()
+            .await
+            .expect_err("a write missing a partition's rows must not commit");
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let (files,): (i64,) = sqlx::query_as("SELECT count(*) FROM ducklake_data_file")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(files, 0);
+        fn parquet_files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .map(|path| {
+                    if path.is_dir() {
+                        parquet_files(&path)
+                    } else {
+                        usize::from(path.extension().is_some_and(|ext| ext == "parquet"))
+                    }
+                })
+                .sum()
+        }
+        assert_eq!(
+            parquet_files(temp.path()),
+            0,
+            "the failed finish removes every file the write started"
+        );
+    }
 
     /// Staging a row mutation that fails validation removes the files the
     /// statement wrote for it; nothing references them.

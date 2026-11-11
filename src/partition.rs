@@ -655,6 +655,19 @@ pub(crate) fn split_batches_by_partition(
             per_batch.entry(values).or_default().push(row as u32);
         }
 
+        // Every row in one partition: the group's rows are the batch's, in
+        // order, which is what `take` with indices `0..num_rows` would copy.
+        // Hand the batch's own arrays over instead of copying them.
+        if per_batch_order.len() == 1 {
+            let values = per_batch_order.pop().expect("one partition");
+            let out = RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())?;
+            if !groups.contains_key(&values) {
+                order.push(values.clone());
+            }
+            groups.entry(values).or_default().push(out);
+            continue;
+        }
+
         // Materialize this batch's contribution to each group it touched.
         for values in per_batch_order {
             let indices = per_batch.remove(&values).unwrap_or_default();
@@ -830,6 +843,71 @@ mod tests {
         .unwrap();
         let values: Vec<Option<String>> = groups.iter().map(|(v, _)| v[0].clone()).collect();
         assert_eq!(values, vec![Some("a\u{0}b".to_string()), None]);
+    }
+
+    /// A batch whose rows share one partition goes through as it is: the
+    /// group holds the batch's own arrays, not copies. Batches of several
+    /// partitions are still split, and the two kinds join the same groups.
+    #[cfg(feature = "write")]
+    #[test]
+    fn a_batch_of_one_partition_is_not_copied() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let make = |regions: Vec<Option<&str>>, start: i64| {
+            let n = regions.len() as i64;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(regions)) as ArrayRef,
+                    Arc::new(arrow::array::Int64Array::from_iter_values(start..start + n)),
+                ],
+            )
+            .unwrap()
+        };
+        let one = make(vec![Some("us"), Some("us"), Some("us")], 0);
+        let mixed = make(vec![Some("eu"), Some("us"), None], 3);
+        let all_null = make(vec![None, None], 6);
+        let groups = split_batches_by_partition(
+            &schema,
+            &[one.clone(), mixed, all_null.clone()],
+            &identity_region_spec(),
+        )
+        .unwrap();
+        let group = |value: Option<&str>| {
+            groups
+                .iter()
+                .find(|(v, _)| v[0].as_deref() == value)
+                .map(|(_, b)| b)
+                .unwrap()
+        };
+        let us = group(Some("us"));
+        assert_eq!(us.len(), 2);
+        for (got, want) in us[0].columns().iter().zip(one.columns()) {
+            assert!(Arc::ptr_eq(got, want), "the one-partition batch was copied");
+        }
+        assert_eq!(us[1].num_rows(), 1);
+        let nulls = group(None);
+        assert_eq!(
+            nulls.len(),
+            2,
+            "the mixed batch's NULL row and the NULL batch"
+        );
+        assert!(Arc::ptr_eq(nulls[1].column(1), all_null.column(1)));
+        let ns = |b: &RecordBatch| -> Vec<i64> {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(ns(&nulls[0]), vec![5]);
+        assert_eq!(ns(&group(Some("eu"))[0]), vec![3]);
+        // Groups keep the order their partitions were first seen.
+        let order: Vec<Option<&str>> = groups.iter().map(|(v, _)| v[0].as_deref()).collect();
+        assert_eq!(order, vec![Some("us"), Some("eu"), None]);
     }
 
     #[test]
