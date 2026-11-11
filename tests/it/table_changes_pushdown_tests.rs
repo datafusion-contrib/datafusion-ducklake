@@ -1222,6 +1222,11 @@ async fn paging_spans_inlined_tables(lake: &Lake) {
         assert!(expected.len() >= 8, "{feed}: {expected:?}");
         for page in 1..=7 {
             let (paged, _) = lake.session_with(page, false);
+            // A pin is taken only from a free connection, and the last
+            // plan's read gives its connection back from a task of its own.
+            lake.pool
+                .settles_at(0, "the last plan's pinned read given back")
+                .await;
             let plan = physical(&paged, &sql).await.0;
             assert!(streams_pages(&plan), "{feed} page {page}");
             assert_eq!(
@@ -1357,6 +1362,9 @@ async fn a_transient_export_failure_is_probed_again() {
         .execute(pool)
         .await
         .unwrap();
+    lake.pool
+        .settles_at(0, "the last plan's read given back")
+        .await;
     let (plan, task) = plan_paged(&lake, &sqls[0]).await;
     assert!(streams_pages(&plan), "{:?}", plan_names(&plan));
     assert_eq!(collected(plan, task).await.unwrap(), expected);
@@ -1480,6 +1488,11 @@ async fn a_flush_after_planning_changes_no_answer(
     for sql in &sqls {
         let expected = rows(&whole, sql).await.unwrap();
         assert!(expected.len() > 4, "{sql}: {expected:?}");
+        // Each plan kept so far holds its one pinned read; wait for any
+        // other read to give its connection back before pinning the next.
+        lake.pool
+            .settles_at(planned.len(), "only the kept plans' reads held")
+            .await;
         let paged = plan(lake, sql).await;
         assert!(streams_pages(&paged.0), "{sql}: {:?}", plan_names(&paged.0));
         let held = physical(&whole, sql).await;
