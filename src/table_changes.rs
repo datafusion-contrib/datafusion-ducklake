@@ -49,9 +49,10 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, TryStreamExt};
 
 use crate::column_rename::ColumnRenameExec;
-use crate::feed_charge::{
-    KeyedInlinedRows, PlanCharge, file_deletes_bytes, inlined_rows_bytes, plan_charge, release,
-};
+use crate::feed_charge::{PlanCharge, file_deletes_bytes, plan_charge, release};
+use crate::feed_filter::{FeedFilter, filters_pushdown};
+use crate::inlined_feed::{InlinedFeedRows, InlinedSource};
+use crate::inlined_filter::InlinedFilter;
 use crate::metadata_provider::{
     DataFileChange, DuckLakeTableColumn, InlinedFileDeleteChange, InlinedRowSelection,
     MetadataProvider, snapshot_change_tokens,
@@ -64,7 +65,7 @@ use crate::table::{
 };
 use crate::table_deletions::{
     DeletedRowsExec, DeletionSource, FeedFiles, WindowDeletions, change_type_literal,
-    keyed_rows_schema, label_rows, project_feed, projected_table_indices,
+    file_scan_bytes, keyed_rows_schema, label_rows, project_feed, projected_table_indices,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
 use crate::types::DuckLakeDefaultExprAdapterFactory;
@@ -216,6 +217,14 @@ const ROWID_IDX: usize = 1;
 const CHANGE_TYPE_IDX: usize = 2;
 /// Number of CDC metadata columns preceding the table columns.
 const CDC_COLS: usize = 3;
+/// The CDC metadata columns' names, in order.
+const CDC_COLUMN_NAMES: [&str; CDC_COLS] = ["snapshot_id", "rowid", "change_type"];
+
+/// Whether the catalog statistics of `file` proved a feed's filter matches
+/// none of its rows.
+fn is_pruned(file: &DataFileChange, pruned: &HashSet<i64>) -> bool {
+    file.data_file_id.is_some_and(|id| pruned.contains(&id))
+}
 
 /// Custom execution plan that prepends CDC columns (snapshot_id, rowid, change_type) to each batch
 ///
@@ -668,6 +677,7 @@ impl TableChangesTable {
         layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
         encryption_factory: &Option<Arc<dyn EncryptionFactory>>,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let read_schema = self.file_read_schema(layout);
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
@@ -679,8 +689,15 @@ impl TableChangesTable {
             session_parquet_source(state, read_schema)
                 .with_parquet_file_reader_factory(reader_factory)
         };
-        self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
-            .await
+        self.build_exec_for_file_impl(
+            state,
+            data_file,
+            layout,
+            proj_info,
+            parquet_source,
+            predicate,
+        )
+        .await
     }
 
     /// Build a ParquetExec wrapped with PrependCDCColumnsExec for a single file
@@ -691,12 +708,20 @@ impl TableChangesTable {
         data_file: &DataFileChange,
         layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let parquet_source = session_parquet_source(state, self.file_read_schema(layout))
             .with_parquet_file_reader_factory(reader_factory);
-        self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
-            .await
+        self.build_exec_for_file_impl(
+            state,
+            data_file,
+            layout,
+            proj_info,
+            parquet_source,
+            predicate,
+        )
+        .await
     }
 
     /// The schema to scan one data file's table columns with: the file's own
@@ -717,7 +742,14 @@ impl TableChangesTable {
         layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
         parquet_source: ParquetSource,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // A filter the reader can prune row groups and pages with, when the
+        // caller has one for this file.
+        let parquet_source = match predicate {
+            Some(predicate) => parquet_source.with_predicate(predicate),
+            None => parquet_source,
+        };
         // Resolve file path
         let resolved_path = resolve_path(
             &self.table_path,
@@ -855,6 +887,7 @@ impl TableChangesTable {
     /// catalog schema, then a row-count probe when nothing else is read, then
     /// the embedded rowid, the embedded snapshot and the position, each when
     /// read.
+    #[allow(clippy::too_many_arguments)]
     fn insert_source(
         &self,
         state: &dyn Session,
@@ -863,6 +896,7 @@ impl TableChangesTable {
         resolve_rowid: bool,
         table_indices: &[usize],
         rewrites: &BTreeSet<i64>,
+        feed_filter: Option<&FeedFilter>,
     ) -> DataFusionResult<InsertSource> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let resolved = resolve_path(
@@ -916,12 +950,19 @@ impl TableChangesTable {
             } else {
                 (read_schema.into(), None)
             };
+        // The feed's filter, for the reader to prune row groups and pages with.
+        // Rows it drops match no filter above, and a position or embedded
+        // rowid it leaves is still the row's own.
+        let mut parquet_source = session_parquet_source(state, scan_schema)
+            .with_parquet_file_reader_factory(reader_factory);
+        if let Some(predicate) =
+            feed_filter.and_then(|filter| filter.file_predicate(&layout.read_schema))
+        {
+            parquet_source = parquet_source.with_predicate(predicate);
+        }
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(
-                session_parquet_source(state, scan_schema)
-                    .with_parquet_file_reader_factory(reader_factory),
-            ),
+            Arc::new(parquet_source),
         )
         .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]))
@@ -1085,6 +1126,8 @@ impl TableChangesTable {
         layouts: &[Arc<ParquetFileLayout>],
         projection: Option<&Vec<usize>>,
         charge: &PlanCharge,
+        feed_filter: Option<&FeedFilter>,
+        pruned: &HashSet<i64>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let table_len = self.table_schema.fields().len();
         // Both come from the same column list, and the index arithmetic of the
@@ -1122,7 +1165,9 @@ impl TableChangesTable {
             }
             if is_partial || layout.embedded_rowid_parquet_name.is_some() {
                 pairable.push((df, layout));
-            } else {
+            } else if !is_pruned(df, pruned) {
+                // A plain insert pairs with no deletion, so one the filter
+                // cannot match is not read.
                 plain.push((df, layout));
             }
         }
@@ -1156,9 +1201,12 @@ impl TableChangesTable {
         let has_deletions = !deletions.is_empty() || !inlined_deletes.is_empty();
 
         let window = (self.start_snapshot, self.end_snapshot);
+        // The filter narrows only reads of rows the feed reports, never the
+        // keys a row of the other side is paired by.
         let inserted = |files: &[(&DataFileChange, &Arc<ParquetFileLayout>)],
                         resolve_rowid: bool,
-                        table_indices: &[usize]|
+                        table_indices: &[usize],
+                        filter: Option<&FeedFilter>|
          -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
             if files.is_empty() {
                 return Ok(None);
@@ -1170,7 +1218,7 @@ impl TableChangesTable {
                     // correlation, so rowid is resolved for them even when it
                     // is not projected.
                     let resolve = resolve_rowid || df.partial_max.is_some();
-                    self.insert_source(state, df, layout, resolve, table_indices, rewrites)
+                    self.insert_source(state, df, layout, resolve, table_indices, rewrites, filter)
                 })
                 .collect::<DataFusionResult<Vec<_>>>()?;
             Ok(Some(Arc::new(InsertedRowsExec::new(
@@ -1184,15 +1232,16 @@ impl TableChangesTable {
         // Inserted rows that can pair: the pairable files and the inlined
         // inserts, which carry their row ids (one written by an UPDATE keeps
         // the row id of the version it supersedes).
-        let pairable_rows =
-            |table_indices: &[usize]| -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
-                let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
-                execs.extend(inserted(&pairable, true, table_indices)?);
-                if !inlined_inserts.is_empty() {
-                    execs.push(inlined_inserts.exec(table_indices)?);
-                }
-                union_of(execs)
-            };
+        let pairable_rows = |table_indices: &[usize],
+                             filter: Option<&FeedFilter>|
+         -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
+            execs.extend(inserted(&pairable, true, table_indices, filter)?);
+            if !inlined_inserts.is_empty() {
+                execs.push(inlined_inserts.exec(table_indices)?);
+            }
+            union_of(execs)
+        };
         // Deleted rows: the positions newly masked in the window and the
         // inlined row versions deleted in it. Their rowids are resolved when
         // output or when an insertion could pair with them.
@@ -1217,10 +1266,10 @@ impl TableChangesTable {
         };
 
         let mut branches: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(3);
-        if let Some(rows) = inserted(&plain, need_rowid, &table_indices)? {
+        if let Some(rows) = inserted(&plain, need_rowid, &table_indices, feed_filter)? {
             branches.push(label_rows(rows, ChangeType::Insert.as_str())?);
         }
-        if let Some(rows) = pairable_rows(&table_indices)? {
+        if let Some(rows) = pairable_rows(&table_indices, feed_filter)? {
             let keys = if has_deletions {
                 deleted_rows(&[], true)?
             } else {
@@ -1235,7 +1284,7 @@ impl TableChangesTable {
         }
         if let Some(rows) = deleted_rows(&table_indices, need_rowid || has_pairable)? {
             let keys = if has_pairable {
-                pairable_rows(&[])?
+                pairable_rows(&[], None)?
             } else {
                 None
             };
@@ -1272,15 +1321,33 @@ impl TableProvider for TableChangesTable {
         TableType::View
     }
 
+    /// `Inexact` for a filter over the table's own columns, which narrows the
+    /// insertion reads (data files, row groups, inlined rows); every filter is applied
+    /// above the feed as well, so the rows it returns are unchanged.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::prelude::Expr],
+    ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(filters_pushdown(
+            filters,
+            &self.table_schema,
+            &CDC_COLUMN_NAMES,
+        ))
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[datafusion::prelude::Expr],
+        filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Analyze projection to determine what to read
         let proj_info = self.analyze_projection(projection);
+        // The filters over the table's columns, which narrow the insertion
+        // reads only: data files by their catalog statistics, row groups by
+        // the Parquet reader, and (on the insertions feed) the inlined rows.
+        let feed_filter = FeedFilter::new(state, filters, &self.table_schema, &CDC_COLUMN_NAMES);
 
         // The columns as of the window's END snapshot, carrying the field ids the
         // per-file read schemas are built from — official DuckLake resolves a
@@ -1297,7 +1364,7 @@ impl TableProvider for TableChangesTable {
         // What the plan holds from the catalog is charged to the session's
         // memory pool as it is read, and for as long as the plan holds it.
         let charge = plan_charge(state, "ducklake_table_changes");
-        let (data_files, window_deletions, rewrites, inlined) =
+        let (data_files, window_deletions, rewrites, inlined, pruned) =
             crate::metadata_provider::read_consistently(&self.provider, |provider| {
                 let external = |e| DataFusionError::External(Box::new(e));
                 // A rewrite's snapshot changes no row: the feed reports neither
@@ -1330,26 +1397,57 @@ impl TableProvider for TableChangesTable {
                 // Inlined inserts, inlined rows deleted or superseded in the
                 // window, and inlined deletions of Parquet-resident rows. Each
                 // carries its own row id and snapshot, so none of them depends
-                // on scan order.
+                // on scan order. The insertions feed pairs its inlined inserts
+                // with nothing, so the filter narrows their read too.
+                let source = InlinedSource {
+                    reader: provider.as_ref(),
+                    table_id: self.table_id,
+                    columns: &columns,
+                    table_schema: &self.table_schema,
+                    page_rows: state.config().batch_size(),
+                    charge: &charge,
+                    pinned: Default::default(),
+                };
+                let insert_filter = feed_filter
+                    .as_ref()
+                    .filter(|_| self.insertions_only)
+                    .and_then(FeedFilter::inlined);
                 let inlined = InlinedChanges::read(
-                    provider.as_ref(),
-                    self.table_id,
-                    &columns,
-                    &self.table_schema,
+                    &source,
                     (self.start_snapshot, self.end_snapshot),
                     !self.insertions_only,
-                    &charge,
+                    insert_filter,
                 )?;
-                Ok::<_, DataFusionError>((data_files, window_deletions, rewrites, inlined))
+                // The data files whose catalog statistics prove the filter
+                // matches none of their rows.
+                let pruned = match &feed_filter {
+                    Some(filter) => filter.pruned_files(
+                        provider.as_ref(),
+                        self.table_id,
+                        &columns,
+                        &data_files,
+                    )?,
+                    None => HashSet::new(),
+                };
+                Ok::<_, DataFusionError>((data_files, window_deletions, rewrites, inlined, pruned))
             })?;
+
+        // A window without deletions pairs no insertion with one, so a pruned
+        // file is dropped outright; with deletions, only a file whose rows
+        // cannot pair (a plain insert) is, once the files are told apart.
+        let pairs_insertions = !window_deletions.is_empty()
+            || !inlined.deletes.is_empty()
+            || !inlined.file_deletes.is_empty();
+        let mut data_files = data_files;
+        if !pairs_insertions && !pruned.is_empty() {
+            data_files.retain(|file| !is_pruned(file, &pruned));
+        }
 
         // Handle empty case
         if data_files.is_empty() && window_deletions.is_empty() && inlined.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
-
-        let mut data_files = data_files;
 
         // Decide whether to take the correlated path (reading delete sources to
         // emit `delete` rows and pair an UPDATE's delete+insert into
@@ -1434,8 +1532,18 @@ impl TableProvider for TableChangesTable {
                     &layouts,
                     projection,
                     &charge,
+                    feed_filter.as_ref(),
+                    &pruned,
                 )
                 .await;
+        }
+
+        // Every row read here surfaces as an `insert`, paired with nothing, so
+        // no pruned file is needed.
+        data_files.retain(|file| !is_pruned(file, &pruned));
+        if data_files.is_empty() && inlined.inserts.is_empty() {
+            use datafusion::physical_plan::empty::EmptyExec;
+            return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
@@ -1482,6 +1590,9 @@ impl TableProvider for TableChangesTable {
                         .await?,
                 )
             };
+            let predicate = feed_filter.as_ref().and_then(|filter| {
+                filter.file_predicate(&self.file_read_schema(layout.as_deref()))
+            });
             #[cfg(feature = "encryption")]
             let exec = self
                 .build_exec_for_file(
@@ -1490,11 +1601,12 @@ impl TableProvider for TableChangesTable {
                     layout.as_deref(),
                     &proj_info,
                     &encryption_factory,
+                    predicate,
                 )
                 .await?;
             #[cfg(not(feature = "encryption"))]
             let exec = self
-                .build_exec_for_file(state, data_file, layout.as_deref(), &proj_info)
+                .build_exec_for_file(state, data_file, layout.as_deref(), &proj_info, predicate)
                 .await?;
             execs.push(exec);
         }
@@ -1710,6 +1822,27 @@ impl InsertedRowsExec {
     }
 }
 
+impl InsertedRowsExec {
+    /// The per-file scans this node runs internally, one per inserted data
+    /// file of the window, which it does not expose as children.
+    pub fn file_scans(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.sources.iter().map(|source| &source.scan).collect()
+    }
+
+    /// An estimate of the bytes this node reads from object storage: over
+    /// [`Self::file_scans`], each file's size times the share of its columns
+    /// the scan projects. It ignores row-group pruning and compression, and
+    /// files the window's filter pruned are not among the scans. A caller that
+    /// walks a plan's `DataSourceExec`s to cost it adds this for this node,
+    /// whose scans are not children.
+    pub fn estimated_scan_bytes(&self) -> u64 {
+        self.file_scans()
+            .into_iter()
+            .map(file_scan_bytes)
+            .fold(0, u64::saturating_add)
+    }
+}
+
 impl DisplayAs for InsertedRowsExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
@@ -1905,53 +2038,48 @@ fn int64_column<'a>(
 }
 
 /// The inlined row versions one change-feed window reads, charged to the
-/// plan's [`PlanCharge`] as each is read.
+/// plan's [`PlanCharge`] as each is read; see [`InlinedFeedRows`] for how
+/// they are paged.
 pub(crate) struct InlinedChanges {
     /// Inlined row versions written in the window.
-    pub(crate) inserts: KeyedInlinedRows,
+    pub(crate) inserts: InlinedFeedRows,
     /// Inlined row versions deleted or superseded in the window.
-    pub(crate) deletes: KeyedInlinedRows,
+    pub(crate) deletes: InlinedFeedRows,
     /// Inlined deletions of Parquet-resident rows made in the window.
     pub(crate) file_deletes: Vec<InlinedFileDeleteChange>,
 }
 
 impl InlinedChanges {
     /// Read the window's inlined changes; the delete side only when
-    /// `read_deletes`.
+    /// `read_deletes`. `insert_filter` narrows the inlined inserts, and may
+    /// only be given where every insert it drops would be dropped above the
+    /// feed and pairs with no deletion.
     pub(crate) fn read(
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        columns: &[DuckLakeTableColumn],
-        table_schema: &SchemaRef,
+        source: &InlinedSource<'_>,
         (start, end): (i64, i64),
         read_deletes: bool,
-        charge: &PlanCharge,
+        insert_filter: Option<&InlinedFilter>,
     ) -> DataFusionResult<Self> {
-        let inserts = Self::read_rows(
-            provider,
-            table_id,
-            columns,
-            table_schema,
+        let inserts = InlinedFeedRows::read(
+            source,
             InlinedRowSelection::InsertedBetween {
                 start,
                 end,
             },
-            charge,
+            insert_filter,
         )?;
         let (deletes, file_deletes) = if read_deletes {
             (
-                Self::read_deletes(
-                    provider,
-                    table_id,
-                    columns,
-                    table_schema,
+                Self::read_deletes(source, (start, end))?,
+                Self::read_file_deletes(
+                    source.reader,
+                    source.table_id,
                     (start, end),
-                    charge,
+                    source.charge,
                 )?,
-                Self::read_file_deletes(provider, table_id, (start, end), charge)?,
             )
         } else {
-            (KeyedInlinedRows::empty(charge), Vec::new())
+            (InlinedFeedRows::empty(source.charge), Vec::new())
         };
         Ok(Self {
             inserts,
@@ -1962,23 +2090,16 @@ impl InlinedChanges {
 
     /// Inlined row versions deleted or superseded in the window.
     pub(crate) fn read_deletes(
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        columns: &[DuckLakeTableColumn],
-        table_schema: &SchemaRef,
+        source: &InlinedSource<'_>,
         (start, end): (i64, i64),
-        charge: &PlanCharge,
-    ) -> DataFusionResult<KeyedInlinedRows> {
-        Self::read_rows(
-            provider,
-            table_id,
-            columns,
-            table_schema,
+    ) -> DataFusionResult<InlinedFeedRows> {
+        InlinedFeedRows::read(
+            source,
             InlinedRowSelection::DeletedBetween {
                 start,
                 end,
             },
-            charge,
+            None,
         )
     }
 
@@ -2009,26 +2130,6 @@ impl InlinedChanges {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         charge.try_grow(file_deletes_bytes(&changes))?;
         Ok(changes)
-    }
-
-    /// Read the inlined row versions `selection` names, charge them, and key
-    /// them; the charge then follows what the keyed rows hold.
-    fn read_rows(
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        columns: &[DuckLakeTableColumn],
-        table_schema: &SchemaRef,
-        selection: InlinedRowSelection,
-        charge: &PlanCharge,
-    ) -> DataFusionResult<KeyedInlinedRows> {
-        let rows = provider
-            .read_inlined_rows(table_id, columns, selection, None)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let read = inlined_rows_bytes(&rows);
-        charge.try_grow(read)?;
-        let keyed = KeyedInlinedRows::new(rows, table_schema, charge)?;
-        release(charge, read.saturating_sub(keyed.bytes()));
-        Ok(keyed)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -2326,6 +2427,15 @@ impl TableProvider for TableInsertionsTable {
 
     fn table_type(&self) -> TableType {
         TableType::View
+    }
+
+    /// As the changes feed answers: `Inexact` for a filter over the table's
+    /// own columns, which narrows the reads; every filter is applied above.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::prelude::Expr],
+    ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
     }
 
     async fn scan(

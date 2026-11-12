@@ -42,7 +42,53 @@ where
         pool: &Pool<DB>,
         begin: &[&'static str],
     ) -> std::result::Result<Self, sqlx::Error> {
-        let mut connection = pool.acquire().await?;
+        Self::begin_on(pool.acquire().await?, begin).await
+    }
+
+    /// Begin as [`Self::begin`] does, on a connection `pool` hands over
+    /// without waiting for an idle one: an idle one, or a new one while the
+    /// pool has fewer than its maximum. Losing the race for the pool's last
+    /// free place can still make it wait briefly for a connection given back.
+    ///
+    /// `None` when every connection the pool may hold is taken, or when the
+    /// connection cannot be opened or the transaction cannot begin on it. A
+    /// read that is an optimisation, such as a pinned read, begins this way,
+    /// so that a busy or failing pool degrades it rather than failing the
+    /// query that wanted it. An idle connection is taken without the pool's
+    /// checks before use, so one the server has closed fails to begin and is
+    /// discarded.
+    pub(crate) async fn try_begin(pool: &Pool<DB>, begin: &[&'static str]) -> Option<Self> {
+        let connection = match pool.try_acquire() {
+            Some(connection) => connection,
+            // A connection the pool opens is waited for only as long as it
+            // takes to open; a task that took the last free place first makes
+            // this wait for a connection given back, as any acquire would.
+            None if pool.size() < pool.options().get_max_connections() => {
+                match pool.acquire().await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::debug!(%error, "no catalog connection to begin a read on");
+                        return None;
+                    },
+                }
+            },
+            None => return None,
+        };
+        match Self::begin_on(connection, begin).await {
+            Ok(read) => Some(read),
+            Err(error) => {
+                tracing::debug!(%error, "a catalog read failed to begin");
+                None
+            },
+        }
+    }
+
+    /// Run `begin` on `connection`, statement by statement; the last one
+    /// starts the transaction.
+    async fn begin_on(
+        mut connection: PoolConnection<DB>,
+        begin: &[&'static str],
+    ) -> std::result::Result<Self, sqlx::Error> {
         for statement in begin {
             if let Err(error) = sqlx::raw_sql(*statement).execute(&mut *connection).await {
                 // The connection may be inside a transaction it cannot leave.
@@ -72,11 +118,24 @@ where
     /// Commit the transaction and give the connection back to the pool.
     /// Committing a committed read does nothing.
     pub(crate) async fn commit(&self) -> std::result::Result<(), sqlx::Error> {
+        self.end_with("COMMIT").await
+    }
+
+    /// Roll the transaction back and give the connection back to the pool:
+    /// [`Self::commit`] for a read that wrote scratch state of its own, such
+    /// as SQLite temporary tables, which must not outlive it on a pooled
+    /// connection. Ending an ended read does nothing.
+    #[cfg_attr(not(feature = "metadata-sqlite"), allow(dead_code))]
+    pub(crate) async fn rollback(&self) -> std::result::Result<(), sqlx::Error> {
+        self.end_with("ROLLBACK").await
+    }
+
+    async fn end_with(&self, statement: &'static str) -> std::result::Result<(), sqlx::Error> {
         let Some(mut connection) = self.connection.lock().await.take() else {
             return Ok(());
         };
         self.open.store(false, Ordering::Release);
-        if let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut *connection).await {
+        if let Err(error) = sqlx::raw_sql(statement).execute(&mut *connection).await {
             connection.close_on_drop();
             return Err(error);
         }

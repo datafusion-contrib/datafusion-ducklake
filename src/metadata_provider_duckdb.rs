@@ -2974,6 +2974,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         row_id_start: row.get(6)?,
                         partial_max: row.get(7)?,
                         mapping_id: row.get(8)?,
+                        data_file_id: None,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3012,6 +3013,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     row_id_start: row.get(6)?,
                     partial_max: info.as_deref().and_then(parse_partial_file_info_max),
                     mapping_id: row.get(8)?,
+                    data_file_id: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?

@@ -45,21 +45,41 @@
 //!
 //! # Memory
 //!
-//! The rows of a row group are charged to the pool's budget while it is
-//! assembled; its job is charged as much again for the pages it encodes; once
-//! the job finishes the charge is what its column chunks hold, until the row
-//! group is appended.
+//! A pool is either a write's own ([`EncodePool::new`], from the write's
+//! `encode_parallelism`) or one a caller shares across all its writes
+//! ([`EncodePool::try_new`]). Both count the row groups out, handed to the
+//! pool and not yet appended, across every queue they serve, and charge each
+//! row group out to the pool's byte budget: twice its rows' size in memory
+//! (its input, and as much again for the pages it encodes) until its job
+//! finishes, then what its column chunks hold, until it is appended. They
+//! differ in how a row group is admitted.
 //!
-//! The pool also counts the row groups out, handed to it and not yet
-//! appended, across every queue it serves. When a row group is ready and the
-//! budget is spent, or the pool already has `2 × threads` row groups out, its
-//! queue appends its own earliest one before handing out another. A queue
-//! with nothing out hands it out anyway, so a row group larger than the
-//! budget is still written, and no queue waits on another's. A write
-//! therefore has at most `2 × threads` row groups out, plus one for each
-//! other queue holding rows: each file sequence of an unpartitioned write or
-//! lane, and each open partition file (up to `max_open_partitions`) of a
-//! partitioned one.
+//! A write's own pool admits loosely. The rows of a row group are charged
+//! while it is assembled. When a row group is ready and the budget is spent,
+//! or the pool already has `2 × threads` row groups out, its queue appends
+//! its own earliest one before handing out another. A queue with nothing out
+//! hands it out anyway, so a row group larger than the budget is still
+//! written, and no queue waits on another's. A write therefore has at most
+//! `2 × threads` row groups out, plus one for each other queue holding rows:
+//! each file sequence of an unpartitioned write or lane, and each open
+//! partition file (up to `max_open_partitions`) of a partitioned one.
+//!
+//! A shared pool admits strictly ([`RowGroupQueue::dispatch_checked`]). A row
+//! group is handed out only when its charge fits in what the budget has left
+//! and the pool has fewer than `2 × threads` row groups out, both checked and
+//! taken in one atomic step each. When it does not fit, its queue appends its
+//! own earliest row group out, which gives that charge back, and tries
+//! again; once the queue has nothing out it encodes the row group on its own
+//! thread, as a one-thread write does, and appends it at once. A write is
+//! never refused for want of budget, and no queue waits on another's row
+//! groups. A row group's charge is taken before it is handed out and is never
+//! grown past the budget: a job whose chunks hold more than it was charged
+//! keeps the charge it had unless the budget has room for the rest. So the
+//! charges of the row groups out, across every write sharing the pool, never
+//! pass the budget, and at most `2 × threads` are out; beyond that each queue
+//! holds the one row group it is assembling, or encoding on its own thread,
+//! as a one-thread writer holds one. The rows being assembled are not
+//! charged.
 //!
 //! # Failure
 //!
@@ -70,9 +90,11 @@
 //! Not counted: buffers a batch slice keeps alive beyond its own rows (a slice
 //! of a larger batch pins the whole parent), the encoders' working memory
 //! beyond the pages they hold, the distinct values counted to choose a row
-//! group's encoding, and the bloom filters and page indexes a file keeps until
-//! its footer is written. The budget bounds what is queued, not the process's
-//! memory.
+//! group's encoding, the bloom filters and page indexes a file keeps until
+//! its footer is written, and, in a shared pool, the row group each queue
+//! assembles or encodes on its own thread and the pages of a job beyond its
+//! charge that the budget has no room for. The budget bounds what is queued,
+//! not the process's memory.
 //!
 //! # What runs on one thread instead
 //!
@@ -117,10 +139,52 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// Threads that encode row groups, started as jobs arrive, and the memory
-/// budget and count of the row groups they are handed. Shared by every queue
-/// of a write: its files, partitions and lanes.
-pub(crate) struct EncodePool {
+/// Threads that encode the row groups of Parquet data files, with a byte
+/// budget and a count of the row groups handed to them.
+///
+/// Without one, a write that encodes on several threads
+/// ([`DuckLakeWriteOptions::encode_parallelism`](crate::DuckLakeWriteOptions::encode_parallelism))
+/// makes a pool of its own. [`EncodePool::try_new`] makes one a caller shares
+/// across all its writes
+/// ([`DuckLakeWriteOptions::encode_pool`](crate::DuckLakeWriteOptions::encode_pool),
+/// [`DuckLakeTableWriter::with_encode_pool`](crate::DuckLakeTableWriter::with_encode_pool)),
+/// as DuckDB shares one thread pool and one memory limit across the
+/// connections of a database instance: its threads and its budget are then
+/// limits on every write together, not on each.
+///
+/// A row group goes to a shared pool only when it fits: its charge, twice
+/// its rows' size in memory (its input, and as much again for the pages it
+/// encodes), within what the budget has left, and fewer than `2 × threads`
+/// row groups out (handed to the pool and not yet appended to their files)
+/// across every write. Once encoded, its charge becomes what its column
+/// chunks hold, grown only within the budget, until it is appended. A row
+/// group that does not fit is not refused and does not wait for another
+/// write: its write first appends its own row groups out, which gives their
+/// charge back, and once it has none out, encodes the row group on its own
+/// thread, as a single-threaded write does, and appends it.
+///
+/// So the charges of the row groups out never add up to more than the
+/// budget, and at most `2 × threads` are out, whatever the number of writes.
+/// Beyond that, each file a write is filling (each file sequence of a write
+/// or of one of its lanes, and each open partition file of a partitioned
+/// write) holds the one row group it is assembling or encoding on its own
+/// thread, as a single-threaded writer holds one.
+///
+/// This is not a bound on the process's memory. It leaves out what a batch
+/// slice keeps alive beyond its own rows (a slice of a larger batch pins the
+/// whole batch), the encoders' working memory beyond the pages they hold, the
+/// distinct values counted to choose a row group's encoding, the bloom
+/// filters and page indexes a file keeps until its footer is written, the
+/// row groups being assembled or encoded on a writer's own thread, and the
+/// pages of a row group beyond its charge that the budget has no room for.
+/// Files written with content-defined chunking, and encrypted files, are
+/// encoded on the thread that writes them, outside the pool.
+///
+/// Sharing a pool changes no file contents: a write's row groups close at
+/// the same rows and each is encoded from its own rows the same way, on
+/// whichever thread, so its files are those of the same write on a pool of
+/// its own.
+pub struct EncodePool {
     threads: usize,
     budget: Arc<Budget>,
     workers: Mutex<Workers>,
@@ -145,6 +209,7 @@ impl std::fmt::Debug for EncodePool {
         f.debug_struct("EncodePool")
             .field("threads", &self.threads)
             .field("budget", &self.budget.limit)
+            .field("shared", &self.budget.checked)
             .field("reserved", &self.budget.reserved.load(Ordering::Relaxed))
             .field("out", &self.budget.out.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -169,22 +234,57 @@ impl EncodePool {
         (threads > 1).then(|| Self::with_budget(threads, budget))
     }
 
-    /// A pool of `threads` threads, a budget of `budget` bytes, and at most
-    /// `2 × threads` row groups out (see the module docs).
+    /// A pool of `threads` threads and a budget of `budget_bytes` bytes, to
+    /// share across writes; see the type's docs for how it admits row groups
+    /// and what it bounds. One thread is allowed: row groups are then
+    /// encoded on it while the writer assembles the next one.
+    ///
+    /// Threads start as the first row groups arrive, and stop once the last
+    /// handle to the pool, and every write holding one, is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`DuckLakeError::InvalidConfig`] when `threads` or `budget_bytes` is 0.
+    pub fn try_new(threads: usize, budget_bytes: usize) -> Result<Arc<Self>> {
+        if threads == 0 {
+            return Err(DuckLakeError::InvalidConfig(
+                "an encode pool needs at least one thread".to_string(),
+            ));
+        }
+        if budget_bytes == 0 {
+            return Err(DuckLakeError::InvalidConfig(
+                "an encode pool needs a budget of at least one byte".to_string(),
+            ));
+        }
+        Ok(Self::build(threads, budget_bytes, true))
+    }
+
+    /// A write's own pool of `threads` threads, a budget of `budget` bytes,
+    /// and at most `2 × threads` row groups out, admitting loosely (see the
+    /// module docs).
     pub(crate) fn with_budget(threads: usize, budget: usize) -> Arc<Self> {
+        Self::build(threads, budget, false)
+    }
+
+    fn build(threads: usize, budget: usize, checked: bool) -> Arc<Self> {
         let threads = threads.max(1);
         let (jobs, queue) = mpsc::channel();
         Arc::new(Self {
             threads,
             budget: Arc::new(Budget {
                 limit: budget,
+                checked,
                 reserved: AtomicUsize::new(0),
                 max_out: threads.saturating_mul(2),
                 out: AtomicUsize::new(0),
                 #[cfg(test)]
                 peak_out: AtomicUsize::new(0),
                 #[cfg(test)]
+                peak_reserved: AtomicUsize::new(0),
+                #[cfg(test)]
                 waits: AtomicUsize::new(0),
+                #[cfg(test)]
+                encoded_here: AtomicUsize::new(0),
             }),
             workers: Mutex::new(Workers {
                 started: 0,
@@ -247,6 +347,36 @@ impl EncodePool {
             budget: Arc::clone(&self.budget),
         }
     }
+
+    /// Bytes charged to the budget now.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.budget.reserved.load(Ordering::Relaxed)
+    }
+
+    /// The most bytes ever charged to the budget at once.
+    #[cfg(test)]
+    pub(crate) fn peak_reserved(&self) -> usize {
+        self.budget.peak_reserved.load(Ordering::Relaxed)
+    }
+
+    /// Row groups out now.
+    #[cfg(test)]
+    pub(crate) fn out(&self) -> usize {
+        self.budget.out.load(Ordering::Relaxed)
+    }
+
+    /// The most row groups ever out at once.
+    #[cfg(test)]
+    pub(crate) fn peak_out(&self) -> usize {
+        self.budget.peak_out.load(Ordering::Relaxed)
+    }
+
+    /// Row groups a shared pool could not take, encoded by their writers.
+    #[cfg(test)]
+    pub(crate) fn encoded_here(&self) -> usize {
+        self.budget.encoded_here.load(Ordering::Relaxed)
+    }
 }
 
 /// A pool thread: run jobs until the pool is dropped.
@@ -263,6 +393,9 @@ fn work(queue: &Mutex<Receiver<Job>>) {
 #[derive(Debug)]
 struct Budget {
     limit: usize,
+    /// Whether row groups are admitted strictly, as a shared pool admits them
+    /// ([`RowGroupQueue::dispatch_checked`]), rather than loosely.
+    checked: bool,
     reserved: AtomicUsize,
     /// Row groups out across every queue of the pool, past which a queue
     /// with one out appends before it hands out another.
@@ -271,17 +404,70 @@ struct Budget {
     /// The most row groups ever out at once.
     #[cfg(test)]
     peak_out: AtomicUsize,
+    /// The most bytes ever charged at once.
+    #[cfg(test)]
+    peak_reserved: AtomicUsize,
     /// How many times a queue began waiting for one of its row groups.
     #[cfg(test)]
     waits: AtomicUsize,
+    /// Row groups a checked pool could not take, encoded by their queues.
+    #[cfg(test)]
+    encoded_here: AtomicUsize,
 }
 
 impl Budget {
     /// Whether a queue with row groups out appends one before it hands out
-    /// another.
+    /// another, in a pool that admits loosely.
     fn full(&self) -> bool {
         self.reserved.load(Ordering::Relaxed) > self.limit
             || self.out.load(Ordering::Relaxed) >= self.max_out
+    }
+
+    /// Charge `bytes` and count one more row group out, if the charge fits
+    /// in what the budget has left and fewer than `max_out` are out; else
+    /// take nothing. Each is checked and taken in one atomic step, so
+    /// concurrent queues never take past either limit.
+    fn try_admit(self: &Arc<Self>, bytes: usize) -> Option<(Reservation, OutSlot)> {
+        let _out = self
+            .out
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |out| {
+                (out < self.max_out).then_some(out + 1)
+            })
+            .ok()?
+            + 1;
+        // Dropped, and the count given back, if the charge does not fit.
+        let slot = OutSlot {
+            budget: Arc::clone(self),
+        };
+        if !self.try_charge(bytes) {
+            return None;
+        }
+        #[cfg(test)]
+        self.peak_out.fetch_max(_out, Ordering::Relaxed);
+        Some((
+            Reservation {
+                budget: Arc::clone(self),
+                bytes,
+            },
+            slot,
+        ))
+    }
+
+    /// Add `bytes` to the charge if the total stays within the budget.
+    fn try_charge(&self, bytes: usize) -> bool {
+        let charged =
+            self.reserved
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                    reserved
+                        .checked_add(bytes)
+                        .filter(|total| *total <= self.limit)
+                });
+        #[cfg(test)]
+        if let Ok(before) = charged {
+            self.peak_reserved
+                .fetch_max(before + bytes, Ordering::Relaxed);
+        }
+        charged.is_ok()
     }
 }
 
@@ -308,15 +494,32 @@ struct Reservation {
 impl Reservation {
     fn resize(&mut self, bytes: usize) {
         if bytes > self.bytes {
-            self.budget
+            let _before = self
+                .budget
                 .reserved
                 .fetch_add(bytes - self.bytes, Ordering::Relaxed);
+            #[cfg(test)]
+            self.budget
+                .peak_reserved
+                .fetch_max(_before + bytes - self.bytes, Ordering::Relaxed);
         } else {
             self.budget
                 .reserved
                 .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
         }
         self.bytes = bytes;
+    }
+
+    /// Charge what an encoded row group's chunks hold, `bytes`. A checked
+    /// pool never grows a charge past its budget: a row group whose chunks
+    /// outgrow its charge keeps the charge it had when the budget has no
+    /// room for the rest.
+    fn settle(&mut self, bytes: usize) {
+        if !self.budget.checked || bytes <= self.bytes {
+            self.resize(bytes);
+        } else if self.budget.try_charge(bytes - self.bytes) {
+            self.bytes = bytes;
+        }
     }
 }
 
@@ -347,8 +550,9 @@ pub(crate) struct EncodedRowGroup {
     leaf_stats: WrittenLeafStats,
     /// The chunks' charge, released once they are appended.
     _reservation: Reservation,
-    /// The row group's place among the pool's row groups out.
-    _slot: OutSlot,
+    /// The row group's place among the pool's row groups out; `None` for a
+    /// row group its queue encoded itself.
+    _slot: Option<OutSlot>,
 }
 
 /// Encode `batches` as one row group: choose its encoding from its rows,
@@ -390,6 +594,29 @@ fn encode_row_group(
         .map(ArrowColumnWriter::close)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((chunks, leaf_stats, bytes))
+}
+
+/// Encode row group `sequence` of a queue, on a pool thread or the queue's
+/// own: [`encode_row_group`], with a panic turned into an error.
+fn encode_job(
+    encoding: &GroupEncoding,
+    sequence: u64,
+    batches: &[RecordBatch],
+) -> Result<(Vec<ArrowColumnChunk>, WrittenLeafStats, usize)> {
+    #[cfg(not(test))]
+    let _ = sequence;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if let Some(hook) = &encoding.before_encode {
+            hook(sequence);
+        }
+        encode_row_group(encoding, batches)
+    }))
+    .unwrap_or_else(|_| {
+        Err(DuckLakeError::Internal(
+            "encoding a row group panicked".to_string(),
+        ))
+    })
 }
 
 /// The rows of the row group being assembled.
@@ -506,7 +733,8 @@ impl RowGroupQueue {
     /// Add `batch`'s rows, handing out every row group they complete, and
     /// pass `deliver` each finished row group, in order, that is ready.
     /// Blocks while the pool's budget is spent or it has its most row groups
-    /// out, appending this queue's earliest one.
+    /// out, appending this queue's earliest one; a shared pool's queue with
+    /// none out encodes a row group the pool cannot take on this thread.
     ///
     /// An error fails the queue: every later push and finish returns one.
     pub(crate) fn push(&mut self, batch: &RecordBatch, deliver: &mut Deliver<'_>) -> Result<()> {
@@ -532,10 +760,13 @@ impl RowGroupQueue {
             assembly.bytes += bytes;
             assembly.batches.push(head);
             let total = assembly.bytes;
-            assembly
-                .reservation
-                .get_or_insert_with(|| self.pool.reserve(0))
-                .resize(total);
+            // A checked pool charges a row group when it is handed out.
+            if !self.pool.budget.checked {
+                assembly
+                    .reservation
+                    .get_or_insert_with(|| self.pool.reserve(0))
+                    .resize(total);
+            }
             let full = self.max_rows.is_some_and(|max| assembly.rows >= max)
                 || self.max_bytes.is_some_and(|max| assembly.bytes >= max);
             if full {
@@ -603,7 +834,9 @@ impl RowGroupQueue {
     /// Hand the row group being assembled to the pool, first appending this
     /// queue's earliest row groups out while the pool's budget is spent or it
     /// has its most row groups out. A queue with none out hands its row group
-    /// out at once: it would otherwise wait on another queue's.
+    /// out at once: it would otherwise wait on another queue's. A pool that
+    /// admits strictly takes it only once it fits
+    /// ([`Self::dispatch_checked`]).
     fn dispatch(&mut self, deliver: &mut Deliver<'_>) -> Result<()> {
         let Assembly {
             batches,
@@ -614,45 +847,97 @@ impl RowGroupQueue {
         if rows == 0 {
             return Ok(());
         }
+        if self.pool.budget.checked {
+            return self.dispatch_checked(batches, rows, bytes, deliver);
+        }
         let mut reservation = reservation.unwrap_or_else(|| self.pool.reserve(0));
         // The rows, and as much again for the pages they encode to.
         reservation.resize(bytes.saturating_mul(2));
         while self.appended < self.dispatched && self.pool.budget.full() {
             self.deliver_next(deliver)?;
         }
+        let slot = self.pool.take_slot();
+        self.submit(batches, rows, reservation, slot);
+        Ok(())
+    }
+
+    /// Hand a row group of `rows` rows, `bytes` in memory, to a pool that
+    /// admits strictly, once its charge fits: twice `bytes`, for the rows and
+    /// the pages they encode to, within what the budget has left, and one
+    /// more row group out within the pool's most. Until it fits, append this
+    /// queue's earliest row group out, which gives its charge back; once the
+    /// queue has none out, encode the row group here, on the calling thread,
+    /// and append it at once. So the queue never waits on another queue's
+    /// row groups, a write is never refused for want of budget, and the row
+    /// group encoded here is the queue's only one held outside the pool.
+    fn dispatch_checked(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        rows: usize,
+        bytes: usize,
+        deliver: &mut Deliver<'_>,
+    ) -> Result<()> {
+        let charge = bytes.saturating_mul(2);
+        loop {
+            if let Some((reservation, slot)) = self.pool.budget.try_admit(charge) {
+                self.submit(batches, rows, reservation, slot);
+                return Ok(());
+            }
+            if self.appended == self.dispatched {
+                break;
+            }
+            self.deliver_next(deliver)?;
+        }
+        #[cfg(test)]
+        self.pool
+            .budget
+            .encoded_here
+            .fetch_add(1, Ordering::Relaxed);
         let sequence = self.dispatched;
         self.dispatched += 1;
-        let slot = self.pool.take_slot();
+        let encoded = encode_job(&self.encoding, sequence, &batches);
+        drop(batches);
+        // Nothing of the queue's is out, so this row group is next in order.
+        self.appended += 1;
+        let (chunks, leaf_stats, _) = encoded?;
+        deliver(EncodedRowGroup {
+            chunks,
+            rows,
+            leaf_stats,
+            _reservation: self.pool.reserve(0),
+            _slot: None,
+        })
+    }
+
+    /// Hand `batches`, charged `reservation` and counted out by `slot`, to
+    /// the pool as the queue's next row group.
+    fn submit(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        rows: usize,
+        mut reservation: Reservation,
+        slot: OutSlot,
+    ) {
+        let sequence = self.dispatched;
+        self.dispatched += 1;
         let encoding = Arc::clone(&self.encoding);
         let sender = self.sender.clone();
         self.pool.submit(Box::new(move || {
-            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                #[cfg(test)]
-                if let Some(hook) = &encoding.before_encode {
-                    hook(sequence);
-                }
-                encode_row_group(&encoding, &batches)
-            }))
-            .unwrap_or_else(|_| {
-                Err(DuckLakeError::Internal(
-                    "encoding a row group panicked".to_string(),
-                ))
-            });
+            let encoded = encode_job(&encoding, sequence, &batches);
             drop(batches);
             let outcome = encoded.map(|(chunks, leaf_stats, bytes)| {
-                reservation.resize(bytes);
+                reservation.settle(bytes);
                 EncodedRowGroup {
                     chunks,
                     rows,
                     leaf_stats,
                     _reservation: reservation,
-                    _slot: slot,
+                    _slot: Some(slot),
                 }
             });
             // A queue dropped mid-write no longer wants it.
             let _ = sender.send((sequence, outcome));
         }));
-        Ok(())
     }
 
     /// Pass `deliver` the finished row groups that are next in order, without
@@ -1304,6 +1589,198 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn a_shared_pool_needs_a_thread_and_a_budget() {
+        let error = EncodePool::try_new(0, 1 << 20).expect_err("no threads");
+        assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
+        let error = EncodePool::try_new(2, 0).expect_err("no budget");
+        assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
+        let pool = EncodePool::try_new(1, 1).unwrap();
+        assert!(pool.budget.checked);
+        assert_eq!(pool.budget.max_out, 2);
+    }
+
+    /// The file `batches` makes on a write's own pool, at a row cap of
+    /// `rows`: what a shared pool must make too.
+    fn own_pool_file(batches: &[RecordBatch], rows: usize) -> Vec<u8> {
+        parallel(
+            batches,
+            &props(Some(rows), None, EncodePool::new(2, None).unwrap()),
+        )
+        .0
+    }
+
+    /// Writes sharing a pool whose budget holds about two of their row
+    /// groups all write every row, in order, into the files each writes on
+    /// a pool of its own: the charges out never pass the budget, nor the
+    /// row groups out `2 × threads`, and every byte and count is given back.
+    #[test]
+    fn writes_sharing_a_pool_stay_within_its_budget() {
+        const WRITES: usize = 4;
+        const ROWS: usize = 500;
+        let batches = batches();
+        let group = batches
+            .iter()
+            .map(sliced_memory_size)
+            .sum::<usize>()
+            .div_ceil(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+            * ROWS;
+        // Two row groups' charges, each twice its rows.
+        let budget = 4 * group;
+        let threads = 2;
+        let pool = EncodePool::try_new(threads, budget).unwrap();
+        let expected = own_pool_file(&batches, ROWS);
+        let start = std::sync::Barrier::new(WRITES);
+        let files: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITES)
+                .map(|_| {
+                    let props = props(Some(ROWS), None, Arc::clone(&pool));
+                    let (batches, start) = (&batches, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        parallel(batches, &props).0
+                    })
+                })
+                .collect();
+            writers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        for file in files {
+            assert!(file == expected, "a shared pool changed a file's bytes");
+        }
+        let peak = pool.peak_reserved();
+        assert!(peak > 0, "no row group went to the pool");
+        assert!(peak <= budget, "{peak} bytes charged of {budget}");
+        assert!(pool.peak_out() <= 2 * threads, "{}", pool.peak_out());
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(pool.out(), 0);
+    }
+
+    /// A shared pool whose budget is smaller than one row group takes none:
+    /// the writer encodes each on its own thread, and writes the file a
+    /// write's own pool writes.
+    #[test]
+    fn a_shared_budget_smaller_than_a_row_group_encodes_each_on_the_writing_thread() {
+        let batches = batches();
+        let pool = EncodePool::try_new(4, 1).unwrap();
+        let (bytes, _) = parallel(&batches, &props(Some(1_000), None, Arc::clone(&pool)));
+        assert_eq!(row_group_rows(&bytes).len(), 26);
+        assert_eq!(pool.encoded_here(), 26);
+        assert_eq!(pool.peak_out(), 0);
+        assert_eq!(pool.peak_reserved(), 0);
+        assert!(bytes == own_pool_file(&batches, 1_000));
+        assert_same_rows(&read(bytes), &batches);
+    }
+
+    /// A shared pool of one thread writes every row, its row groups cut as
+    /// `ArrowWriter` cuts them.
+    #[test]
+    fn a_shared_pool_of_one_thread_writes_every_row() {
+        let batches = batches();
+        let mut serial =
+            ArrowWriter::try_new(Vec::new(), schema(), Some(writer_props(Some(3_000), None)))
+                .unwrap();
+        for b in &batches {
+            serial.write(b).unwrap();
+        }
+        let serial = serial.into_inner().unwrap();
+        let pool = EncodePool::try_new(1, usize::MAX).unwrap();
+        let (bytes, _) = parallel(&batches, &props(Some(3_000), None, Arc::clone(&pool)));
+        assert_eq!(row_group_rows(&bytes), row_group_rows(&serial));
+        assert_same_rows(&read(bytes), &batches);
+        assert_eq!(pool.encoded_here(), 0);
+        assert!(pool.peak_out() <= 2, "{}", pool.peak_out());
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// Wait until `pool` has nothing charged and nothing out.
+    fn wait_until_given_back(pool: &EncodePool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pool.reserved() != 0 || pool.out() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} bytes and {} row groups were never given back",
+                pool.reserved(),
+                pool.out()
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A row group that fails on a shared pool fails the write, and every
+    /// byte and count of the write's row groups is given back.
+    #[test]
+    fn a_failed_row_group_gives_back_a_shared_pools_budget() {
+        let pool = EncodePool::try_new(2, usize::MAX).unwrap();
+        pool.set_before_encode(Arc::new(|sequence| {
+            if sequence == 1 {
+                panic!("row group {sequence} failed");
+            }
+        }));
+        let props = props(Some(1_000), None, Arc::clone(&pool));
+        let mut queue = queue(&props);
+        let mut deliver = |_: EncodedRowGroup| Ok(());
+        let error = queue
+            .push(&batch(0, 3_000), &mut deliver)
+            .and_then(|()| queue.finish(&mut deliver))
+            .expect_err("a failed row group fails the write");
+        assert!(error.to_string().contains("panicked"), "{error}");
+        drop(queue);
+        wait_until_given_back(&pool);
+    }
+
+    /// A row group that fails while its writer encodes it fails the write,
+    /// with nothing charged.
+    #[test]
+    fn a_row_group_failed_on_the_writing_thread_fails_the_write() {
+        let pool = EncodePool::try_new(2, 1).unwrap();
+        pool.set_before_encode(Arc::new(|sequence| {
+            if sequence == 1 {
+                panic!("row group {sequence} failed");
+            }
+        }));
+        let props = props(Some(1_000), None, Arc::clone(&pool));
+        let mut queue = queue(&props);
+        let mut appended = 0;
+        let mut deliver = |_: EncodedRowGroup| {
+            appended += 1;
+            Ok(())
+        };
+        let error = queue
+            .push(&batch(0, 3_000), &mut deliver)
+            .expect_err("a failed row group fails the push");
+        assert!(error.to_string().contains("panicked"), "{error}");
+        let error = queue
+            .finish(&mut deliver)
+            .expect_err("a failed queue does not finish");
+        assert!(error.to_string().contains("earlier row group"), "{error}");
+        assert_eq!(appended, 1, "only the row group before the failed one");
+        assert_eq!(pool.encoded_here(), 2);
+        assert_eq!(pool.peak_reserved(), 0);
+        assert_eq!(pool.out(), 0);
+    }
+
+    /// A write dropped while its row groups are still encoding gives their
+    /// bytes and counts back once the jobs finish.
+    #[test]
+    fn a_dropped_write_gives_back_a_shared_pools_budget() {
+        let pool = EncodePool::try_new(2, usize::MAX).unwrap();
+        let (open, opened) = mpsc::channel::<()>();
+        let opened = Mutex::new(opened);
+        pool.set_before_encode(Arc::new(move |_| {
+            // Every job waits until the gate drops.
+            let _ = lock(&opened).recv();
+        }));
+        let props = props(Some(100), None, Arc::clone(&pool));
+        let mut queue = queue(&props);
+        // Four row groups, the pool's most out: none waits for another.
+        queue.push(&batch(0, 400), &mut |_| Ok(())).unwrap();
+        assert_eq!(pool.out(), 4);
+        assert!(pool.reserved() > 0);
+        drop(queue);
+        drop(open);
+        wait_until_given_back(&pool);
     }
 
     #[test]

@@ -1250,6 +1250,24 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   `DuckLakeTable::scan` has no memo code, and the memo lives in its own provider wrapper
   (`src/catalog_read_memo.rs`).
 
+- **The change feeds prune data files by their catalog statistics; official's do not.** A filter
+  on `ducklake_table_insertions`, or on the rows `ducklake_table_changes` reports, skips a data
+  file of the window whose `ducklake_file_column_stats` prove no row can match. Official prunes
+  files by those statistics only in table scans: its file list takes a pushed filter only when
+  the scan type is `SCAN_TABLE` (`DynamicFilterPushdown` and `ComplexFilterPushdown` in
+  `src/storage/ducklake_multi_file_list.cpp`), so its feeds list every file of the window and
+  filter in the Parquet reader, as this crate also does. Answers do not change: the filter is
+  still applied above the feed, deletions are never pruned, and a file whose inserted rows a
+  deletion of the window can pair with into an update is kept (its reported rows are still
+  narrowed by the Parquet reader, its pairing keys are not). Pruning is kept because it is most of
+  the win: a selective filter over a 30-file window read 1 file instead of 30, 2.17 MB instead of
+  64.65 MB, in 6.3 ms instead of 25.2 ms.
+
+  Converging would take either official accepting the same pruning for `SCAN_INSERTIONS` (and
+  for the insertions of `ducklake_table_changes`, with the pairing exemption above), or this
+  crate dropping the statistics step (`FeedFilter::pruned_files`) and filtering in the Parquet
+  reader only.
+
 - **Catalog-side filter pushdown declines a few type/backend combinations.** A
   pushed-down filter narrows the file-listing query using per-column statistics,
   but the comparison runs in the catalog engine, so some types decline it and

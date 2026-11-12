@@ -51,6 +51,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::feed_charge::{PlanCharge, plan_charge};
+use crate::inlined_feed::InlinedSource;
 use crate::metadata_provider::{
     DeleteFileChange, DuckLakeTableColumn, InlinedFileDeleteChange, MetadataProvider,
 };
@@ -802,12 +803,16 @@ impl TableProvider for TableDeletionsTable {
                     &charge,
                 )?;
                 let inlined_rows = InlinedChanges::read_deletes(
-                    provider.as_ref(),
-                    self.table_id,
-                    &columns,
-                    &self.table_schema,
+                    &InlinedSource {
+                        reader: provider.as_ref(),
+                        table_id: self.table_id,
+                        columns: &columns,
+                        table_schema: &self.table_schema,
+                        page_rows: state.config().batch_size(),
+                        charge: &charge,
+                        pinned: Default::default(),
+                    },
                     window,
-                    &charge,
                 )?;
                 let inlined_file_deletes = InlinedChanges::read_file_deletes(
                     provider.as_ref(),
@@ -893,6 +898,51 @@ impl TableProvider for TableDeletionsTable {
             &table_indices,
         )
     }
+}
+
+/// The bytes the file scans in `plan` read from object storage, estimated as
+/// each file's size times the share of its columns the scan projects (every
+/// column when it projects none): the rule a caller walking a plan's
+/// `DataSourceExec`s applies, so a feed node's hidden scans are counted as its
+/// visible ones would be. A virtual column (the physical position) reads
+/// nothing, and a byte range counts its own length. It ignores row-group
+/// pruning and compression.
+pub(crate) fn file_scan_bytes(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::source::DataSourceExec;
+
+    let mut total = 0u64;
+    let mut pending: Vec<&Arc<dyn ExecutionPlan>> = vec![plan];
+    while let Some(node) = pending.pop() {
+        if let Some(config) = node
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().as_ref().downcast_ref::<FileScanConfig>())
+        {
+            let columns = config.file_schema().fields().len().max(1);
+            let projected = match config.file_source().projection() {
+                Some(projection) => {
+                    let mut indices = projection.column_indices();
+                    indices.retain(|index| *index < columns);
+                    indices.sort_unstable();
+                    indices.dedup();
+                    indices.len()
+                },
+                None => columns,
+            } as u64;
+            for file in config.file_groups.iter().flat_map(|group| group.files()) {
+                let bytes = match &file.range {
+                    Some(range) => u64::try_from(range.end - range.start).unwrap_or(0),
+                    None => file.object_meta.size,
+                };
+                total = total.saturating_add(
+                    u64::try_from(u128::from(bytes) * u128::from(projected) / columns as u128)
+                        .unwrap_or(u64::MAX),
+                );
+            }
+        }
+        pending.extend(node.children());
+    }
+    total
 }
 
 /// A delete file a deletion reads.
@@ -1067,6 +1117,33 @@ impl DeletedRowsExec {
             properties,
             _charge: Arc::clone(charge),
         })
+    }
+}
+
+impl DeletedRowsExec {
+    /// The per-file scans this node runs internally, which it does not expose
+    /// as children: each deletion's data-file scan, then its delete files'.
+    pub fn file_scans(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.scans
+            .iter()
+            .flat_map(|scan| {
+                std::iter::once(&scan.data_scan)
+                    .chain(scan.current_scan.as_ref())
+                    .chain(scan.previous_scan.as_ref())
+            })
+            .collect()
+    }
+
+    /// An estimate of the bytes this node reads from object storage: over
+    /// [`Self::file_scans`], each file's size times the share of its columns
+    /// the scan projects. It ignores row-group pruning and compression. A
+    /// caller that walks a plan's `DataSourceExec`s to cost it adds this for
+    /// this node, whose scans are not children.
+    pub fn estimated_scan_bytes(&self) -> u64 {
+        self.file_scans()
+            .into_iter()
+            .map(file_scan_bytes)
+            .fold(0, u64::saturating_add)
     }
 }
 

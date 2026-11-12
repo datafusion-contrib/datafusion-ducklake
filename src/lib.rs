@@ -83,8 +83,10 @@ mod delete_memo;
 pub mod encryption;
 pub mod error;
 mod feed_charge;
+mod feed_filter;
 pub(crate) mod field_id_adapter;
 pub mod information_schema;
+mod inlined_feed;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
 pub mod metadata_provider;
@@ -258,6 +260,8 @@ pub use multicatalog::{
 };
 #[cfg(feature = "multicatalog-postgres")]
 pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
+#[cfg(feature = "write")]
+pub use parallel_encode::EncodePool;
 #[cfg(feature = "restore")]
 pub use restore::RestoreResult;
 #[cfg(feature = "write")]

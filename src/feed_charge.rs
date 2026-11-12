@@ -1,17 +1,19 @@
 //! The memory a change feed holds from planning to the end of execution,
 //! charged to the session's memory pool.
 //!
-//! The catalog's inlined rows and inlined deletions of a window are read at
+//! The catalog's inlined deletions of a window, and the first page of its
+//! inlined rows (all of them, for a window that fits a page), are read at
 //! planning, inside the plan's consistent catalog read, and the plan keeps them
-//! until it is dropped. Each read is charged as soon as it returns, so a window
-//! whose inlined history does not fit the pool fails with a resources error
-//! there, before the plan is built on it; the charge then follows what the
-//! plan keeps and is released with the plan.
+//! until it is dropped; the inlined rows past the first page are read as the
+//! plan executes ([`crate::inlined_feed`]). Each read is charged as soon as it
+//! returns, so a window whose inlined history does not fit the pool fails with
+//! a resources error there, before the plan is built on it; the charge then
+//! follows what the plan keeps and is released with the plan.
 //!
-//! What one catalog statement returns is allocated before it can be charged:
-//! the catalog interface reads a selection whole, with no limit or paging. The
-//! overshoot is bounded by one statement's result, which is freed as soon as
-//! the charge refuses it.
+//! What one catalog statement returns is allocated before it can be charged.
+//! The overshoot is bounded by one statement's result, which is freed as soon
+//! as the charge refuses it: a page of inlined rows, on a provider that pages
+//! them, and otherwise the whole selection.
 
 use std::fmt;
 use std::sync::Arc;
@@ -76,6 +78,25 @@ pub(crate) fn file_deletes_bytes(changes: &Vec<InlinedFileDeleteChange>) -> usiz
             .sum::<usize>()
 }
 
+/// `rows`, read under the full table schema, as one batch of `schema`
+/// (`[snapshot_id, rowid, table columns]`). The row ids and snapshots move into
+/// the key columns without a copy.
+pub(crate) fn keyed_inlined_batch(
+    rows: DuckLakeInlinedRows,
+    schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let num_rows = rows.batch.num_rows();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(rows.batch.num_columns() + 2);
+    columns.push(Arc::new(Int64Array::from(rows.snapshots)));
+    columns.push(Arc::new(Int64Array::from(rows.row_ids)));
+    columns.extend(rows.batch.columns().iter().cloned());
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?)
+}
+
 /// Inlined row versions of a window as `[snapshot_id, rowid, table columns]`
 /// batches, built once from the catalog's read and shared by every node of
 /// the plan that reads them.
@@ -105,16 +126,7 @@ impl KeyedInlinedRows {
         let schema = keyed_rows_schema(table_schema, &all);
         let mut batches = Vec::with_capacity(rows.len());
         for rows in rows {
-            let num_rows = rows.batch.num_rows();
-            let mut columns: Vec<ArrayRef> = Vec::with_capacity(all.len() + 2);
-            columns.push(Arc::new(Int64Array::from(rows.snapshots)));
-            columns.push(Arc::new(Int64Array::from(rows.row_ids)));
-            columns.extend(rows.batch.columns().iter().cloned());
-            batches.push(RecordBatch::try_new_with_options(
-                Arc::clone(&schema),
-                columns,
-                &RecordBatchOptions::new().with_row_count(Some(num_rows)),
-            )?);
+            batches.push(keyed_inlined_batch(rows, &schema)?);
         }
         Ok(Self {
             batches: Arc::new(batches),

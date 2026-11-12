@@ -24,11 +24,13 @@ use crate::metadata_provider::{
 };
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
-    INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange,
-    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedVersionColumn,
-    InlinedVersionLookup, SQL_NEXT_FILE_ID, SchemaVersionLedger, inlined_file_delete_change,
-    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
-    inlined_version_columns_sql, inlined_version_snapshot_sql, next_table_file_id_sql,
+    INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedCursorRequest,
+    InlinedFileDeleteChange, InlinedFileDeleteRow, InlinedPageBound, InlinedPageTable,
+    InlinedReadShape, InlinedRowSelection, InlinedRowsAfter, InlinedRowsCursor,
+    InlinedVersionColumn, InlinedVersionLookup, SQL_NEXT_FILE_ID, SchemaVersionLedger,
+    inlined_file_delete_change, inlined_file_deletes_between_sql,
+    inlined_file_deletes_for_flush_sql, inlined_page_tables, inlined_version_columns_sql,
+    inlined_version_snapshot_sql, next_table_file_id_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -58,7 +60,79 @@ async fn read_postgres_inlined_table(
     selection: InlinedRowSelection,
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
+    page: Option<InlinedPageBound>,
 ) -> Result<Option<DuckLakeInlinedRows>> {
+    let read = prepare_postgres_inlined_read(
+        &mut *connection,
+        ledger,
+        table_id,
+        table,
+        columns,
+        selection,
+        filter,
+        shape,
+        page,
+    )
+    .await?;
+    let rows = bind_inlined_values(sqlx::query(AssertSqlSafe(read.sql.as_str())), &read.binds)
+        .fetch_all(&mut *connection)
+        .await?;
+    read.decoder.decode(&rows)
+}
+
+/// A read of one inlined-data table, prepared on a connection: the `SELECT`,
+/// the values it binds in placeholder order, and how its rows decode.
+struct PostgresInlinedRead {
+    sql: String,
+    binds: Vec<InlinedSqlBind>,
+    decoder: PostgresInlinedDecoder,
+}
+
+/// How the rows of a [`PostgresInlinedRead`] decode.
+struct PostgresInlinedDecoder {
+    table: String,
+    columns: Vec<DuckLakeTableColumn>,
+    schema: SchemaRef,
+    decode_schema: SchemaRef,
+    decode_columns: Vec<DuckLakeTableColumn>,
+    // Per column, whether it is a string stored as `BYTEA` and read as bytes.
+    raw_strings: Vec<bool>,
+    mapping: InlinedColumnMapping,
+}
+
+/// `query` with `binds` bound in order.
+fn bind_inlined_values<'q>(
+    mut query: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    binds: &[InlinedSqlBind],
+) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments> {
+    for bind in binds {
+        query = match bind.clone() {
+            InlinedSqlBind::Bool(value) => query.bind(value),
+            InlinedSqlBind::I64(value) => query.bind(value),
+            InlinedSqlBind::U64(value) => query.bind(value.to_string()),
+            InlinedSqlBind::F64(value) => query.bind(value),
+            InlinedSqlBind::Text(value) => query.bind(value),
+            InlinedSqlBind::Bytes(value) => query.bind(value),
+        };
+    }
+    query
+}
+
+/// Prepare the read of `selection` of the inlined-data table `table` (see
+/// [`read_postgres_inlined_table`]), reading the table's layout and schema
+/// version on `connection`.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_postgres_inlined_read(
+    connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
+    table_id: i64,
+    table: &str,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    shape: InlinedReadShape,
+    page: Option<InlinedPageBound>,
+) -> Result<PostgresInlinedRead> {
     let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
@@ -122,93 +196,478 @@ async fn read_postgres_inlined_table(
             2,
         )
     });
-    let pushed = rendered
-        .as_ref()
-        .map(|rendered| format!(" AND ({})", rendered.sql))
-        .unwrap_or_default();
+    let (first, second) = selection.bounds();
+    let mut binds = vec![InlinedSqlBind::I64(first), InlinedSqlBind::I64(second)];
+    let pushed = match rendered {
+        Some(rendered) => {
+            binds.extend(rendered.binds);
+            format!(" AND ({})", rendered.sql)
+        },
+        None => String::new(),
+    };
+    let (keyset, order_by, limit) = match page {
+        Some(page) => {
+            // The page's placeholders follow the selection's and the filter's.
+            let keyset = match page.after {
+                Some((snapshot, row_id)) => {
+                    let next = binds.len() + 1;
+                    binds.extend([InlinedSqlBind::I64(snapshot), InlinedSqlBind::I64(row_id)]);
+                    page.predicate(
+                        &system,
+                        selection,
+                        &format!("${next}"),
+                        &format!("${}", next + 1),
+                    )
+                },
+                None => String::new(),
+            };
+            let limit = match page.limit_value() {
+                Some(limit) => {
+                    binds.push(InlinedSqlBind::I64(limit));
+                    format!(" LIMIT ${}", binds.len())
+                },
+                None => String::new(),
+            };
+            (keyset, page.order_by(&system, selection), limit)
+        },
+        None => (
+            String::new(),
+            shape.order_by(&system, selection),
+            String::new(),
+        ),
+    };
     let sql = format!(
-        "SELECT {} FROM {} WHERE {}{pushed} ORDER BY {}",
+        "SELECT {} FROM {} WHERE {}{pushed}{keyset} ORDER BY {order_by}{limit}",
         select_list.join(", "),
         quote_ident(table),
         selection.predicate(&system, "$1", "$2"),
-        shape.order_by(&system, selection),
     );
-    let (first, second) = selection.bounds();
-    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
-        .bind(first)
-        .bind(second);
-    if let Some(rendered) = rendered {
-        for bind in rendered.binds {
-            query = match bind {
-                InlinedSqlBind::Bool(value) => query.bind(value),
-                InlinedSqlBind::I64(value) => query.bind(value),
-                InlinedSqlBind::U64(value) => query.bind(value.to_string()),
-                InlinedSqlBind::F64(value) => query.bind(value),
-                InlinedSqlBind::Text(value) => query.bind(value),
-                InlinedSqlBind::Bytes(value) => query.bind(value),
-            };
+    Ok(PostgresInlinedRead {
+        sql,
+        binds,
+        decoder: PostgresInlinedDecoder {
+            table: table.to_string(),
+            columns: columns.to_vec(),
+            schema,
+            decode_schema,
+            decode_columns,
+            raw_strings,
+            mapping,
+        },
+    })
+}
+
+impl PostgresInlinedDecoder {
+    /// The row versions `rows` hold; `None` when there are none.
+    fn decode(&self, rows: &[PgRow]) -> Result<Option<DuckLakeInlinedRows>> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let Self {
+            table,
+            columns,
+            schema,
+            decode_schema,
+            decode_columns,
+            raw_strings,
+            mapping,
+        } = self;
+        let row_ids = rows
+            .iter()
+            .map(|row| row.try_get(0))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let snapshots = rows
+            .iter()
+            .map(|row| row.try_get(1))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let end_snapshots = rows
+            .iter()
+            .map(|row| row.try_get(2))
+            .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..columns.len())
+                    .map(|index| {
+                        let at = index + INLINED_SYSTEM_SELECT_WIDTH;
+                        if raw_strings[index] {
+                            row.try_get::<Option<Vec<u8>>, _>(at)?
+                                .map(|bytes| {
+                                    String::from_utf8(bytes).map_err(|error| {
+                                        crate::DuckLakeError::Internal(format!(
+                                            "inlined string in {table} is not UTF-8: {error}"
+                                        ))
+                                    })
+                                })
+                                .transpose()
+                        } else {
+                            Ok(row.try_get::<Option<String>, _>(at)?)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(DuckLakeInlinedRows {
+            table_name: table.clone(),
+            row_ids,
+            snapshots,
+            end_snapshots,
+            batch: mapping.adapt(
+                parse_inlined_rows_with_present(
+                    Arc::clone(decode_schema),
+                    decode_columns,
+                    values,
+                    Some(&mapping.present(columns)),
+                )?,
+                Arc::clone(schema),
+                columns,
+            )?,
+            next_file_id: None,
+        }))
+    }
+}
+
+/// Names each server-side cursor a [`PostgresInlinedRowsCursor`] declares,
+/// unique within any transaction.
+static NEXT_INLINED_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A change feed's inlined row versions after a position, streamed inside a
+/// pinned read (see `MetadataProvider::pin_consistent_read`): one
+/// server-side cursor per physical inlined-data table, in name order, each
+/// declared over the table's whole remaining selection
+/// (`DECLARE ... NO SCROLL CURSOR`) and fetched a page at a time
+/// (`FETCH FORWARD`). Each table's query therefore runs once however many
+/// pages it spans, where a keyset query per page would scan and sort the
+/// unindexed table once a page. The server holds what the cursor has not yet
+/// returned; the transaction's end closes it.
+pub(crate) struct PostgresInlinedRowsCursor {
+    read: Arc<ReadTransaction<Postgres>>,
+    ledger: InlinedVersionLookup,
+    catalog_id: Option<i64>,
+    request: InlinedCursorRequest,
+    // The tables left to read, listed when the first page is read.
+    tables: Option<std::collections::VecDeque<InlinedPageTable<i64>>>,
+    open: Option<OpenInlinedCursor>,
+    done: bool,
+}
+
+/// The cursor of the table a [`PostgresInlinedRowsCursor`] is reading.
+struct OpenInlinedCursor {
+    name: String,
+    next_file_id: i64,
+    decoder: PostgresInlinedDecoder,
+}
+
+impl PostgresInlinedRowsCursor {
+    /// The pages of `request` inside `read`, in the inlined tables registered
+    /// for `catalog_id` (the single-catalog layout's when `None`).
+    pub(crate) fn new(
+        read: Arc<ReadTransaction<Postgres>>,
+        ledger: InlinedVersionLookup,
+        catalog_id: Option<i64>,
+        request: InlinedCursorRequest,
+    ) -> Self {
+        Self {
+            read,
+            ledger,
+            catalog_id,
+            request,
+            tables: None,
+            open: None,
+            done: false,
         }
     }
-    let rows = query.fetch_all(&mut *connection).await?;
-    if rows.is_empty() {
-        return Ok(None);
+
+    async fn read_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        let mut out = Vec::new();
+        if self.done {
+            return Ok(out);
+        }
+        let Some(mut connection) = self.read.connection().await else {
+            return Err(crate::DuckLakeError::Internal(
+                "the catalog read this change feed's inlined rows are read through has ended"
+                    .to_string(),
+            ));
+        };
+        let request = &self.request;
+        if self.tables.is_none() {
+            let tables = registered_inlined_tables_and_next_file_id_on(
+                &mut connection,
+                self.catalog_id,
+                request.table_id,
+            )
+            .await?;
+            self.tables = Some(inlined_page_tables(tables, Some(&request.after)).into());
+        }
+        let mut remaining = request.page_rows;
+        while remaining > 0 {
+            if self.open.is_none() {
+                let Some((table, next_file_id, after)) =
+                    self.tables.as_mut().and_then(|tables| tables.pop_front())
+                else {
+                    self.done = true;
+                    break;
+                };
+                let read = prepare_postgres_inlined_read(
+                    &mut connection,
+                    self.ledger,
+                    request.table_id,
+                    &table,
+                    &request.columns,
+                    request.selection,
+                    request.filter.as_ref(),
+                    InlinedReadShape::Changes,
+                    Some(InlinedPageBound {
+                        after,
+                        limit: None,
+                    }),
+                )
+                .await?;
+                let name = format!(
+                    "ducklake_inlined_feed_{}",
+                    NEXT_INLINED_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let declare = format!("DECLARE {name} NO SCROLL CURSOR FOR {}", read.sql);
+                bind_inlined_values(
+                    sqlx::query(AssertSqlSafe(declare.as_str())).persistent(false),
+                    &read.binds,
+                )
+                .execute(&mut *connection)
+                .await?;
+                self.open = Some(OpenInlinedCursor {
+                    name,
+                    next_file_id,
+                    decoder: read.decoder,
+                });
+            }
+            let Some(open) = &self.open else {
+                break;
+            };
+            let fetch = format!("FETCH FORWARD {remaining} FROM {}", open.name);
+            let rows = sqlx::query(AssertSqlSafe(fetch.as_str()))
+                .persistent(false)
+                .fetch_all(&mut *connection)
+                .await?;
+            let fetched = rows.len();
+            if let Some(mut page) = open.decoder.decode(&rows)? {
+                page.next_file_id = Some(open.next_file_id);
+                out.push(page);
+            }
+            if fetched < remaining {
+                // The table is read to its end.
+                let close = format!("CLOSE {}", open.name);
+                sqlx::query(AssertSqlSafe(close.as_str()))
+                    .persistent(false)
+                    .execute(&mut *connection)
+                    .await?;
+                self.open = None;
+            }
+            remaining -= fetched;
+        }
+        Ok(out)
     }
-    let row_ids = rows
-        .iter()
-        .map(|row| row.try_get(0))
-        .collect::<std::result::Result<Vec<i64>, _>>()?;
-    let snapshots = rows
-        .iter()
-        .map(|row| row.try_get(1))
-        .collect::<std::result::Result<Vec<i64>, _>>()?;
-    let end_snapshots = rows
-        .iter()
-        .map(|row| row.try_get(2))
-        .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
-    let values = rows
-        .iter()
-        .map(|row| {
-            (0..columns.len())
-                .map(|index| {
-                    let at = index + INLINED_SYSTEM_SELECT_WIDTH;
-                    if raw_strings[index] {
-                        row.try_get::<Option<Vec<u8>>, _>(at)?
-                            .map(|bytes| {
-                                String::from_utf8(bytes).map_err(|error| {
-                                    crate::DuckLakeError::Internal(format!(
-                                        "inlined string in {table} is not UTF-8: {error}"
-                                    ))
-                                })
-                            })
-                            .transpose()
-                    } else {
-                        Ok(row.try_get::<Option<String>, _>(at)?)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(DuckLakeInlinedRows {
-        table_name: table.to_string(),
-        row_ids,
-        snapshots,
-        end_snapshots,
-        batch: mapping.adapt(
-            parse_inlined_rows_with_present(
-                decode_schema,
-                &decode_columns,
-                values,
-                Some(&mapping.present(columns)),
-            )?,
-            schema,
-            columns,
-        )?,
-        next_file_id: None,
-    }))
+}
+
+impl InlinedRowsCursor for PostgresInlinedRowsCursor {
+    fn next_page(&mut self) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(self.read_page())
+    }
+}
+
+/// The `ducklake_file_column_stats` rows of the data files `ids` of
+/// `table_id`, read on `connection`, decoded by [`file_column_statistics_row`].
+/// Shared with [`crate::multicatalog_provider`].
+pub(crate) async fn file_column_statistics_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    ids: &[i64],
+) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT data_file_id, column_id, column_size_bytes, value_count, null_count,
+                min_value, max_value, contains_nan
+         FROM ducklake_file_column_stats
+         WHERE table_id = $1 AND data_file_id = ANY($2)",
+    )
+    .bind(table_id)
+    .bind(ids)
+    .fetch_all(connection)
+    .await
+}
+
+/// One row of [`file_column_statistics_on`].
+pub(crate) fn file_column_statistics_row(row: &PgRow) -> Result<DuckLakeFileColumnStatistics> {
+    Ok(DuckLakeFileColumnStatistics {
+        data_file_id: row.try_get(0)?,
+        column_id: row.try_get(1)?,
+        column_size_bytes: row.try_get(2)?,
+        value_count: row.try_get(3)?,
+        null_count: row.try_get(4)?,
+        min_value: row.try_get(5)?,
+        max_value: row.try_get(6)?,
+        contains_nan: row.try_get(7)?,
+    })
 }
 
 /// The statement that begins a consistent read's transaction on PostgreSQL.
 pub(crate) const CONSISTENT_READ_BEGIN: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY";
+
+/// Whether the server exports snapshots (`pg_export_snapshot`), as a
+/// provider and its clones have found it: probed on a connection of the pool
+/// of its own, outside every consistent read, before the first export.
+///
+/// An export runs inside the open read it pins, and a failed statement aborts
+/// that transaction, so a server that cannot export (a database that speaks
+/// the protocol without implementing the function, or a role it is revoked
+/// from) would fail the query that only wanted the pin. The probe makes such a
+/// server pin nothing instead. `pg_export_snapshot` cannot run in a
+/// subtransaction, so a savepoint cannot guard the export itself.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotExportProbe(std::sync::atomic::AtomicU8);
+
+impl SnapshotExportProbe {
+    const UNKNOWN: u8 = 0;
+    const SUPPORTED: u8 = 1;
+    const UNSUPPORTED: u8 = 2;
+
+    /// Whether the server behind `pool` exports snapshots, probing it until
+    /// it answers. `false`, without remembering it, when the probe cannot run
+    /// or its answer is not final: every connection the pool may hold is
+    /// taken (the probe does not wait for an idle one, though it can wait
+    /// briefly when it races another task for the pool's last free place and
+    /// loses), the connection fails, or the export fails with an error other
+    /// than the server lacking the function, the privilege or the feature.
+    async fn supported(&self, pool: &PgPool) -> bool {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            Self::SUPPORTED => return true,
+            Self::UNSUPPORTED => return false,
+            _ => {},
+        }
+        let mut connection = match pool.try_acquire() {
+            Some(connection) => connection,
+            None if pool.size() < pool.options().get_max_connections() => {
+                match pool.acquire().await {
+                    Ok(connection) => connection,
+                    Err(_) => return false,
+                }
+            },
+            None => return false,
+        };
+        if let Err(error) = sqlx::raw_sql(CONSISTENT_READ_BEGIN)
+            .execute(&mut *connection)
+            .await
+        {
+            tracing::debug!(%error, "cannot probe the catalog's snapshot export");
+            connection.close_on_drop();
+            return false;
+        }
+        let exported = sqlx::query_scalar::<_, String>("SELECT pg_export_snapshot()")
+            .fetch_one(&mut *connection)
+            .await;
+        if sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *connection)
+            .await
+            .is_err()
+        {
+            connection.close_on_drop();
+        }
+        let state = match exported {
+            Ok(_) => Self::SUPPORTED,
+            // The server refused the export as a capability it lacks: it will
+            // refuse it again. SQLSTATE `42883` undefined_function, `42501`
+            // insufficient_privilege, `0A000` feature_not_supported.
+            Err(sqlx::Error::Database(error))
+                if matches!(error.code().as_deref(), Some("42883" | "42501" | "0A000")) =>
+            {
+                tracing::debug!(%error, "the catalog cannot export snapshots; feeds read every page at planning");
+                Self::UNSUPPORTED
+            },
+            // Any other failure (a cancelled statement, a resource limit) may
+            // pass: nothing is remembered, and the next probe tries again.
+            Err(error) => {
+                tracing::debug!(%error, "cannot probe the catalog's snapshot export");
+                return false;
+            },
+        };
+        let _ = self.0.compare_exchange(
+            Self::UNKNOWN,
+            state,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        state == Self::SUPPORTED
+    }
+}
+
+/// Begin a consistent read on a connection of `pool`'s own that sees exactly
+/// the snapshot of the open transaction `exporting` is inside (see
+/// [`MetadataProvider::pin_consistent_read`]): the snapshot is exported there
+/// (`pg_export_snapshot`) and imported first thing in a new read-only
+/// `REPEATABLE READ` transaction (`SET TRANSACTION SNAPSHOT`), as `pg_dump`
+/// shares one snapshot among its workers. The new transaction takes only the
+/// locks its reads take, as any read does.
+///
+/// `None`, with `exporting` untouched, when `probe` finds the server cannot
+/// export a snapshot ([`SnapshotExportProbe`]). `None` as well when every
+/// connection the pool may hold is taken (`ReadTransaction::try_begin`, which
+/// does not wait for an idle one but can wait briefly when it loses a race
+/// for the pool's last free place), or when the new transaction cannot begin
+/// or import the snapshot, for example on a connection to another server; the
+/// exporting transaction is unaffected. An export that fails all the same is
+/// returned: it fails the exporting transaction.
+pub(crate) async fn begin_read_at_snapshot_of(
+    exporting: &mut PgConnection,
+    pool: &PgPool,
+    probe: &SnapshotExportProbe,
+) -> Result<Option<ReadTransaction<Postgres>>> {
+    if !probe.supported(pool).await {
+        return Ok(None);
+    }
+    let snapshot: String = sqlx::query_scalar("SELECT pg_export_snapshot()")
+        .fetch_one(&mut *exporting)
+        .await?;
+    // `SET TRANSACTION SNAPSHOT` takes no parameter, so the id, hex digits
+    // and dashes, is written into the statement.
+    if snapshot.is_empty() || !snapshot.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Ok(None);
+    }
+    let Some(read) = ReadTransaction::try_begin(pool, &[CONSISTENT_READ_BEGIN]).await else {
+        return Ok(None);
+    };
+    let imported = match read.connection().await {
+        Some(mut connection) => sqlx::raw_sql(AssertSqlSafe(format!(
+            "SET TRANSACTION SNAPSHOT '{snapshot}'"
+        )))
+        .execute(&mut *connection)
+        .await
+        .is_ok(),
+        None => false,
+    };
+    // A read that did not import is dropped, which rolls it back and pools
+    // its connection again.
+    Ok(imported.then_some(read))
+}
+
+/// How a read pinned on `read` streams a change feed's inlined row versions
+/// ([`PostgresInlinedRowsCursor`]), for the inlined tables registered for
+/// `catalog_id`. `ledger` reads, when a cursor opens, how the catalog
+/// records schema versions, or `None` when it has no inlined-data tables.
+pub(crate) fn inlined_rows_cursor_opener(
+    read: Arc<ReadTransaction<Postgres>>,
+    catalog_id: Option<i64>,
+    ledger: impl Fn() -> Result<Option<InlinedVersionLookup>> + Send + Sync + 'static,
+) -> crate::metadata_provider::OpenInlinedRowsCursor {
+    Arc::new(move |request| {
+        let Some(ledger) = ledger()? else {
+            return Ok(Box::new(crate::metadata_provider::NoInlinedRows));
+        };
+        Ok(Box::new(PostgresInlinedRowsCursor::new(
+            Arc::clone(&read),
+            ledger,
+            catalog_id,
+            request,
+        )))
+    })
+}
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -754,6 +1213,7 @@ pub(crate) async fn scan_inlined_data_on(
             InlinedRowSelection::VisibleAt(snapshot_id),
             filter,
             InlinedReadShape::Scan,
+            None,
         )
         .await?
         {
@@ -800,10 +1260,57 @@ pub(crate) async fn read_inlined_rows_on(
         registered_inlined_tables_and_next_file_id_on(connection, catalog_id, table_id).await?
     {
         if let Some(mut rows) = read_postgres_inlined_table(
-            connection, ledger, table_id, &table, columns, selection, filter, shape,
+            connection, ledger, table_id, &table, columns, selection, filter, shape, None,
         )
         .await?
         {
+            rows.next_file_id = Some(next_file_id);
+            out.push(rows);
+        }
+    }
+    Ok(out)
+}
+
+/// One page of [`read_inlined_rows_on`]'s change-feed read, on `connection`.
+/// See [`MetadataProvider::read_inlined_rows_page`].
+///
+/// Shared with [`crate::multicatalog_provider`]. The caller checks first that
+/// the catalog has `ducklake_inlined_data_tables`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_inlined_rows_page_on(
+    connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
+    catalog_id: Option<i64>,
+    table_id: i64,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    after: Option<&InlinedRowsAfter>,
+    limit: usize,
+) -> Result<Vec<DuckLakeInlinedRows>> {
+    let mut out = Vec::new();
+    let mut remaining = limit;
+    for (table, next_file_id, after) in inlined_page_tables(
+        registered_inlined_tables_and_next_file_id_on(connection, catalog_id, table_id).await?,
+        after,
+    ) {
+        if remaining == 0 {
+            break;
+        }
+        if let Some(mut rows) = read_postgres_inlined_table(
+            connection,
+            ledger,
+            table_id,
+            &table,
+            columns,
+            selection,
+            filter,
+            InlinedReadShape::Changes,
+            Some(InlinedPageBound::new(after, limit, remaining)),
+        )
+        .await?
+        {
+            remaining = remaining.saturating_sub(rows.row_ids.len());
             rows.next_file_id = Some(next_file_id);
             out.push(rows);
         }
@@ -1016,6 +1523,7 @@ pub(crate) async fn inlined_table_for_flush_on(
         InlinedRowSelection::WrittenUpTo(snapshot_id),
         None,
         InlinedReadShape::Flush,
+        None,
     )
     .await
 }
@@ -1596,6 +2104,9 @@ pub struct PostgresMetadataProvider {
     // Set once the catalog's layout version is found readable (see
     // `require_readable`). Shared across clones.
     readable: Arc<tokio::sync::OnceCell<()>>,
+    // Whether the server exports snapshots, once probed (see
+    // `SnapshotExportProbe`). Shared across clones.
+    snapshot_export: Arc<SnapshotExportProbe>,
 }
 
 impl PostgresMetadataProvider {
@@ -1642,6 +2153,7 @@ impl PostgresMetadataProvider {
         Ok(Self {
             pool,
             schema_capabilities: Arc::default(),
+            snapshot_export: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
             readable: Arc::default(),
@@ -1665,6 +2177,7 @@ impl PostgresMetadataProvider {
         Self {
             pool,
             schema_capabilities: Arc::default(),
+            snapshot_export: Arc::default(),
             inlined_deletion_tables: Arc::default(),
             read: None,
             readable: Arc::default(),
@@ -2143,6 +2656,40 @@ impl MetadataProvider for PostgresMetadataProvider {
         Ok(Some(ConsistentRead::new(Arc::new(provider), move || {
             Ok(block_on(read.commit())?)
         })))
+    }
+
+    /// A pooled connection inside a read-only `REPEATABLE READ` transaction
+    /// that imports the snapshot of the open read (see
+    /// `begin_read_at_snapshot_of`).
+    fn pin_consistent_read(&self) -> Result<Option<ConsistentRead>> {
+        let Some(read) = self.read.as_ref().filter(|read| read.is_open()) else {
+            return Ok(None);
+        };
+        let pinned = block_on(async {
+            let Some(mut connection) = read.connection().await else {
+                return Ok(None);
+            };
+            begin_read_at_snapshot_of(&mut connection, &self.pool, &self.snapshot_export).await
+        })?;
+        let Some(pinned) = pinned else {
+            return Ok(None);
+        };
+        let pinned = Arc::new(pinned);
+        let provider = Self {
+            read: Some(Arc::clone(&pinned)),
+            ..self.clone()
+        };
+        let cursor = {
+            let provider = provider.clone();
+            inlined_rows_cursor_opener(Arc::clone(&pinned), None, move || {
+                let caps = block_on(provider.schema_capabilities())?;
+                Ok(caps.inlined_data_tables.then(|| caps.ledger().into()))
+            })
+        };
+        Ok(Some(
+            ConsistentRead::new(Arc::new(provider), move || Ok(block_on(pinned.commit())?))
+                .with_inlined_cursor(cursor),
+        ))
     }
 
     fn get_current_snapshot(&self) -> Result<i64> {
@@ -2838,6 +3385,29 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn get_data_file_column_statistics(
+        &self,
+        table_id: i64,
+        data_file_ids: &[i64],
+    ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            let mut out = Vec::new();
+            for ids in data_file_ids.chunks(crate::metadata_provider::FILE_STATISTICS_ID_CHUNK) {
+                let rows = self
+                    .read_if_present(caps.file_column_stats, async |connection| {
+                        file_column_statistics_on(connection, table_id, ids).await
+                    })
+                    .await?
+                    .unwrap_or_default();
+                for row in rows {
+                    out.push(file_column_statistics_row(&row)?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         block_on(async {
             let caps = self.schema_capabilities().await?;
@@ -3028,6 +3598,36 @@ impl MetadataProvider for PostgresMetadataProvider {
             filter,
             InlinedReadShape::Changes,
         ))
+    }
+
+    fn read_inlined_rows_page(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        after: Option<&InlinedRowsAfter>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            if !caps.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let mut connection = self.connection().await?;
+            read_inlined_rows_page_on(
+                &mut connection,
+                caps.ledger().into(),
+                None,
+                table_id,
+                columns,
+                selection,
+                filter,
+                after,
+                limit,
+            )
+            .await
+        })
     }
 
     fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
@@ -3750,7 +4350,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                     data.encryption_key,
                     data.row_id_start,
                     {pm},
-                    data.mapping_id
+                    data.mapping_id,
+                    data.data_file_id
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = $1
                   AND data.begin_snapshot <= $3
@@ -3776,6 +4377,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
                         mapping_id: row.try_get(8)?,
+                        data_file_id: row.try_get(9)?,
                     })
                 })
                 .collect()
