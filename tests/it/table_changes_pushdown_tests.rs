@@ -1380,11 +1380,7 @@ async fn a_transient_export_failure_is_probed_again() {
         .execute(pool)
         .await
         .unwrap();
-    lake.pool
-        .settles_at(0, "the last plan's read given back")
-        .await;
-    let (plan, task) = plan_paged(&lake, &sqls[0]).await;
-    assert!(streams_pages(&plan), "{:?}", plan_names(&plan));
+    let (plan, task) = planned_pinned(&lake, &sqls[0], 0, plan_paged).await;
     assert_eq!(collected(plan, task).await.unwrap(), expected);
 }
 
@@ -1475,6 +1471,44 @@ async fn feeds_over_inlined_rows(lake: &Lake) -> Vec<String> {
 
 /// Plans each feed reading its inlined rows a page of 4 at a time: through
 /// `lake`'s provider, unless the test binds one per query.
+/// Plan with `plan` until the plan pins its read, while `held` connections
+/// are taken by plans the caller keeps. A pin is best effort: it is taken
+/// only from a free connection, and a plan's read gives its connection back
+/// from a task of its own, so a plan made too soon reads at planning instead.
+async fn planned_pinned(
+    lake: &Lake,
+    sql: &str,
+    held: usize,
+    plan: impl AsyncFn(
+        &Lake,
+        &str,
+    ) -> (
+        Arc<dyn ExecutionPlan>,
+        Arc<datafusion::execution::TaskContext>,
+    ),
+) -> (
+    Arc<dyn ExecutionPlan>,
+    Arc<datafusion::execution::TaskContext>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        lake.pool
+            .settles_at(held, "only the kept plans' reads held")
+            .await;
+        let planned = plan(lake, sql).await;
+        if streams_pages(&planned.0) {
+            return planned;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{sql}: no plan pinned its read: {:?}",
+            plan_names(&planned.0)
+        );
+        drop(planned);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 async fn plan_paged(
     lake: &Lake,
     sql: &str,
@@ -1506,13 +1540,8 @@ async fn a_flush_after_planning_changes_no_answer(
     for sql in &sqls {
         let expected = rows(&whole, sql).await.unwrap();
         assert!(expected.len() > 4, "{sql}: {expected:?}");
-        // Each plan kept so far holds its one pinned read; wait for any
-        // other read to give its connection back before pinning the next.
-        lake.pool
-            .settles_at(planned.len(), "only the kept plans' reads held")
-            .await;
-        let paged = plan(lake, sql).await;
-        assert!(streams_pages(&paged.0), "{sql}: {:?}", plan_names(&paged.0));
+        // Each plan kept so far holds its one pinned read.
+        let paged = planned_pinned(lake, sql, planned.len(), &plan).await;
         let held = physical(&whole, sql).await;
         assert!(!streams_pages(&held.0), "{sql}");
         planned.push((sql, paged, held, expected));
@@ -1650,8 +1679,7 @@ async fn an_exhausted_pool_reads_every_page_at_planning(lake: &Lake) {
     }
     drop(held);
     lake.pool.settles_at(0, "the pool given back").await;
-    let (plan, task) = plan_paged(lake, &sqls[0]).await;
-    assert!(streams_pages(&plan), "{:?}", plan_names(&plan));
+    let (plan, task) = planned_pinned(lake, &sqls[0], 0, plan_paged).await;
     assert_eq!(collected(plan, task).await.unwrap(), expected[0]);
 }
 
