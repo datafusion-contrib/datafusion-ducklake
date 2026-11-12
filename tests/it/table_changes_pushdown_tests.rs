@@ -1222,17 +1222,35 @@ async fn paging_spans_inlined_tables(lake: &Lake) {
         assert!(expected.len() >= 8, "{feed}: {expected:?}");
         for page in 1..=7 {
             let (paged, _) = lake.session_with(page, false);
-            // A pin is taken only from a free connection, and the last
-            // plan's read gives its connection back from a task of its own.
-            lake.pool
-                .settles_at(0, "the last plan's pinned read given back")
-                .await;
-            let plan = physical(&paged, &sql).await.0;
-            assert!(streams_pages(&plan), "{feed} page {page}");
+            // Every plan answers the same, pinned or not.
             assert_eq!(
                 rows(&paged, &sql).await.unwrap(),
                 expected,
                 "{feed} in pages of {page}"
+            );
+            // A pin is best effort: it is taken only from a free connection,
+            // and a plan's read gives its connection back from a task of its
+            // own. So poll until a plan pins, then check what it streams.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let plan = loop {
+                lake.pool
+                    .settles_at(0, "the last plan's pinned read given back")
+                    .await;
+                let (plan, task) = physical(&paged, &sql).await;
+                if streams_pages(&plan) {
+                    break (plan, task);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{feed} in pages of {page}: no plan streamed its pages"
+                );
+                drop(plan);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            assert_eq!(
+                collected(plan.0, plan.1).await.unwrap(),
+                expected,
+                "{feed} in pages of {page}, pinned"
             );
         }
     }
