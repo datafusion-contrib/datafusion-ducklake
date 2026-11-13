@@ -1,5 +1,6 @@
 //! Parquet data page settings on `DuckLakeWriteOptions`
-//! (`data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`).
+//! (`data_page_row_count_limit`, `data_page_size_limit`, `write_batch_size`),
+//! and the per-column settings of `ColumnWriteOptions`, bloom filters included.
 //!
 //! Each test reads the written files' page index with the plain parquet reader,
 //! so a setting that never reached the writer shows up as pages of the parquet
@@ -676,6 +677,162 @@ async fn insert_flush_merge_rewrite_and_update_write_small_pages() {
 }
 
 // ---------------------------------------------------------------------------
+// Bloom filters
+// ---------------------------------------------------------------------------
+
+/// A key of `id` whose order has nothing to do with `id`, so every row group's
+/// min/max spans almost every key and statistics prune no row group of a lookup.
+fn scrambled_key(id: i64) -> String {
+    format!("key-{:06}", (id * 7_919) % 100_003)
+}
+
+fn keyed_batch(ids: Range<i64>) -> RecordBatch {
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(ids.clone())),
+            Arc::new(StringArray::from_iter_values(ids.map(scrambled_key))),
+        ],
+    )
+    .unwrap()
+}
+
+/// Per row group of `path`, whether `column` has a bloom filter.
+fn bloom_filters(path: &Path, column: &str) -> Vec<bool> {
+    let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+    reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|group| {
+            group
+                .columns()
+                .iter()
+                .find(|chunk| chunk.column_path().string() == column)
+                .unwrap()
+                .bloom_filter_offset()
+                .is_some()
+        })
+        .collect()
+}
+
+/// Assert that every row group of each of `files` has a bloom filter on `v`
+/// and none on `id`.
+fn assert_filter_on_v_only(files: &BTreeSet<PathBuf>, what: &str) {
+    assert!(!files.is_empty(), "{what} wrote no file");
+    for file in files {
+        let v = bloom_filters(file, "v");
+        assert!(v.iter().all(|&b| b), "{what}: {} v {v:?}", file.display());
+        let id = bloom_filters(file, "id");
+        assert!(
+            id.iter().all(|&b| !b),
+            "{what}: {} id {id:?}",
+            file.display()
+        );
+    }
+}
+
+/// The `id` of the row whose `v` is `key`, and from `EXPLAIN ANALYZE` of the
+/// same lookup, the row groups its bloom filters checked and kept.
+async fn lookup(ctx: &SessionContext, key: &str) -> (i64, usize, usize) {
+    let query = format!("SELECT id FROM lake.main.t WHERE v = '{key}'");
+    let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+    let ids: Vec<i64> = rows
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids.len(), 1, "{key}: {ids:?}");
+    let plan = ctx
+        .sql(&format!("EXPLAIN ANALYZE {query}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = arrow::util::pretty::pretty_format_batches(&plan)
+        .unwrap()
+        .to_string();
+    let pruning =
+        regex::Regex::new(r"row_groups_pruned_bloom_filter=(\d+) total \S+ (\d+) matched").unwrap();
+    let mut checked = 0;
+    let mut kept = 0;
+    for found in pruning.captures_iter(&plan) {
+        checked += found[1].parse::<usize>().unwrap();
+        kept += found[2].parse::<usize>().unwrap();
+    }
+    assert!(checked > 0, "no bloom filter pruning in\n{plan}");
+    (ids[0], checked, kept)
+}
+
+/// A column given a bloom filter keeps one in every row group that a write,
+/// an append, a merge and a rewrite produce, and a lookup on it reads only the
+/// row group that holds the key. Its neighbour `id`, unique as well, gets none,
+/// as official's rule decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bloom_filter_option_reaches_every_file_and_prunes_a_lookup() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let url = new_lake(&temp).await;
+    let mut options = DuckLakeWriteOptions::default()
+        .with_data_inlining_row_limit(0)
+        .with_column_options("v", ColumnWriteOptions::new().with_bloom_filter(true));
+    options.max_row_group_rows = Some(1_000);
+
+    let writer = table_writer(&url, &options).await;
+    writer
+        .write_table("main", "t", &[keyed_batch(0..4_000)])
+        .await
+        .unwrap();
+    writer
+        .append_table("main", "t", &[keyed_batch(4_000..8_000)])
+        .await
+        .unwrap();
+    let mut seen = data_files(&data);
+    assert_filter_on_v_only(&seen, "write and append");
+
+    let ctx = session(&url, options).await;
+    let (id, checked, kept) = lookup(&ctx, &scrambled_key(1_234)).await;
+    assert_eq!(id, 1_234);
+    assert_eq!((checked, kept), (8, 1), "8 row groups of 1,000 rows");
+
+    let merged = table(&ctx, "t")
+        .await
+        .merge_adjacent_files(&ctx.state(), MergeOptions::default())
+        .await
+        .unwrap();
+    assert!(merged.files_created > 0, "{merged:?}");
+    assert_filter_on_v_only(&new_files(&data, &seen, "merge"), "merge");
+    seen = data_files(&data);
+    let (id, _, kept) = lookup(&ctx, &scrambled_key(6_789)).await;
+    assert_eq!((id, kept), (6_789, 1));
+
+    sql(&ctx, "DELETE FROM lake.main.t WHERE id % 10 <> 0").await;
+    let rewritten = table(&ctx, "t")
+        .await
+        .rewrite_data_files(
+            &ctx.state(),
+            RewriteOptions {
+                delete_threshold: 0.5,
+                ..RewriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rewritten.files_created > 0, "{rewritten:?}");
+    assert_filter_on_v_only(&new_files(&data, &seen, "rewrite"), "rewrite");
+    let (id, _, kept) = lookup(&ctx, &scrambled_key(4_560)).await;
+    assert_eq!((id, kept), (4_560, 1));
+}
+
+// ---------------------------------------------------------------------------
 // Readers
 // ---------------------------------------------------------------------------
 
@@ -799,7 +956,8 @@ async fn official_duckdb_reads_a_table_with_column_options() {
             "id",
             ColumnWriteOptions::new()
                 .with_dictionary_enabled(false)
-                .with_encoding(Encoding::DELTA_BINARY_PACKED),
+                .with_encoding(Encoding::DELTA_BINARY_PACKED)
+                .with_bloom_filter(true),
         )
         .with_column_options(
             "v",
@@ -807,7 +965,8 @@ async fn official_duckdb_reads_a_table_with_column_options() {
                 .with_dictionary_enabled(false)
                 .with_encoding(Encoding::DELTA_LENGTH_BYTE_ARRAY)
                 .with_compression(Compression::SNAPPY)
-                .with_page_size_limit(1_024),
+                .with_page_size_limit(1_024)
+                .with_bloom_filter(true),
         )
         .with_column_options("f", split.clone())
         .with_column_options("emb", split.with_page_size_limit(2_048));
@@ -840,6 +999,13 @@ async fn official_duckdb_reads_a_table_with_column_options() {
         let (_, used) = encodings.iter().find(|(path, _)| path == column).unwrap();
         assert!(used.contains(&encoding), "{column}: {used:?}");
     }
+    for column in ["id", "v"] {
+        assert_eq!(
+            bloom_filters(files.first().unwrap(), column),
+            [true],
+            "{column}"
+        );
+    }
 
     let metadata = Metadata::Sqlite(temp.path().join("lake.db"));
     let summary = duckdb_query(
@@ -864,6 +1030,14 @@ async fn official_duckdb_reads_a_table_with_column_options() {
         .map(|id| format!("{id},{},{id},{}", value(*id), 2 * id))
         .collect();
     assert_eq!(rows, expected);
+    // A lookup through the bloom filter on `v`, whose unique values official's
+    // rule would give none.
+    let found = duckdb_query(
+        &metadata,
+        &data,
+        &format!("SELECT id FROM lake.main.t WHERE v = '{}'", value(1234)),
+    );
+    assert_eq!(found, vec!["1234".to_string()]);
 }
 
 /// `read_columns_by_rowid` of a few rows reads far less of a file written with

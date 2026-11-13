@@ -1276,6 +1276,7 @@ mod tests {
         DataFileProperties {
             props: writer_props(rows, bytes),
             dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::default(),
             pool: Some(pool),
         }
     }
@@ -1355,6 +1356,36 @@ mod tests {
                 assert_same_rows(&read(bytes), &batches);
                 assert_eq!(format!("{stats:?}"), format!("{sequential:?}"));
             }
+        }
+    }
+
+    /// A bloom filter the caller set holds in every row group encoded on a
+    /// thread, whatever that row group's dictionary decision.
+    #[test]
+    fn a_bloom_filter_the_caller_set_reaches_every_row_group_encoded_on_threads() {
+        let id = parquet::schema::types::ColumnPath::from("id");
+        let base = props(Some(3_000), None, EncodePool::new(3, None).unwrap());
+        let props = DataFileProperties {
+            props: base
+                .props
+                .clone()
+                .into_builder()
+                .set_column_bloom_filter_enabled(id.clone(), true)
+                .set_column_bloom_filter_fpp(id, crate::write_encoding::BLOOM_FILTER_FPP)
+                .build(),
+            bloom_filter_set: Arc::new(std::collections::HashSet::from(["id".to_string()])),
+            ..base
+        };
+        let (bytes, _) = parallel(&batches(), &props);
+        let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+        let groups = reader.metadata().row_groups();
+        assert!(groups.len() > 1, "{} row groups", groups.len());
+        for (g, group) in groups.iter().enumerate() {
+            // `id` is unique, so the rule keeps no dictionary and no filter.
+            let id = group.column(1);
+            assert_eq!(id.column_path().string(), "id");
+            assert!(id.bloom_filter_offset().is_some(), "row group {g}");
+            assert!(id.dictionary_page_offset().is_none(), "row group {g}");
         }
     }
 
@@ -1790,6 +1821,7 @@ mod tests {
                 .set_content_defined_chunking(Some(Default::default()))
                 .build(),
             dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::default(),
             pool: EncodePool::new(2, None),
         };
         assert!(!supports(&props.props));
