@@ -33,6 +33,12 @@
 //! array columns under Parquet V1, where arrow-rs writes no dictionary for them.
 //! A column whose dictionary the caller set ([`DataFileProperties::dictionary_set`])
 //! is not tuned either: it keeps the caller's setting and gets no bloom filter.
+//!
+//! A column whose bloom filter the caller set
+//! ([`DataFileProperties::bloom_filter_set`]) keeps that setting, whatever its
+//! dictionary: its dictionary is still decided as above, but the decision no
+//! longer turns its filter on or off. The caller's filter starts at the size of
+//! a full row group, and arrow-rs folds it down to the values written.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -55,7 +61,7 @@ use crate::stats_collect::WrittenLeafStats;
 const DICTIONARY_ROWS_PER_ENTRY: usize = 5;
 
 /// DuckDB's default bloom filter false-positive rate.
-const BLOOM_FILTER_FPP: f64 = 0.01;
+pub(crate) const BLOOM_FILTER_FPP: f64 = 0.01;
 
 /// Bytes a dictionary entry of `data_type` occupies once written, taking the
 /// longest value in `arrays` for a variable-length type, or `None` when the type
@@ -171,12 +177,15 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
 }
 
 /// The writer properties a data file starts from, the top-level columns whose
-/// dictionary the caller set, which [`props_for_row_group`] leaves alone, and
-/// the pool that encodes the file's row groups.
+/// dictionary or bloom filter the caller set, which [`props_for_row_group`]
+/// leaves alone, and the pool that encodes the file's row groups.
 #[derive(Clone, Debug)]
 pub(crate) struct DataFileProperties {
     pub(crate) props: WriterProperties,
     pub(crate) dictionary_set: Arc<HashSet<String>>,
+    /// The top-level columns whose bloom filter the caller turned on or off in
+    /// [`Self::props`].
+    pub(crate) bloom_filter_set: Arc<HashSet<String>>,
     /// The threads that encode the file's row groups, shared by every file of
     /// the write ([`crate::parallel_encode`]); `None` encodes on the writing
     /// thread.
@@ -188,6 +197,7 @@ impl From<WriterProperties> for DataFileProperties {
         Self {
             props,
             dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::default(),
             pool: None,
         }
     }
@@ -201,13 +211,15 @@ fn row_group_rows(base: &WriterProperties) -> usize {
 
 /// `base` with each tuned top-level column's dictionary and bloom filter set from
 /// the file's first row group: the first [`row_group_rows`] rows of `buffered`, or
-/// all of them when there are fewer. Columns are matched by position; the batches
-/// carry the file's full parquet schema.
+/// all of them when there are fewer. A column whose bloom filter the caller set
+/// gets its dictionary only. Columns are matched by position; the batches carry
+/// the file's full parquet schema.
 pub(crate) fn props_for_row_group(
     base: &DataFileProperties,
     buffered: &[RecordBatch],
 ) -> Result<WriterProperties> {
     let dictionary_set = &base.dictionary_set;
+    let bloom_filter_set = &base.bloom_filter_set;
     let base = &base.props;
     let full_rows = row_group_rows(base);
     let mut row_group = Vec::with_capacity(buffered.len());
@@ -240,11 +252,13 @@ pub(crate) fn props_for_row_group(
             continue;
         };
         let path = ColumnPath::new(vec![field.name().clone()]);
+        let caller_bloom_filter = bloom_filter_set.contains(field.name());
         let distinct = distinct_up_to(&columns, limit)?;
         if distinct == 0 || distinct > limit {
-            builder = builder
-                .set_column_dictionary_enabled(path.clone(), false)
-                .set_column_bloom_filter_enabled(path, false);
+            builder = builder.set_column_dictionary_enabled(path.clone(), false);
+            if !caller_bloom_filter {
+                builder = builder.set_column_bloom_filter_enabled(path, false);
+            }
         } else {
             let entries = full_limit.max(limit).max(1);
             builder = builder
@@ -252,10 +266,13 @@ pub(crate) fn props_for_row_group(
                 .set_column_dictionary_page_size_limit(
                     path.clone(),
                     entries.saturating_mul(width.max(1)),
-                )
-                .set_column_bloom_filter_enabled(path.clone(), true)
-                .set_column_bloom_filter_fpp(path.clone(), BLOOM_FILTER_FPP)
-                .set_column_bloom_filter_max_ndv(path, entries as u64);
+                );
+            if !caller_bloom_filter {
+                builder = builder
+                    .set_column_bloom_filter_enabled(path.clone(), true)
+                    .set_column_bloom_filter_fpp(path.clone(), BLOOM_FILTER_FPP)
+                    .set_column_bloom_filter_max_ndv(path, entries as u64);
+            }
         }
     }
     Ok(builder.build())
@@ -505,17 +522,27 @@ mod tests {
         .unwrap()
     }
 
+    /// Write `batches` through [`RowGroupSampledWriter`] from `base`.
+    fn write_with(batches: &[RecordBatch], base: impl Into<DataFileProperties>) -> Bytes {
+        let mut writer = RowGroupSampledWriter::new(Vec::new(), schema(), base);
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        Bytes::from(writer.into_inner().unwrap())
+    }
+
     /// Write `batches` through [`RowGroupSampledWriter`] and report, per column of
     /// the first row group, whether it carries a dictionary and a bloom filter.
     fn layout(batches: &[RecordBatch], row_group_rows: usize) -> Vec<(String, bool, bool)> {
         let base = WriterProperties::builder()
             .set_max_row_group_row_count(Some(row_group_rows))
             .build();
-        let mut writer = RowGroupSampledWriter::new(Vec::new(), schema(), base);
-        for batch in batches {
-            writer.write(batch).unwrap();
-        }
-        let bytes = Bytes::from(writer.into_inner().unwrap());
+        layout_of(write_with(batches, base))
+    }
+
+    /// Per column of `bytes`' first row group, whether it carries a dictionary
+    /// and a bloom filter.
+    fn layout_of(bytes: Bytes) -> Vec<(String, bool, bool)> {
         let reader = SerializedFileReader::new(bytes).unwrap();
         reader
             .metadata()
@@ -573,6 +600,88 @@ mod tests {
         // holds all 2,000 `mid` values, over its limit of 400, although the whole
         // batch (2,000 values against a limit of 4,000) would stay under.
         assert_repeating(&layout(&[batch(0, 20_000)], 2_000), &["status"]);
+    }
+
+    /// Properties with full row groups of `row_group_rows`, and a bloom filter
+    /// the caller turned on for each of `on` and off for each of `off`, as
+    /// `build_writer_props` sets them.
+    fn caller_bloom_filters(
+        row_group_rows: usize,
+        on: &[&str],
+        off: &[&str],
+    ) -> DataFileProperties {
+        let mut builder =
+            WriterProperties::builder().set_max_row_group_row_count(Some(row_group_rows));
+        for column in on {
+            builder = builder
+                .set_column_bloom_filter_enabled(ColumnPath::from(*column), true)
+                .set_column_bloom_filter_fpp(ColumnPath::from(*column), BLOOM_FILTER_FPP);
+        }
+        for column in off {
+            builder = builder.set_column_bloom_filter_enabled(ColumnPath::from(*column), false);
+        }
+        DataFileProperties {
+            props: builder.build(),
+            dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::new(on.iter().chain(off).map(|c| c.to_string()).collect()),
+            pool: None,
+        }
+    }
+
+    #[test]
+    fn a_bloom_filter_the_caller_set_replaces_the_dictionary_rule() {
+        // 20,000 rows, limit 4,000: `status` and `mid` keep their dictionaries,
+        // `id` and `s` are unique and keep none.
+        let batches: Vec<_> = (0..20).map(|b| batch(b * 1_000, (b + 1) * 1_000)).collect();
+        let base = caller_bloom_filters(20_000, &["id", "s"], &["status"]);
+        let expected = [
+            ("id", false, true),
+            ("v", false, false),
+            ("s", false, true),
+            ("status", true, false),
+            // Not set by the caller: the rule gives it a filter with its dictionary.
+            ("mid", true, true),
+            ("empty", false, false),
+        ]
+        .map(|(column, dictionary, bloom)| (column.to_string(), dictionary, bloom));
+        assert_eq!(layout_of(write_with(&batches, base)), expected);
+    }
+
+    #[test]
+    fn a_bloom_filter_the_caller_set_is_folded_to_the_values_written() {
+        use parquet::file::properties::ReaderProperties;
+        use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+        // 1,000 unique values in a file whose full row group is 122,880 rows.
+        let bytes = write_with(
+            &[batch(0, 1_000)],
+            caller_bloom_filters(122_880, &["s"], &[]),
+        );
+        let options = ReadOptionsBuilder::new()
+            .with_reader_properties(
+                ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build(),
+            )
+            .build();
+        let reader = SerializedFileReader::new_with_options(bytes, options).unwrap();
+        let s = 2;
+        let length = reader
+            .metadata()
+            .row_group(0)
+            .column(s)
+            .bloom_filter_length()
+            .expect("the filter's length is recorded");
+        // Sized for 122,880 values at 1%, the filter would take 256 KiB.
+        assert!(length < 16 * 1024, "a filter of {length} bytes");
+        let row_group = reader.get_row_group(0).unwrap();
+        let filter = row_group
+            .get_column_bloom_filter(s)
+            .expect("s has a bloom filter");
+        for i in 0..1_000 {
+            let value = format!("user_{i}");
+            assert!(filter.check(value.as_str()), "{value} is missing");
+        }
     }
 
     #[test]

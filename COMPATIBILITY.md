@@ -339,9 +339,13 @@ arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
 `DuckLakeWriteOptions::data_page_row_count_limit`, `data_page_size_limit` and `write_batch_size`
 set arrow-rs's data page limits for every data file a write, `UPDATE`, flush, merge or rewrite
 produces; unset, arrow-rs's defaults apply (20,000 rows, 1 MiB, 1,024 values).
-`DuckLakeWriteOptions::column_options` sets a column's page size, codec, dictionary and encoding on
-the same files; a column given a dictionary setting keeps it instead of the dictionary chosen from
-its first row group, and gets no bloom filter. Official DuckLake has none of these options, and
+`DuckLakeWriteOptions::column_options` sets a column's page size, codec, dictionary, encoding and
+bloom filter on the same files; a column given a dictionary setting keeps it instead of the
+dictionary chosen from its first row group, and gets no bloom filter unless it is given one. A
+column given a bloom filter setting keeps it whatever its dictionary, so a column of mostly
+distinct values, which official's rule leaves without a filter, can get one for point lookups. Its
+filter has the same 0.01 rate, starts at the size of a full row group and is folded down to the
+values written. Official DuckLake has none of these options, and
 stores none: they are writer settings, not catalog ones. The files remain ordinary Parquet with an
 offset index and page-level statistics, which DuckDB reads as any other.
 

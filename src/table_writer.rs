@@ -312,8 +312,16 @@ pub struct ColumnWriteOptions {
     pub compression: Option<Compression>,
     /// Whether this column is dictionary-encoded. Set, it replaces the choice a
     /// data file otherwise makes from its first row group, and the column gets
-    /// no bloom filter.
+    /// no bloom filter unless [`Self::bloom_filter`] gives it one.
     pub dictionary_enabled: Option<bool>,
+    /// Whether this column gets a bloom filter, at DuckDB's false-positive
+    /// rate of 0.01. Set, it replaces the choice a data file otherwise makes
+    /// from its first row group, which gives a filter only to a column that
+    /// keeps its dictionary. So `true` gives a column of mostly distinct values,
+    /// such as an id, a filter that a point lookup can skip row groups with.
+    /// The filter is sized for a full row group and folded down to the values
+    /// written, so a small file gets a small filter.
+    pub bloom_filter: Option<bool>,
     /// The column's value encoding; with a dictionary, the encoding used once
     /// the dictionary falls back. A write refuses, before it writes anything, a
     /// dictionary encoding (`RLE_DICTIONARY`, `PLAIN_DICTIONARY`; use
@@ -360,6 +368,13 @@ impl ColumnWriteOptions {
         self
     }
 
+    /// Sets [`Self::bloom_filter`].
+    #[must_use]
+    pub fn with_bloom_filter(mut self, enabled: bool) -> Self {
+        self.bloom_filter = Some(enabled);
+        self
+    }
+
     /// `self` with each field `overrides` sets replaced.
     fn with_overrides(mut self, overrides: &Self) -> Self {
         if overrides.page_size_limit.is_some() {
@@ -373,6 +388,9 @@ impl ColumnWriteOptions {
         }
         if overrides.encoding.is_some() {
             self.encoding = overrides.encoding;
+        }
+        if overrides.bloom_filter.is_some() {
+            self.bloom_filter = overrides.bloom_filter;
         }
         self
     }
@@ -1228,6 +1246,7 @@ impl DuckLakeTableWriter {
         let parquet_schema = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
         let mut builder = base.into_builder();
         let mut dictionary_set = std::collections::HashSet::new();
+        let mut bloom_filter_set = std::collections::HashSet::new();
         for leaf in parquet_schema.columns() {
             let path = leaf.path();
             let Some(options) = path
@@ -1259,10 +1278,23 @@ impl DuckLakeTableWriter {
                 check_column_encoding(&path.string(), encoding, leaf.physical_type())?;
                 builder = builder.set_column_encoding(path.clone(), encoding);
             }
+            if let Some(enabled) = options.bloom_filter {
+                builder = builder.set_column_bloom_filter_enabled(path.clone(), enabled);
+                if enabled {
+                    // No distinct count: the writer sizes the filter for a full
+                    // row group and folds it down to the values written.
+                    builder = builder.set_column_bloom_filter_fpp(
+                        path.clone(),
+                        crate::write_encoding::BLOOM_FILTER_FPP,
+                    );
+                }
+                bloom_filter_set.insert(path.parts()[0].clone());
+            }
         }
         Ok(DataFileProperties {
             props: builder.build(),
             dictionary_set: Arc::new(dictionary_set),
+            bloom_filter_set: Arc::new(bloom_filter_set),
             pool: self.data_file_pool(),
         })
     }
@@ -7730,6 +7762,46 @@ mod tests {
         }
     }
 
+    /// A bloom filter choice reaches the file's properties with DuckDB's rate
+    /// and no distinct count of its own, so the filter starts at a full row
+    /// group, and the column is marked as the caller's for the per-file choice.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_props_carry_a_bloom_filter_choice() {
+        use parquet::schema::types::ColumnPath;
+        let temp = tempfile::TempDir::new().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("other", DataType::Utf8, true),
+        ]);
+        let mut options = DuckLakeWriteOptions::default()
+            .with_column_options("id", ColumnWriteOptions::new().with_bloom_filter(true))
+            .with_column_options("status", ColumnWriteOptions::new().with_bloom_filter(false));
+        options.max_row_group_rows = Some(4_096);
+        let writer = props_test_writer(&temp).await.with_options(&options);
+        let built = writer.build_writer_props(&schema).unwrap();
+        let bloom = built
+            .props
+            .bloom_filter_properties(&ColumnPath::from("id"))
+            .expect("id gets a bloom filter");
+        assert_eq!(bloom.fpp(), crate::write_encoding::BLOOM_FILTER_FPP);
+        assert_eq!(bloom.ndv(), 4_096);
+        for column in ["status", "other"] {
+            assert!(
+                built
+                    .props
+                    .bloom_filter_properties(&ColumnPath::from(column))
+                    .is_none(),
+                "{column}"
+            );
+        }
+        let mut set: Vec<&String> = built.bloom_filter_set.iter().collect();
+        set.sort();
+        assert_eq!(set, ["id", "status"]);
+        assert!(built.dictionary_set.is_empty());
+    }
+
     #[test]
     fn column_options_override_per_column_and_field() {
         let configured = DuckLakeWriteOptions::default()
@@ -7742,7 +7814,9 @@ mod tests {
             .with_column_options("b", ColumnWriteOptions::new().with_page_size_limit(2_048));
         let explicit = DuckLakeWriteOptions::default().with_column_options(
             "a",
-            ColumnWriteOptions::new().with_encoding(Encoding::PLAIN),
+            ColumnWriteOptions::new()
+                .with_encoding(Encoding::PLAIN)
+                .with_bloom_filter(true),
         );
         let options = configured.with_overrides(&explicit);
         assert_eq!(
@@ -7751,6 +7825,7 @@ mod tests {
                 .with_page_size_limit(1_024)
                 .with_dictionary_enabled(true)
                 .with_encoding(Encoding::PLAIN)
+                .with_bloom_filter(true)
         );
         assert_eq!(
             options.column_options["b"],
