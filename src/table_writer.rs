@@ -319,8 +319,9 @@ pub struct ColumnWriteOptions {
     /// from its first row group, which gives a filter only to a column that
     /// keeps its dictionary. So `true` gives a column of mostly distinct values,
     /// such as an id, a filter that a point lookup can skip row groups with.
-    /// The filter is sized for a full row group and folded down to the values
-    /// written, so a small file gets a small filter.
+    /// The filter is sized for the rows of its row group and folded down to
+    /// the values written, so a small write gets a small filter, in memory and
+    /// in the file.
     pub bloom_filter: Option<bool>,
     /// The column's value encoding; with a dictionary, the encoding used once
     /// the dictionary falls back. A write refuses, before it writes anything, a
@@ -1281,14 +1282,15 @@ impl DuckLakeTableWriter {
             if let Some(enabled) = options.bloom_filter {
                 builder = builder.set_column_bloom_filter_enabled(path.clone(), enabled);
                 if enabled {
-                    // No distinct count: the writer sizes the filter for a full
-                    // row group and folds it down to the values written.
+                    // The distinct count is set per row group, from its rows
+                    // (`props_for_row_group`), and the writer folds the filter
+                    // down to the values written.
                     builder = builder.set_column_bloom_filter_fpp(
                         path.clone(),
                         crate::write_encoding::BLOOM_FILTER_FPP,
                     );
                 }
-                bloom_filter_set.insert(path.parts()[0].clone());
+                bloom_filter_set.insert(path.clone());
             }
         }
         Ok(DataFileProperties {
@@ -7762,9 +7764,10 @@ mod tests {
         }
     }
 
-    /// A bloom filter choice reaches the file's properties with DuckDB's rate
-    /// and no distinct count of its own, so the filter starts at a full row
-    /// group, and the column is marked as the caller's for the per-file choice.
+    /// A bloom filter choice reaches the file's properties with DuckDB's rate,
+    /// and the column's leaf is marked as the caller's, so the per-file choice
+    /// keeps the filter and sizes it from each row group's rows. Until then
+    /// the distinct count is parquet's default, the row-group cap.
     #[cfg(feature = "write-sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn writer_props_carry_a_bloom_filter_choice() {
@@ -7796,7 +7799,7 @@ mod tests {
                 "{column}"
             );
         }
-        let mut set: Vec<&String> = built.bloom_filter_set.iter().collect();
+        let mut set: Vec<String> = built.bloom_filter_set.iter().map(|p| p.string()).collect();
         set.sort();
         assert_eq!(set, ["id", "status"]);
         assert!(built.dictionary_set.is_empty());

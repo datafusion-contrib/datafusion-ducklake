@@ -37,8 +37,12 @@
 //! A column whose bloom filter the caller set
 //! ([`DataFileProperties::bloom_filter_set`]) keeps that setting, whatever its
 //! dictionary: its dictionary is still decided as above, but the decision no
-//! longer turns its filter on or off. The caller's filter starts at the size of
-//! a full row group, and arrow-rs folds it down to the values written.
+//! longer turns its filter on or off. The caller's filter is sized for the rows
+//! of the row group being decided, not for a full row group: arrow-rs holds a
+//! filter's whole starting size in memory until the file closes, and folding it
+//! down to the values written frees none of it. So a write of a few rows over
+//! many such columns allocates a few bytes per column, not a full row group's
+//! filter each.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -183,9 +187,9 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
 pub(crate) struct DataFileProperties {
     pub(crate) props: WriterProperties,
     pub(crate) dictionary_set: Arc<HashSet<String>>,
-    /// The top-level columns whose bloom filter the caller turned on or off in
+    /// The leaf columns whose bloom filter the caller turned on or off in
     /// [`Self::props`].
-    pub(crate) bloom_filter_set: Arc<HashSet<String>>,
+    pub(crate) bloom_filter_set: Arc<HashSet<ColumnPath>>,
     /// The threads that encode the file's row groups, shared by every file of
     /// the write ([`crate::parallel_encode`]); `None` encodes on the writing
     /// thread.
@@ -212,8 +216,9 @@ fn row_group_rows(base: &WriterProperties) -> usize {
 /// `base` with each tuned top-level column's dictionary and bloom filter set from
 /// the file's first row group: the first [`row_group_rows`] rows of `buffered`, or
 /// all of them when there are fewer. A column whose bloom filter the caller set
-/// gets its dictionary only. Columns are matched by position; the batches carry
-/// the file's full parquet schema.
+/// gets its dictionary only, and its filter, when on, is sized for those rows.
+/// Columns are matched by position; the batches carry the file's full parquet
+/// schema.
 pub(crate) fn props_for_row_group(
     base: &DataFileProperties,
     buffered: &[RecordBatch],
@@ -242,6 +247,13 @@ pub(crate) fn props_for_row_group(
     let writer_version = base.writer_version();
     let schema = first.schema();
     let mut builder = base.clone().into_builder();
+    // A caller's filter holds at most this row group's values, so it is sized
+    // for them: left to arrow-rs, it would start at a full row group's size.
+    for path in bloom_filter_set.iter() {
+        if base.bloom_filter_properties(path).is_some() {
+            builder = builder.set_column_bloom_filter_max_ndv(path.clone(), rows.max(1) as u64);
+        }
+    }
     for (index, field) in schema.fields().iter().enumerate() {
         if dictionary_set.contains(field.name()) {
             continue;
@@ -252,7 +264,7 @@ pub(crate) fn props_for_row_group(
             continue;
         };
         let path = ColumnPath::new(vec![field.name().clone()]);
-        let caller_bloom_filter = bloom_filter_set.contains(field.name());
+        let caller_bloom_filter = bloom_filter_set.contains(&path);
         let distinct = distinct_up_to(&columns, limit)?;
         if distinct == 0 || distinct > limit {
             builder = builder.set_column_dictionary_enabled(path.clone(), false);
@@ -623,7 +635,9 @@ mod tests {
         DataFileProperties {
             props: builder.build(),
             dictionary_set: Arc::default(),
-            bloom_filter_set: Arc::new(on.iter().chain(off).map(|c| c.to_string()).collect()),
+            bloom_filter_set: Arc::new(
+                on.iter().chain(off).map(|c| ColumnPath::from(*c)).collect(),
+            ),
             pool: None,
         }
     }
@@ -682,6 +696,113 @@ mod tests {
             let value = format!("user_{i}");
             assert!(filter.check(value.as_str()), "{value} is missing");
         }
+    }
+
+    /// The distinct count a written file's properties give `path`'s filter.
+    fn bloom_ndv(props: &WriterProperties, path: &ColumnPath) -> u64 {
+        props
+            .bloom_filter_properties(path)
+            .unwrap_or_else(|| panic!("{path} has no bloom filter"))
+            .ndv()
+    }
+
+    /// A write of one row over 400 columns with a caller's filter sizes each
+    /// filter for that row, not for the 1,000,000-row cap: arrow-rs holds a
+    /// filter's starting size until the file closes, so cap-sized filters
+    /// would hold 2 MiB each, 800 MiB here, for one row.
+    #[test]
+    fn a_bloom_filter_the_caller_set_on_a_few_rows_is_sized_for_them() {
+        const COLUMNS: usize = 400;
+        const CAP: usize = 1_000_000;
+        let schema = Arc::new(Schema::new(
+            (0..COLUMNS)
+                .map(|c| Field::new(format!("c{c}"), DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let row = RecordBatch::try_new(
+            Arc::clone(&schema),
+            (0..COLUMNS)
+                .map(|c| Arc::new(StringArray::from(vec![format!("v{c}")])) as ArrayRef)
+                .collect(),
+        )
+        .unwrap();
+        let paths: Vec<ColumnPath> = (0..COLUMNS)
+            .map(|c| ColumnPath::from(format!("c{c}").as_str()))
+            .collect();
+        let mut builder = WriterProperties::builder().set_max_row_group_row_count(Some(CAP));
+        for path in &paths {
+            builder = builder
+                .set_column_bloom_filter_enabled(path.clone(), true)
+                .set_column_bloom_filter_fpp(path.clone(), BLOOM_FILTER_FPP);
+        }
+        let base = DataFileProperties {
+            props: builder.build(),
+            dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::new(paths.iter().cloned().collect()),
+            pool: None,
+        };
+        assert_eq!(bloom_ndv(&base.props, &paths[0]), CAP as u64);
+
+        let props = props_for_row_group(&base, std::slice::from_ref(&row)).unwrap();
+        for path in &paths {
+            assert_eq!(bloom_ndv(&props, path), 1, "{path}");
+        }
+
+        let mut writer = RowGroupSampledWriter::new(Vec::new(), Arc::clone(&schema), base);
+        writer.write(&row).unwrap();
+        let reader = SerializedFileReader::new(Bytes::from(writer.into_inner().unwrap())).unwrap();
+        for column in reader.metadata().row_group(0).columns() {
+            let length = column
+                .bloom_filter_length()
+                .unwrap_or_else(|| panic!("{} has no filter", column.column_path()));
+            assert!(length <= 64, "{}: {length} bytes", column.column_path());
+        }
+    }
+
+    /// A full row group's filter keeps a full row group's size, so the rate
+    /// holds however many distinct values it gets.
+    #[test]
+    fn a_bloom_filter_the_caller_set_on_a_full_row_group_is_sized_for_it() {
+        let batches: Vec<_> = (0..4).map(|b| batch(b * 1_000, (b + 1) * 1_000)).collect();
+        let base = caller_bloom_filters(2_000, &["s"], &[]);
+        let props = props_for_row_group(&base, &batches).unwrap();
+        assert_eq!(bloom_ndv(&props, &ColumnPath::from("s")), 2_000);
+    }
+
+    /// A caller's filter on a nested column is set on its leaves, which the
+    /// per-file choice never tunes, and is sized from the rows all the same.
+    #[test]
+    fn a_bloom_filter_the_caller_set_on_a_nested_column_is_sized_for_the_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+        let leaf = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&schema)
+            .unwrap()
+            .column(0)
+            .path()
+            .clone();
+        let mut values = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
+        for i in 0..10 {
+            values.values().append_value(format!("t{i}"));
+            values.append(true);
+        }
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values.finish())]).unwrap();
+        let base = DataFileProperties {
+            props: WriterProperties::builder()
+                .set_max_row_group_row_count(Some(1_000_000))
+                .set_column_bloom_filter_enabled(leaf.clone(), true)
+                .set_column_bloom_filter_fpp(leaf.clone(), BLOOM_FILTER_FPP)
+                .build(),
+            dictionary_set: Arc::default(),
+            bloom_filter_set: Arc::new(HashSet::from([leaf.clone()])),
+            pool: None,
+        };
+        let props = props_for_row_group(&base, &[batch]).unwrap();
+        assert_eq!(bloom_ndv(&props, &leaf), 10, "{leaf}");
     }
 
     #[test]
