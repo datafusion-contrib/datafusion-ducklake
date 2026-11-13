@@ -1373,7 +1373,9 @@ mod tests {
                 .set_column_bloom_filter_enabled(id.clone(), true)
                 .set_column_bloom_filter_fpp(id, crate::write_encoding::BLOOM_FILTER_FPP)
                 .build(),
-            bloom_filter_set: Arc::new(std::collections::HashSet::from(["id".to_string()])),
+            bloom_filter_set: Arc::new(std::collections::HashSet::from([
+                parquet::schema::types::ColumnPath::from("id"),
+            ])),
             ..base
         };
         let (bytes, _) = parallel(&batches(), &props);

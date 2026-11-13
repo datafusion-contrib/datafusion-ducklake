@@ -344,8 +344,8 @@ bloom filter on the same files; a column given a dictionary setting keeps it ins
 dictionary chosen from its first row group, and gets no bloom filter unless it is given one. A
 column given a bloom filter setting keeps it whatever its dictionary, so a column of mostly
 distinct values, which official's rule leaves without a filter, can get one for point lookups. Its
-filter has the same 0.01 rate, starts at the size of a full row group and is folded down to the
-values written. Official DuckLake has none of these options, and
+filter has the same 0.01 rate, is sized for the rows of its row group and is folded down to the
+values written, so a write of a few rows holds a few bytes per column, not a full row group's filter. Official DuckLake has none of these options, and
 stores none: they are writer settings, not catalog ones. The files remain ordinary Parquet with an
 offset index and page-level statistics, which DuckDB reads as any other.
 
