@@ -15,7 +15,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use arrow::array::{Array, ArrayRef, Float32Array, Float64Array};
+use arrow::array::{Array, ArrayRef, Float32Array, Float64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -770,7 +770,7 @@ fn compute(
                 continue;
             };
             match StatisticsConverter::from_column_index(leaf, leaf_field, parquet_schema) {
-                Ok(converter) => (column_id, converter),
+                Ok(converter) => (column_id, converter.with_missing_null_counts_as_zero(false)),
                 Err(e) => {
                     tracing::debug!(leaf, error = %e, "no statistics converter for leaf column");
                     continue;
@@ -778,7 +778,10 @@ fn compute(
             }
         } else {
             match StatisticsConverter::try_new(root_field.name(), arrow_schema, parquet_schema) {
-                Ok(converter) => (column_ids[root], converter),
+                Ok(converter) => (
+                    column_ids[root],
+                    converter.with_missing_null_counts_as_zero(false),
+                ),
                 Err(e) => {
                     tracing::debug!(
                         column = root_field.name(),
@@ -791,28 +794,33 @@ fn compute(
         };
 
         // Null counts: sum across row groups. Present for files we write
-        // (statistics on by default). If unknown, both counts stay None
-        // (DuckLake stores value_count/null_count NULL together). A leaf's
-        // values are its column chunks' levels, NULL ones included.
-        let (null_count, value_count) = match converter.row_group_null_counts(row_groups.iter()) {
-            Ok(counts) => {
-                let total: u64 = (0..counts.len())
-                    .filter(|i| !counts.is_null(*i))
-                    .map(|i| counts.value(i))
-                    .sum();
-                let null_count = i64::try_from(total).ok();
+        // (statistics on by default). As official maps a file's statistics,
+        // both counts are unknown when any row group's null count is (a
+        // missing count is not read as zero), or when the NULLs outnumber
+        // the values (DuckLake stores value_count/null_count NULL together).
+        // A leaf's values are its column chunks' levels, NULL ones included.
+        let row_group_null_counts = converter.row_group_null_counts(row_groups.iter()).ok();
+        let row_group_values: Vec<i64> = row_groups
+            .iter()
+            .map(|rg| rg.column(leaf).num_values())
+            .collect();
+        let (null_count, value_count) = match &row_group_null_counts {
+            Some(counts) if counts.null_count() == 0 => {
+                let total = counts
+                    .values()
+                    .iter()
+                    .try_fold(0u64, |sum, nulls| sum.checked_add(*nulls));
                 let values = if nested {
-                    row_groups
-                        .iter()
-                        .map(|rg| rg.column(leaf).num_values())
-                        .sum::<i64>()
+                    row_group_values.iter().sum::<i64>()
                 } else {
                     row_count
                 };
-                let value_count = null_count.map(|nc| (values - nc).max(0));
-                (null_count, value_count)
+                match total.and_then(|total| i64::try_from(total).ok()) {
+                    Some(nulls) if nulls <= values => (Some(nulls), Some(values - nulls)),
+                    _ => (None, None),
+                }
             },
-            Err(_) => (None, None),
+            _ => (None, None),
         };
 
         // Computed from the Arrow data at write time (the footer has no NaN
@@ -835,12 +843,26 @@ fn compute(
                 let min = converter
                     .row_group_mins(row_groups.iter())
                     .ok()
-                    .and_then(|arr| reduce(&arr, Ordering::Less))
+                    .and_then(|arr| {
+                        reduce_known(
+                            &arr,
+                            row_group_null_counts.as_ref(),
+                            &row_group_values,
+                            Ordering::Less,
+                        )
+                    })
                     .and_then(|value| truncate_bound(value, Ordering::Less));
                 let max = converter
                     .row_group_maxes(row_groups.iter())
                     .ok()
-                    .and_then(|arr| reduce(&arr, Ordering::Greater));
+                    .and_then(|arr| {
+                        reduce_known(
+                            &arr,
+                            row_group_null_counts.as_ref(),
+                            &row_group_values,
+                            Ordering::Greater,
+                        )
+                    });
                 // A maximum that cannot be truncated leaves no bounds at all.
                 match max {
                     Some(max) => match truncate_bound(max, Ordering::Greater) {
@@ -889,19 +911,44 @@ fn compute(
     out
 }
 
+/// [`reduce`] for a file's footer bounds: `None` when a row group with values
+/// has no bound, as official leaves a file without a bound when a row group
+/// has none: the other row groups' bound does not bound its values.
+///
+/// A row group of NULLs only (its null count equals its `values`) has no
+/// bound and is skipped, since it has no values to bound. This diverges from
+/// official, which leaves the file without a bound there too, on both its
+/// `ducklake_add_data_files` and `INSERT` paths.
+fn reduce_known(
+    array: &ArrayRef,
+    null_counts: Option<&UInt64Array>,
+    values: &[i64],
+    keep: Ordering,
+) -> Option<ScalarValue> {
+    let only_nulls = |i: usize| {
+        null_counts.is_some_and(|counts| {
+            !counts.is_null(i) && i64::try_from(counts.value(i)).ok() == values.get(i).copied()
+        })
+    };
+    let unknown = |i: usize| array.is_null(i) && !only_nulls(i);
+    if (0..array.len()).any(unknown) {
+        return None;
+    }
+    reduce(array, keep)
+}
+
 /// Reduce a per-row-group statistics array to a single bound: the smallest
 /// element for `Ordering::Less` (min), the largest for `Ordering::Greater`
-/// (max). Null entries mean "statistic unknown for that row group" and are
-/// skipped. Returns `None` if every entry is null/empty.
+/// (max). Null entries are skipped; [`reduce_known`] decides which may be.
+/// Returns `None` if every entry is null/empty, or if an entry cannot be read
+/// as a value, since the bound would not cover it.
 fn reduce(array: &ArrayRef, keep: Ordering) -> Option<ScalarValue> {
     let mut acc: Option<ScalarValue> = None;
     for i in 0..array.len() {
         if array.is_null(i) {
             continue;
         }
-        let Ok(value) = ScalarValue::try_from_array(array.as_ref(), i) else {
-            continue;
-        };
+        let value = ScalarValue::try_from_array(array.as_ref(), i).ok()?;
         acc = Some(match acc {
             None => value,
             Some(current) => {
@@ -1159,6 +1206,202 @@ mod tests {
                 format!("{one_pass:?}"),
                 "round {round}"
             );
+        }
+    }
+
+    /// What a writer left out of one row group's statistics.
+    #[derive(Debug, Clone, Copy)]
+    enum Omit {
+        /// No statistics at all.
+        All,
+        NullCount,
+        Min,
+        Max,
+        /// A null count past the row group's values.
+        TooManyNulls,
+    }
+
+    /// Rewrite every column chunk of the row groups named in `omit` without
+    /// what it names, as a writer that kept none of it leaves the footer.
+    fn omit_statistics(
+        metadata: &parquet::file::metadata::ParquetMetaData,
+        omit: &[(usize, Omit)],
+    ) -> parquet::file::metadata::ParquetMetaData {
+        use parquet::file::metadata::ParquetMetaDataBuilder;
+        use parquet::file::statistics::Statistics;
+
+        let mut builder = ParquetMetaDataBuilder::new_from_metadata(metadata.clone());
+        let row_groups = builder
+            .take_row_groups()
+            .into_iter()
+            .enumerate()
+            .map(|(index, row_group)| {
+                let Some(&(_, what)) = omit.iter().find(|(at, _)| *at == index) else {
+                    return row_group;
+                };
+                let columns = row_group
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        let chunk = column.clone().into_builder();
+                        let Some(Statistics::Int64(stats)) = column.statistics() else {
+                            panic!("a BIGINT chunk with statistics: {column:?}");
+                        };
+                        let (mut min, mut max, mut nulls) = (
+                            stats.min_opt().copied(),
+                            stats.max_opt().copied(),
+                            stats.null_count_opt(),
+                        );
+                        match what {
+                            Omit::All => return chunk.clear_statistics().build().unwrap(),
+                            Omit::NullCount => nulls = None,
+                            Omit::Min => min = None,
+                            Omit::Max => max = None,
+                            Omit::TooManyNulls => nulls = Some(1_000),
+                        }
+                        chunk
+                            .set_statistics(Statistics::int64(min, max, None, nulls, false))
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+                row_group
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        builder.set_row_groups(row_groups).build()
+    }
+
+    /// Write `batch` two rows to a row group, and read its footer back.
+    fn two_row_groups(
+        batch: &RecordBatch,
+    ) -> (SchemaRef, parquet::file::metadata::ParquetMetaData) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let mut file = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(properties)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(file)).unwrap();
+        (
+            builder.schema().clone(),
+            builder.metadata().as_ref().clone(),
+        )
+    }
+
+    /// `(min, max, null_count, value_count)` of `stats`.
+    fn summary(stats: &ColumnStat) -> (Option<&str>, Option<&str>, Option<i64>, Option<i64>) {
+        (
+            stats.min_value.as_deref(),
+            stats.max_value.as_deref(),
+            stats.null_count,
+            stats.value_count,
+        )
+    }
+
+    /// The footer stats of a file of one nullable `BIGINT` column holding
+    /// `values`, two rows to a row group, with `omit` applied.
+    fn flat_stats(values: &[Option<i64>], omit: &[(usize, Omit)]) -> ColumnStat {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))])
+            .unwrap();
+        let (schema, metadata) = two_row_groups(&batch);
+        let metadata = omit_statistics(&metadata, omit);
+        let row_count = i64::try_from(values.len()).unwrap();
+        let mut stats = compute_column_stats(&schema, &metadata, &[7], row_count, &[]);
+        assert_eq!(stats.len(), 1);
+        stats.remove(0)
+    }
+
+    const SIX: [Option<i64>; 6] = [Some(1), Some(2), Some(30), Some(40), Some(50), Some(60)];
+
+    /// A file's statistics are what official DuckDB 1.5.5 records when it
+    /// registers the same footer with `ducklake_add_data_files`: a bound
+    /// only when every row group with values has one, and counts only when
+    /// every row group's null count is known and the NULLs do not outnumber
+    /// the values. The other row groups' bound does not bound the values of
+    /// one without a bound.
+    #[test]
+    fn a_files_statistics_are_known_only_where_every_row_group_knows_them() {
+        let cases: [(&[(usize, Omit)], _); 8] = [
+            (&[], (Some("1"), Some("60"), Some(0), Some(6))),
+            (&[(0, Omit::All)], (None, None, None, None)),
+            (&[(1, Omit::All)], (None, None, None, None)),
+            (&[(1, Omit::NullCount)], (Some("1"), Some("60"), None, None)),
+            (&[(0, Omit::NullCount)], (Some("1"), Some("60"), None, None)),
+            (&[(1, Omit::Min)], (None, Some("60"), Some(0), Some(6))),
+            (&[(1, Omit::Max)], (Some("1"), None, Some(0), Some(6))),
+            (
+                &[(1, Omit::TooManyNulls)],
+                (Some("1"), Some("60"), None, None),
+            ),
+        ];
+        for (omit, expected) in cases {
+            let stats = flat_stats(&SIX, omit);
+            assert_eq!(summary(&stats), expected, "{omit:?}");
+        }
+    }
+
+    /// A row group of NULLs only has no bounds, and the file takes the other
+    /// row groups' bounds, which cover every value. Official leaves the file
+    /// without bounds here.
+    #[test]
+    fn a_row_group_of_nulls_leaves_the_others_bounds() {
+        let values = [None, None, Some(30), Some(40)];
+        let stats = flat_stats(&values, &[]);
+        assert_eq!(summary(&stats), (Some("30"), Some("40"), Some(2), Some(2)));
+        let stats = flat_stats(&values, &[(0, Omit::All)]);
+        assert_eq!(summary(&stats), (None, None, None, None));
+    }
+
+    /// A leaf of a nested column follows the same rules, counting its
+    /// column chunks' values.
+    #[test]
+    fn a_nested_leaf_without_statistics_leaves_its_bounds_unknown() {
+        use arrow::array::{Int64Array, StructArray};
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let fields = Fields::from(vec![Field::new("v", DataType::Int64, true)]);
+        let column = StructArray::new(
+            fields.clone(),
+            vec![Arc::new(Int64Array::from(SIX.to_vec()))],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap();
+        let (schema, metadata) = two_row_groups(&batch);
+        for (omit, expected) in [
+            (&[][..], (Some("1"), Some("60"), Some(0), Some(6))),
+            (&[(1, Omit::All)][..], (None, None, None, None)),
+            (
+                &[(1, Omit::NullCount)][..],
+                (Some("1"), Some("60"), None, None),
+            ),
+        ] {
+            let metadata = omit_statistics(&metadata, omit);
+            let stats =
+                compute_column_stats_with_leaf_ids(&schema, &metadata, &[7], &[Some(8)], 6, &[]);
+            let leaf = stats
+                .iter()
+                .find(|stat| stat.column_id == 8)
+                .expect("the leaf's stats");
+            assert_eq!(summary(leaf), expected, "{omit:?}");
         }
     }
 
