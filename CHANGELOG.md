@@ -338,6 +338,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A data file's column statistics read from its Parquet footer no longer take a bound or count
+  from the other row groups when one row group lacks it, as official records them: a row group
+  with values but no min or max leaves the file without that bound, and a row group with no null
+  count, or a file with more NULLs than values, leaves it without counts. A row group of NULLs only
+  still leaves the file the other row groups' bounds, where official records none.
+  Files registered earlier keep their recorded statistics.
 - A merge of rowid-adjacent files reads its sources' partitions one after another instead of
   merging them by source order. The merge held one decoded batch of every partition in memory it
   could not spill, so wide rows failed with "Resources exhausted" under a pool that holds a few
