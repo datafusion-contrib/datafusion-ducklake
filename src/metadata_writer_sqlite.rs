@@ -2307,7 +2307,7 @@ async fn migrate_snapshot_changes_nullable(pool: &SqlitePool) -> Result<()> {
 /// or `end_snapshot` newer than `base_snapshot` (the head observed when this
 /// write began), or an inlined data or inlined delete row was committed after
 /// it, another writer changed the table in the meantime, so this `Replace`
-/// aborts with [`DuckLakeError::Conflict`] rather than clobbering it.
+/// aborts with [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict) rather than clobbering it.
 /// (`Append` does not call this unless the write set an expected base snapshot:
 /// concurrent appends commute.)
 /// An inlined-data flush ([`ConflictScope::InlinedFlush`]) does not count delete

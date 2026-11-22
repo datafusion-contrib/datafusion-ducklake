@@ -523,7 +523,7 @@ fn partition_key(file: &DuckLakeTableFile) -> (Option<i64>, Vec<Option<String>>)
 }
 
 /// Re-key normalized partition values back to the `(partition_key_index, value)`
-/// pairs [`DataFileInfo::with_partition`] persists.
+/// pairs [`DataFileInfo::with_partition`](crate::metadata_writer::DataFileInfo::with_partition) persists.
 fn partition_value_pairs(values: &[Option<String>]) -> Vec<(i32, Option<String>)> {
     values
         .iter()

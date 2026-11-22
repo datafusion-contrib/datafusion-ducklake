@@ -5825,7 +5825,7 @@ impl DuckLakeTable {
     /// A read-only clone of this table (no writer, no rowid projection, fresh
     /// per-file read-config cache) carrying exactly the metadata a scan needs.
     /// [`DuckLakeUpdateExec`] holds one so it can drive the per-file update
-    /// scans ([`Self::compute_file_update`]) at execute time — `update()` only
+    /// scans ([`Self::apply_update_to_batches`]) at execute time — `update()` only
     /// has `&self`, so it cannot hand the exec an `Arc<Self>` directly.
     #[cfg(feature = "write")]
     fn read_only_clone(&self) -> DuckLakeTable {

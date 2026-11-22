@@ -2662,7 +2662,7 @@ async fn reserve_ids(
 /// file, delete file OR column of the table has `begin_snapshot` or
 /// `end_snapshot` > `base` (the catalog head observed at begin), or an inlined
 /// delete row has `begin_snapshot` > `base`, another writer changed this table
-/// since this write began ⇒ [`DuckLakeError::Conflict`]. Catches a data Replace
+/// since this write began ⇒ [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict). Catches a data Replace
 /// (new file begin), a fileless `CREATE`/Replace (new column begin), a DROP
 /// (end-stamp), and a DELETE that wrote or retired only a delete file or an
 /// inlined delete. The writer's own rows are not written yet, so the check

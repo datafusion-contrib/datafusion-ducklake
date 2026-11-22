@@ -1,51 +1,36 @@
-//! Whether a table's data changed between two snapshots, read from the
-//! snapshot change ledger (`ducklake_snapshot_changes.changes_made`) as
-//! official DuckLake records it.
+//! Whether a table's data changed between two snapshots, read from the snapshot
+//! change ledger (`ducklake_snapshot_changes.changes_made`) as official
+//! DuckLake records it.
 //!
-//! Every commit names the tables it touched in `changes_made`:
-//! `inserted_into_table:<id>` and `deleted_from_table:<id>` for Parquet data
-//! and delete files, `inlined_insert:<id>` and `inlined_delete:<id>` for rows
-//! and deletions stored in the catalog, `inline_flush:<id>` (official's
-//! `flushed_inlined`) when inlined data moves to Parquet,
-//! `merge_adjacent:<id>`, `rewrite_delete:<id>` and `compacted_table:<id>` for
-//! compaction, `altered_table:<id>` and `dropped_table:<id>`. Reading the
-//! ledger answers "did this table change" without listing a single data file,
-//! and sees changes that live only in the catalog (inlined inserts and
-//! deletions), which a file listing cannot.
+//! Every commit names the tables it touched in `changes_made`, as
+//! `<token>:<id>`: `inserted_into_table`, `deleted_from_table`,
+//! `inlined_insert`, `inlined_delete`, `inline_flush` (official's
+//! `flushed_inlined`), `merge_adjacent`, `rewrite_delete`, `compacted_table`,
+//! `altered_table` and `dropped_table`. Reading the ledger answers "did this
+//! table change" without listing data files, and sees catalog-only changes
+//! (inlined rows and deletions) that a listing cannot.
 //!
-//! Whether the rows changed is what official's change feed says:
-//! [`TableDataChanges::rows_changed`] is set when this crate's port of
-//! `ducklake_table_insertions` or `ducklake_table_deletions` over the window
-//! returns a row (or the window's history is unknown). The ledger decides
-//! without reading data wherever it can:
+//! [`TableDataChanges::rows_changed`] matches official's change feed: it is set
+//! when this crate's `ducklake_table_insertions` or `ducklake_table_deletions`
+//! over the window returns a row, or the window's history is unknown. The
+//! ledger decides without reading data where it can:
 //!
-//! - no token naming the table in the window (and no expired or unrecorded
-//!   snapshot): unchanged. Every change the feed reports is a data file, a
-//!   delete file or an inlined row or deletion committed in the window, and
-//!   every commit that writes one names the table;
-//! - an insert or a delete token (`inserted_into_table`, `deleted_from_table`,
-//!   `inlined_insert`, `inlined_delete`), `dropped_table`, a token this crate
-//!   does not know, an unrecorded snapshot or an expired one: changed. This
-//!   errs towards a change in one case: official's flush of inlined deletions
-//!   of Parquet rows (and a flush that writes delete files beside moving rows)
-//!   records `deleted_from_table`, as a `DELETE` does, while the feed reports
-//!   nothing for it;
-//! - `altered_table` only: unchanged. An alteration writes no data file, delete
-//!   file or inlined row, so the feed has nothing for it;
-//! - otherwise the snapshots recorded only a flush or a compaction
-//!   (`inline_flush`, `flushed_inlined`, `merge_adjacent`, `rewrite_delete`,
-//!   `compacted_table`), which move rows or rewrite their files, and the feed
-//!   is read over them, stopping at its first row. A `DELETE` committed in one
-//!   transaction with official's flush records only `inline_flush`; the feed
-//!   reports the deletion. A rewrite (`ducklake_rewrite_data_files`) and a
-//!   merge of adjacent files report nothing, so neither counts as a change on
-//!   its own (the feed follows official's main branch here, ahead of the
-//!   extension this crate pins, whose feed reports a rewrite's rows as
-//!   `UPDATE`s; see COMPATIBILITY.md).
+//! - no token for the table, and no expired or unrecorded snapshot: unchanged,
+//!   since every commit that writes data names the table;
+//! - an insert or delete token, `dropped_table`, an unknown token, or an
+//!   expired or unrecorded snapshot: changed. This over-reports one case:
+//!   official's flush of inlined deletions of Parquet rows records
+//!   `deleted_from_table`, while the feed reports nothing;
+//! - only `altered_table`: unchanged, since an alteration writes no data;
+//! - only flushes and compactions: the feed is read over them, stopping at its
+//!   first row (a `DELETE` committed with a flush records only `inline_flush`).
+//!   A rewrite or a merge of adjacent files reports nothing on its own; this
+//!   follows official's main branch, ahead of the pinned extension (see
+//!   COMPATIBILITY.md).
 //!
-//! [`TableDataChanges::layout_changed`] adds every flush and compaction from
-//! the tokens alone. A cache keyed by row content needs the first; one keyed by
-//! file and position (a row's location) needs both.
+//! [`TableDataChanges::layout_changed`] also counts every flush and compaction,
+//! from the tokens alone. A cache keyed by row content needs `rows_changed`;
+//! one keyed by row location needs both.
 //!
 //! # Example
 //!
