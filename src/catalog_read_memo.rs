@@ -55,37 +55,24 @@ use crate::table::{SCAN_READ_ATTEMPTS, inlined_rows_kept_moving, written_since};
 ///
 /// # How this differs from DuckLake
 ///
-/// Official DuckLake keeps no file listing between transactions. Each scan
-/// lists its files again, at the snapshot that its transaction pinned. This
-/// memo keeps a table's reads across queries, and checks only the catalog head
-/// (the newest snapshot id) before it serves them. It is correct only while
-/// these facts hold:
+/// Official DuckLake lists a scan's files again in every transaction. This memo
+/// serves kept reads after checking only the catalog head (the newest snapshot
+/// id), so it is correct only while:
 ///
-/// 1. Every commit that changes what a scan reads also moves the head. SQL
-///    writes (insert, delete, update) and the maintenance calls (merge adjacent
-///    files, rewrite data files, flush inlined data) each commit a new snapshot
-///    together with their changes, in official DuckLake and in this crate. The
-///    merge, the rewrite and the flush also change the listing of older
-///    snapshots.
-///
-///    The low-level [`MetadataWriter`](crate::metadata_writer::MetadataWriter)
-///    API does not keep this fact. `create_snapshot` moves the head, and later
-///    calls such as `register_data_file` or `end_table_files` change the
-///    catalog at that snapshot without moving the head again. A memo filled
-///    between them misses those changes until the next commit. Any other writer
-///    that changes the catalog tables without a new snapshot breaks the memo in
-///    the same way.
-/// 2. Snapshot ids only grow. A bind that reads a newer head drops every
-///    entry, because no entry can serve that head.
-/// 3. Expiring snapshots and cleaning up old files commit no snapshot, so they
-///    do not move the head. Official DuckLake refuses a read at an expired
-///    snapshot ("No snapshot found"). Without a memo, this crate returns no rows
-///    for it. With a memo, a kept entry of the expired snapshot returns the old
-///    rows until cleanup deletes their files, and then the read fails. Entries
-///    of the head snapshot are safe, because the head cannot expire.
-/// 4. A key is a table id and a snapshot id, with no catalog identity. Use one
-///    memo per catalog. A catalog that is restored to an older head and then
-///    committed up to the same snapshot id again gets the old entries.
+/// 1. Every commit that changes what a scan reads moves the head. SQL writes
+///    and maintenance (merge, rewrite, flush) do; the last three also change
+///    older snapshots' listings. The low-level
+///    [`MetadataWriter`](crate::metadata_writer::MetadataWriter) calls after
+///    `create_snapshot` (`register_data_file`, `end_table_files`) do not, so a
+///    memo filled between them misses those changes until the next commit. So
+///    does any writer that changes the catalog without a new snapshot.
+/// 2. Snapshot ids only grow. A bind that sees a newer head drops every entry.
+/// 3. Expire and cleanup do not move the head. A kept entry for an expired
+///    snapshot returns old rows until cleanup deletes their files, then fails.
+///    (Official DuckLake refuses the read; without a memo this crate returns no
+///    rows.) Entries for the head snapshot are safe.
+/// 4. Keys carry no catalog identity, so use one memo per catalog. A catalog
+///    restored and committed back up to the same snapshot id gets stale entries.
 ///
 /// Two answers stay across heads, so that a fill after a commit reads less:
 ///

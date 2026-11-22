@@ -10,7 +10,8 @@
 //!
 //! This extension provides read and write access to DuckLake catalogs through DataFusion's
 //! catalog and table provider interfaces. Writes are feature-gated (`write-sqlite`,
-//! `write-postgres`); see `COMPATIBILITY.md` for the full backend/feature matrix.
+//! `write-postgres`, `write-duckdb`, `write-mysql`); see `COMPATIBILITY.md` for the
+//! full backend/feature matrix.
 //!
 //! ## Example
 //!
@@ -37,40 +38,19 @@
 //! # }
 //! ```
 //!
-//! ## Catalog I/O runs on a runtime of this crate's own
+//! ## Catalog I/O runs on its own runtime
 //!
-//! DataFusion resolves catalog, schema and table names through synchronous
-//! trait methods, so a catalog query is awaited from a blocking context
-//! somewhere in here. That query is driven on a tokio runtime this crate owns
-//! rather than on the caller's: two worker threads, started the first time a
-//! SQLite, PostgreSQL or MySQL catalog opens a pool or answers a call, shared
-//! by every provider and writer in the process, and never shut down. Behind
-//! them is a blocking pool capped at sixteen more, which carry the address
-//! resolution a pool does while it opens a connection. Tokio names both pools
-//! alike, so a process counting threads called `ducklake-catalog` can
-//! transiently see eighteen.
+//! DataFusion resolves names through synchronous methods, so this crate drives
+//! SQLite, PostgreSQL and MySQL catalog queries on a tokio runtime it owns: two
+//! worker threads and a blocking pool of up to sixteen, all named
+//! `ducklake-catalog`, started on first use, shared process-wide and never shut
+//! down. Catalog calls therefore work from any context: a `current_thread`
+//! runtime, a busy multi-threaded one, or a plain `std::thread`.
 //!
-//! That is what lets a catalog call work wherever it is made from — a
-//! `current_thread` runtime, a multi-threaded one with every thread already
-//! busy, or a plain `std::thread` — and keeps the number of catalog calls in
-//! flight from being something an embedder has to size its own runtime
-//! against.
-//!
-//! It covers the pools this crate opens: `SqliteMetadataProvider::new`,
-//! `PostgresMetadataProvider::new`, `MySqlMetadataProvider::new` and the
-//! metadata writers' constructors all open theirs on that runtime. A pool
-//! adopted through `from_pool` or `with_pool` keeps whatever driver opened its
-//! connections, and a sqlx connection is only ever reported readable by that
-//! driver, so a catalog call through an adopted pool must not block the
-//! runtime the pool came from — under a `current_thread` runtime it blocks
-//! exactly that. The call fails when the pool's acquire timeout expires,
-//! answers when every reply it reads has already reached the socket, or hangs
-//! indefinitely when the pool's health check finds its reply waiting but the
-//! query does not: the acquire timeout does not bound the query.
-//! Those constructors say what they do and do not move.
-//!
-//! The cost is the threads this library starts without being asked, which is
-//! worth knowing if you are counting them.
+//! Pools opened by this crate's constructors use that runtime. A pool adopted
+//! through `from_pool` or `with_pool` keeps the driver that opened it, so a
+//! catalog call on it must not block the runtime the pool came from. Under a
+//! `current_thread` runtime it can hang; the acquire timeout does not bound it.
 
 pub mod catalog;
 mod catalog_read_memo;

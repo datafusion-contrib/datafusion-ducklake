@@ -1,106 +1,68 @@
 //! Encoding a data file's row groups on several threads.
 //!
-//! A [`RowGroupQueue`] cuts the batches of a write into row groups and encodes
-//! each one as a job of its own on an [`EncodePool`], at most one job per pool
-//! thread at a time. Finished row groups come back in the order their rows
-//! were written, whichever job finished first, and the caller appends them to
-//! its file with a [`RowGroupAppender`], or to the next file once one is full.
-//! Row groups share no state: each job has its own column writers, so the
-//! heaviest column of a file is encoded on as many threads as there are row
-//! groups in flight.
-//!
-//! Official DuckLake's writer, DuckDB's Parquet `COPY`, also prepares row
-//! groups on several threads (`PrepareRowGroup`) and writes them to the file
-//! one at a time (`FlushRowGroup`). An insert into a DuckLake table does not
-//! preserve insertion order, so DuckDB copies it in parallel
-//! (`PARALLEL_COPY_TO_FILE`) and appends each row group as it is ready, in
-//! whatever order its threads finish them. Rows kept in write order are one
-//! of the orders that copy can produce.
+//! A [`RowGroupQueue`] cuts a write's batches into row groups and encodes each
+//! as a job on an [`EncodePool`], at most one per pool thread. Results come
+//! back in write order and the caller appends them with a [`RowGroupAppender`],
+//! to this file or the next once it is full. Jobs share no state, so a file's
+//! heaviest column is encoded on as many threads as there are row groups in
+//! flight. DuckDB's Parquet `COPY` works the same way, and since a DuckLake
+//! insert does not preserve order, write order is one it could produce.
 //!
 //! # Row groups
 //!
-//! A row group closes when it holds the row cap's rows
-//! (`WriterProperties::max_row_group_row_count`), exactly, or when its input
-//! reaches the byte cap (`WriterProperties::max_row_group_bytes`), counted as
-//! the logical size of its rows in memory
-//! ([`crate::write_encoding::sliced_memory_size`]), as DuckDB counts its
-//! buffered input against `row_group_size_bytes`. A batch is split where a row
-//! group closes, at the batch's average row size; a row larger than the byte
-//! cap is a row group of its own. `ArrowWriter` instead closes a row group by
-//! the running estimate of its encoded size, which only a sequential writer
-//! has, so a byte cap gives row groups of other sizes here. The row cap alone
-//! gives the same ones.
+//! A row group closes at the row cap (`max_row_group_row_count`) or when its
+//! in-memory size ([`crate::write_encoding::sliced_memory_size`]) reaches the
+//! byte cap (`max_row_group_bytes`), as DuckDB counts `row_group_size_bytes`.
+//! A batch is split at its average row size; a row larger than the byte cap
+//! gets its own row group. With a byte cap, row-group sizes differ from
+//! `ArrowWriter`, which uses a running estimate of encoded size.
 //!
-//! Each row group's encoding is chosen from its own rows
-//! ([`crate::write_encoding::props_for_row_group`]), as DuckDB chooses each
-//! column chunk's; a file written on one thread takes its first row group's
-//! choice for the whole file. The values and their order are the same either
-//! way; the bytes of the file are not, and so neither are its column sizes.
+//! Each row group picks its encoding from its own rows
+//! ([`crate::write_encoding::props_for_row_group`]), so file bytes and column
+//! sizes differ from a single-threaded write. Values and order do not.
 //!
-//! Each job also folds its rows into a [`WrittenLeafStats`], which the caller
-//! merges in row-group order ([`WrittenLeafStats::merge_ordered`]), so no pass
-//! over the values is left on the calling thread. The merge is one pass over
-//! the values but for string and blob bounds cut short of a value's 256th
-//! byte, which it can leave looser, or drop; see its docs.
+//! Each job also builds a [`WrittenLeafStats`], merged in row-group order by
+//! [`WrittenLeafStats::merge_ordered`], which may loosen or drop string and
+//! blob bounds truncated before byte 256 (see its docs).
 //!
 //! # Memory
 //!
-//! A pool is either a write's own ([`EncodePool::new`], from the write's
-//! `encode_parallelism`) or one a caller shares across all its writes
-//! ([`EncodePool::try_new`]). Both count the row groups out, handed to the
-//! pool and not yet appended, across every queue they serve, and charge each
-//! row group out to the pool's byte budget: twice its rows' size in memory
-//! (its input, and as much again for the pages it encodes) until its job
-//! finishes, then what its column chunks hold, until it is appended. They
-//! differ in how a row group is admitted.
+//! A pool is a write's own ([`EncodePool::new`], sized by
+//! `encode_parallelism`) or shared across writes ([`EncodePool::try_new`]).
+//! Both charge each row group out (handed to the pool, not yet appended) to a
+//! byte budget: twice its rows' in-memory size until its job finishes, then
+//! the size of its column chunks until it is appended. At most `2 × threads`
+//! row groups are out at once.
 //!
-//! A write's own pool admits loosely. The rows of a row group are charged
-//! while it is assembled. When a row group is ready and the budget is spent,
-//! or the pool already has `2 × threads` row groups out, its queue appends
-//! its own earliest one before handing out another. A queue with nothing out
-//! hands it out anyway, so a row group larger than the budget is still
-//! written, and no queue waits on another's. A write therefore has at most
-//! `2 × threads` row groups out, plus one for each other queue holding rows:
-//! each file sequence of an unpartitioned write or lane, and each open
-//! partition file (up to `max_open_partitions`) of a partitioned one.
+//! - A write's own pool admits loosely. When the budget is spent, a queue
+//!   appends its earliest row group before handing out another, but a queue
+//!   with nothing out hands one out regardless, so an oversized row group is
+//!   still written. A write has at most `2 × threads` row groups out, plus one
+//!   per other queue holding rows (each file sequence or lane, and each open
+//!   partition file up to `max_open_partitions`).
+//! - A shared pool admits strictly ([`RowGroupQueue::dispatch_checked`]). A row
+//!   group is handed out only if its charge fits the remaining budget; if not,
+//!   its queue appends its own earliest row group and retries, and with nothing
+//!   out it encodes on its own thread. Charges never grow past the budget, so
+//!   across all writes sharing the pool they never exceed it. No write is
+//!   refused and no queue waits on another's.
 //!
-//! A shared pool admits strictly ([`RowGroupQueue::dispatch_checked`]). A row
-//! group is handed out only when its charge fits in what the budget has left
-//! and the pool has fewer than `2 × threads` row groups out, both checked and
-//! taken in one atomic step each. When it does not fit, its queue appends its
-//! own earliest row group out, which gives that charge back, and tries
-//! again; once the queue has nothing out it encodes the row group on its own
-//! thread, as a one-thread write does, and appends it at once. A write is
-//! never refused for want of budget, and no queue waits on another's row
-//! groups. A row group's charge is taken before it is handed out and is never
-//! grown past the budget: a job whose chunks hold more than it was charged
-//! keeps the charge it had unless the budget has room for the rest. So the
-//! charges of the row groups out, across every write sharing the pool, never
-//! pass the budget, and at most `2 × threads` are out; beyond that each queue
-//! holds the one row group it is assembling, or encoding on its own thread,
-//! as a one-thread writer holds one. The rows being assembled are not
-//! charged.
+//! The budget bounds what is queued, not process memory. Not counted: buffers a
+//! batch slice keeps alive (a slice pins its parent), encoder working memory,
+//! distinct-value counting, bloom filters and page indexes held until the
+//! footer, and, in a shared pool, the row group each queue assembles or
+//! encodes itself plus any job pages beyond its charge.
 //!
 //! # Failure
 //!
-//! A row group that fails to encode, or to append, fails its queue for good:
-//! every later push and finish of it returns an error, so a file missing the
-//! row group's rows is never finished.
-//!
-//! Not counted: buffers a batch slice keeps alive beyond its own rows (a slice
-//! of a larger batch pins the whole parent), the encoders' working memory
-//! beyond the pages they hold, the distinct values counted to choose a row
-//! group's encoding, the bloom filters and page indexes a file keeps until
-//! its footer is written, and, in a shared pool, the row group each queue
-//! assembles or encodes on its own thread and the pages of a job beyond its
-//! charge that the budget has no room for. The budget bounds what is queued,
-//! not the process's memory.
+//! A row group that fails to encode or append fails its queue for good: every
+//! later push and finish returns an error, so a file missing rows is never
+//! finished.
 //!
 //! # What runs on one thread instead
 //!
-//! Content-defined chunking (`WriterProperties::content_defined_chunking`)
-//! cuts pages across a whole column, and an encrypted file binds each column
-//! chunk to its file and row-group position; [`supports`] refuses both, and
+//! Content-defined chunking cuts pages across a whole column, and an encrypted
+//! file binds each column chunk to its position; [`supports`] refuses both, and
 //! the caller writes those files with `ArrowWriter`.
 
 use std::collections::BTreeMap;
