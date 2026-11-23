@@ -10,7 +10,7 @@ DataFusion-DuckLake is a DataFusion extension that provides read and write acces
 
 The extension integrates DuckLake with Apache DataFusion by implementing DataFusion's catalog and table provider interfaces.
 
-Reads are supported on all four catalog backends. Writes are feature-gated and implemented for SQLite (`write-sqlite`), PostgreSQL (`write-postgres`), DuckDB (`write-duckdb`) and MySQL (`write-mysql`). Both have a **standard single-catalog** writer (`SqliteMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
+Reads are supported on all four catalog backends. Writes are feature-gated and implemented for SQLite (`write-sqlite`), PostgreSQL (`write-postgres`), DuckDB (`write-duckdb`) and MySQL (`write-mysql`). Each has a **standard single-catalog** writer (`SqliteMetadataWriter`, `DuckdbMetadataWriter`, `MySqlMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
 
 ## Commands
 
@@ -52,8 +52,8 @@ The codebase follows a layered architecture with clear separation of concerns:
      file list at each scan
    - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching
 
-3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
-   - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`), `PostgresSingleCatalogMetadataWriter` (`metadata_writer_postgres_single.rs`, standard spec layout), and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`, multi-catalog layout)
+3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres` / `write-duckdb` / `write-mysql`)
+   - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`), `DuckdbMetadataWriter` (`metadata_writer_duckdb.rs`), `MySqlMetadataWriter` (`metadata_writer_mysql.rs`), `PostgresSingleCatalogMetadataWriter` (`metadata_writer_postgres_single.rs`, standard spec layout), and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`, multi-catalog layout)
    - `DuckLakeTableWriter` / `TableWriteSession` (`table_writer.rs`): write Arrow batches to Parquet with configurable compression and row-group sizing
    - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/it/insert_partitioning_tests.rs`)
    - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`

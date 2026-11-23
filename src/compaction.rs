@@ -580,45 +580,20 @@ pub(crate) fn sorted_rewrite_batches(
 
 /// Stream compaction output through DataFusion's spilling sort.
 ///
-/// `input` carries `[data columns..., rowid]` and, for a partial merge, the
-/// embedded snapshot-id column. `ordering` (from [`compaction_ordering`])
-/// resolves against the leading data columns, so the embedded row lineage stays
-/// attached to its row; `None` streams the input through unsorted.
+/// `input` carries `[data columns..., rowid]`, plus the embedded snapshot-id
+/// column for a partial merge. `ordering` (from [`compaction_ordering`])
+/// resolves against the leading data columns; `None` leaves the input unsorted.
 ///
-/// `input` is normally multi-partition — one partition per source file — because
-/// that is how the compaction set is read in parallel.
-/// `CoalescePartitionsExec` funnels those partitions back into the single stream
-/// the compaction writer consumes.
+/// `input` has one partition per source file (or byte range), and
+/// `CoalescePartitionsExec` merges them in arrival order, so unsorted output
+/// order is not deterministic. Official DuckLake does not preserve it either,
+/// except for rowid-adjacent merges, which go through [`source_ordered_output`].
+/// That is safe: each row carries its rowid (and origin snapshot) as columns,
+/// and delete positions are resolved by rescanning the rewritten file.
 ///
-/// That coalesce emits partitions interleaved by arrival, so an unsorted merge's
-/// physical row order depends on which object-store request returned first. The
-/// same now applies to a single-file `rewrite_data_files`, whose scan is split
-/// across byte ranges: its output order is no longer the source order. Official
-/// DuckLake does not preserve order on this copy either (`DONT_PRESERVE_ORDER`
-/// in `ducklake_compaction_functions.cpp` for every compaction but a merge of
-/// rowid-adjacent files, which is written through [`source_ordered_output`]).
-/// The order is not load bearing: every compaction output carries each row's
-/// rowid (and, for a partial file, its origin snapshot) as columns, so nothing
-/// downstream derives lineage from where a row sits. Delete
-/// files ARE written in position space, but a
-/// mutation resolves those positions by rescanning the file it is targeting, so
-/// they describe that file's actual layout whatever it turned out to be.
-///
-/// Preserving order instead means holding a partition until its turn to be
-/// emitted. The custom operator that did so buffered each one into a `Vec`
-/// outside the memory pool's accounting, which is memory a streaming coalesce
-/// does not need and the pool could not see.
-///
-/// The coalesce starts every input partition at once rather than capping
-/// concurrency, so the fan-out is worth being explicit about. Partitions are the
-/// bin's files, each split across byte ranges, and two limits bound that from
-/// opposite directions:
-/// `MergeOptions::max_merged_files` caps how many files a pass considers, and
-/// the bin's byte budget caps how much data one plan covers. They cannot both be
-/// at maximum.
-/// The batches in flight are bounded too: `CoalescePartitionsExec` feeds a
-/// `tokio::sync::mpsc` channel sized to the partition count, so a producer that
-/// outruns the writer blocks on send rather than accumulating.
+/// Fan-out is bounded by `MergeOptions::max_merged_files` and the bin's byte
+/// budget. The coalesce channel is sized to the partition count, so a fast
+/// producer blocks instead of buffering.
 pub(crate) fn sorted_rewrite_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,

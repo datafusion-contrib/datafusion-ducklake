@@ -367,7 +367,7 @@ walkthrough (bootstrap → create catalogs → write → read back).
 
 The `maintenance` API handles lakehouse upkeep from Rust: expiring old snapshots,
 cleaning up superseded files, and reclaiming orphaned files. The concrete entry points
-are backend-gated (`write-sqlite` / `write-postgres`). `DROP TABLE` is available through
+are backend-gated (`write-sqlite` / `write-postgres` / `write-duckdb` / `write-mysql`). `DROP TABLE` is available through
 `MetadataWriter`. See
 [`examples/maintenance_demo.rs`](examples/maintenance_demo.rs) and
 [`examples/orphan_cleanup_demo.rs`](examples/orphan_cleanup_demo.rs).
