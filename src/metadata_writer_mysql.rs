@@ -1,17 +1,13 @@
 //! MySQL implementation of [`MetadataWriter`].
 //!
-//! Single-catalog only — the legacy DuckLake v1.0 layout, mirroring
-//! [`crate::metadata_writer_sqlite::SqliteMetadataWriter`] rather than the
-//! multicatalog Postgres writer. It supports the crate's write primitives,
-//! inlined data, positional deletes, updates, compaction, truncate, append
-//! restoration, type promotion, partition and sort metadata, and snapshot
-//! expiry. Multiple catalogs remain specific to PostgreSQL;
-//! [`MetadataWriter::catalog_id`] inherits the `None` default and keeps file
-//! paths in the `{data_path}/{schema}/{table}/…` layout.
+//! Single-catalog only (the DuckLake v1.0 layout), mirroring
+//! [`crate::metadata_writer_sqlite::SqliteMetadataWriter`] with the same write
+//! features. [`MetadataWriter::catalog_id`] returns `None`, and file paths use
+//! the `{data_path}/{schema}/{table}/…` layout.
 //!
-//! Requires a multi-threaded Tokio runtime (`#[tokio::test(flavor =
-//! "multi_thread")]`): the sync trait methods bridge async sqlx via
-//! `crate::metadata_provider::block_on`, exactly like the SQLite writer.
+//! Requires a multi-threaded Tokio runtime: the sync trait methods bridge async
+//! sqlx through `crate::metadata_provider::block_on`, as the SQLite writer
+//! does.
 //!
 //! ## MySQL dialect adaptations vs the SQLite template
 //!
@@ -1823,7 +1819,6 @@ async fn retire_prior_generation(
     Ok(())
 }
 
-/// Register a delete file an inlined flush wrote for `data_file_id`.
 /// Register each of `entries`, a delete file that records its positions'
 /// snapshots, against its data file. One that replaces the file's live delete
 /// file carries every position of it, so the replaced row is removed and its
@@ -1880,6 +1875,7 @@ async fn replace_delete_files(
     Ok(())
 }
 
+/// Register a delete file an inlined flush wrote for `data_file_id`.
 async fn insert_flush_delete_file(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -2198,18 +2194,6 @@ async fn record_schema_version(
     Ok(())
 }
 
-/// The atomic commit point for a single-catalog write. Inserts the deferred
-/// `ducklake_snapshot` row (its counter id was reserved conceptually at begin but
-/// the row is inserted here), finalizes the column generation, and — for
-/// `Replace` — retires the prior data generation. All within the caller's
-/// transaction, so a reader never sees a half-published head.
-///
-/// The column generation is deferred to here (rather than written in
-/// `begin_write_transaction`) because the read path resolves a table's columns by
-/// `end_snapshot IS NULL` only (not snapshot-scoped), so inserting the new
-/// generation at begin would leak it to concurrent reads during the upload
-/// window. `column_ids` are the ids reserved at begin and already baked into the
-/// staged parquet's `field_id` metadata.
 /// Persist the harvested per-column stats for a just-registered data file
 /// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
 async fn insert_file_column_stats(
@@ -2241,8 +2225,6 @@ async fn insert_file_column_stats(
     Ok(())
 }
 
-/// Recompute `ducklake_table_column_stats` from the table's live files and
-/// replace the stored rows. See the SQLite writer's equivalent for the rationale.
 /// Persist a partitioned data file's partition metadata within the commit
 /// transaction: set `ducklake_data_file.partition_id` and insert one
 /// `ducklake_file_partition_value` row per partition key. A no-op for an
@@ -2697,6 +2679,18 @@ pub(crate) async fn merge_inlined_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
+/// The atomic commit point for a single-catalog write. Inserts the
+/// `ducklake_snapshot` row (its id taken from the snapshot counter here),
+/// finalizes the column generation, and — for
+/// `Replace` — retires the prior data generation. All within the caller's
+/// transaction, so a reader never sees a half-published head.
+///
+/// The column generation is deferred to here (rather than written in
+/// `begin_write_transaction`) because the read path resolves a table's columns by
+/// `end_snapshot IS NULL` only (not snapshot-scoped), so inserting the new
+/// generation at begin would leak it to concurrent reads during the upload
+/// window. `column_ids` are the ids reserved at begin and already baked into the
+/// staged parquet's `field_id` metadata.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,

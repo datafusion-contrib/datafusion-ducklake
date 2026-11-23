@@ -803,7 +803,7 @@ fn predicates() -> Vec<Predicate> {
 /// **No — [`Fidelity::HostileEncoding`].** The statistic is text no writer of
 /// this crate produces (`nan` for a float, `today` for a date, `2020-02-31`,
 /// a padded ` 2020-01-01 `, a `.50` fraction the encoder trims), or a row that
-/// is absent or incomplete. `stats_filter`'s module docs commit to declining
+/// is absent or incomplete. `docs/stats-filter.md` (divergence 4) commits to declining
 /// exactly these — "every dialect admits only the shapes `stats_encode` writes",
 /// because an engine's input function is permissive by design and will read
 /// `nan`, `epoch` or `0x10` into a real value that then prunes. `table.rs`'s

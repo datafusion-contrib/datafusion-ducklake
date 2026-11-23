@@ -1,9 +1,5 @@
-//! Keyed mutations of a table from a staged batch: delete, update or upsert
-//! the rows whose key columns equal a staged row's.
-//!
-//! A caller that holds a batch of changed rows and knows the table's key
-//! columns gets the semantics of a SQL statement keyed on them, without
-//! knowing where the matching rows live:
+//! Keyed mutations of a table from a staged batch: delete, update or upsert the
+//! rows whose key columns equal a staged row's.
 //!
 //! - [`KeyedMutation::delete_by_keys`] is `DELETE FROM t WHERE (k...) IN
 //!   (SELECT k... FROM staged)`;
@@ -13,24 +9,20 @@
 //! - [`KeyedMutation::upsert_by_keys`] deletes the matched rows and appends
 //!   every staged row, with new `rowid`s, in the same snapshot.
 //!
-//! Matches are found in the table's Parquet files and in its inlined rows,
-//! and each is recorded the way official DuckLake's `DELETE` and `UPDATE`
-//! record it (`DuckLakeDelete::FlushDelete`): a data file's deletions that
-//! number at most the table's `data_inlining_row_limit` go to
-//! `ducklake_inlined_delete_<table_id>`, even when they delete every row of
-//! the file; above the limit, a file they empty is ended, a file with a live
-//! delete file gets a new one carrying each position with the snapshot that
-//! deleted it, and any other file gets a delete file of its new positions;
-//! matched inlined rows are ended. New rows (the upsert's appends,
-//! the update's new versions) are inlined when the statement writes at most
-//! the limit's rows, as official's insert inlines them, else written to
-//! Parquet. Everything commits in one snapshot, with the conflict checks and
-//! retries of a SQL `DELETE` or `UPDATE`
+//! Matches are found in Parquet files and inlined rows alike, and recorded as
+//! official DuckLake's `DELETE` and `UPDATE` record them: a file's deletions
+//! within the table's `data_inlining_row_limit` go to
+//! `ducklake_inlined_delete_<table_id>`, even when they empty the file; above
+//! it, a file they empty is ended and any other gets a delete file. Matched
+//! inlined rows are ended. New rows are inlined when the statement
+//! writes at most the limit's rows, else written to Parquet. Everything commits
+//! in one snapshot, with the conflict checks and retries of a SQL `DELETE` or
+//! `UPDATE`
 //! ([`DuckLakeWriteTransaction::commit`](crate::DuckLakeWriteTransaction::commit)).
 //!
-//! A key is matched by value equality of every key column, each found in a
-//! staged batch by name. A staged row with a NULL key matches nothing, as
-//! `NULL = NULL` is not true in SQL; an upsert still appends it.
+//! A key matches when every key column, found in the staged batch by name, is
+//! equal. A staged row with a NULL key matches nothing, as `NULL = NULL` is not
+//! true in SQL; an upsert still appends it.
 //!
 //! # Staged types
 //!

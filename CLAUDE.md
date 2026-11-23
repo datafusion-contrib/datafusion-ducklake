@@ -108,7 +108,7 @@ The codebase follows a layered architecture with clear separation of concerns:
    - Converts DuckLake type strings to Arrow DataTypes
    - Handles basic types (integers, floats, strings, dates, timestamps)
    - Supports decimals with precision/scale parsing
-   - Complex types (lists, structs, maps) return proper errors instead of silently failing
+   - Maps nested types (lists, structs, maps) recursively
    - `build_arrow_schema()` constructs Arrow schemas from DuckLake column metadata
 
 ### Dynamic Metadata Lookup
@@ -229,8 +229,8 @@ The `DuckLakeTable` provider handles URL resolution by:
 - Type mapping handles SQL type aliases (e.g., "bigint" -> Int64,
   "text" -> Utf8)
 - Geometry types are mapped to Binary (WKB format)
-- Complex types (nested lists, structs, maps) return descriptive errors
-  instead of silently failing
+- Nested types (lists, structs, maps) are supported, including inlining; their
+  statistics do not prune files
 - Inlined writers preserve DuckLake encodings. SQLite uses text for temporal values;
   PostgreSQL uses text for dates, timestamps, and `UInt64`. See `COMPATIBILITY.md`.
 - `MetadataWriter::set_inlined_index_columns()` declares optional physical indexes.
@@ -264,7 +264,7 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
   (see `COMPATIBILITY.md`)
 - No SQL `AS OF` syntax; use `DuckLakeCatalog::with_snapshot`,
   `DuckLakeCatalog::with_snapshot_at`, or `ducklake_table_at` for snapshot selection
-- Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
+- Nested types (lists, structs, maps) are not pruned by statistics (see `COMPATIBILITY.md`)
 - Partitioning (`identity` + temporal `year`/`month`/`day`/`hour`) is supported: read + pruning on
   all backends, and partitioned writes on every writable backend, declared via
   `set_partition_spec`/`reset_partition_spec` or the `ALTER TABLE … SET/RESET PARTITIONED BY` SQL
@@ -291,7 +291,7 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
   opt-in `CatalogReadMemo` wrapper, which is not DuckLake behavior (see `COMPATIBILITY.md`)
 
 ### Testing
-The project includes comprehensive tests (`tests/it/`, ~50 integration modules plus unit
+The project includes comprehensive tests (`tests/it/`, ~125 integration modules plus unit
 tests in `src/`). Many are feature-gated — e.g. write tests need `write-sqlite`, and
 the postgres/mysql provider and multicatalog tests require Docker (`testcontainers`).
 

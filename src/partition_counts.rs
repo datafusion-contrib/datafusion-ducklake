@@ -2,49 +2,41 @@
 //!
 //! [`DuckLakeTable::partition_live_row_counts`](crate::DuckLakeTable::partition_live_row_counts)
 //! answers "how many rows are live in the partition whose value is `v`" without
-//! listing the table's files to the caller or opening any of them. A provider
-//! supplies the catalog facts ([`PartitionCountFacts`], through
+//! opening any file. A provider supplies the catalog facts
+//! ([`PartitionCountFacts`], through
 //! [`MetadataProvider::get_partition_count_facts`](crate::MetadataProvider::get_partition_count_facts)),
 //! and the table turns them into a count per requested value.
 //!
-//! The answer for a value is [`PartitionRowCount::Exact`] only when the catalog
+//! A value's answer is [`PartitionRowCount::Exact`] only when the catalog
 //! counters account for every row a scan at the same snapshot would return, and
 //! [`PartitionRowCount::Unknown`] otherwise. Unknown is never zero: a caller
-//! that needs the number has to count the partition's rows for real.
+//! that needs the number must count the rows.
 //!
-//! The column must be the one identity key of the table's live partition spec,
-//! and each requested value must be spelled as the writer stores it (see
-//! [`PartitionCountUnknown::NonCanonicalValue`]). A value is then exact when all
-//! of these hold at the read snapshot `S`:
+//! The column must be the one identity key of the table's live partition spec
+//! and not a float ([`PartitionCountUnknown::FloatKey`]). Each requested value
+//! must be spelled as the writer stores it (see
+//! [`PartitionCountUnknown::NonCanonicalValue`]). A value is then exact when
+//! all of these hold at the read snapshot `S`:
 //!
 //! - `S` still exists in the catalog;
-//! - the table has no visible inlined rows. Inlined rows live in the catalog,
-//!   not in a data file, and no file counter includes them. This is stricter
-//!   than official DuckLake, whose nearest mechanism (the `count(*)` fold of
-//!   `ducklake_scan.cpp`, over `GetNetDataFileRowCountSql`) is table-wide and
-//!   adds the inlined rows in; per partition value that would mean reading
-//!   every inlined row's key, so here any visible inlined row makes every
-//!   value unknown;
-//! - every visible data file is attributable: it was written under the live
-//!   partition spec, has exactly one partition value for the key, and that
-//!   value is spelled canonically. One that is not could hold rows of any
-//!   value, so every value is unknown;
+//! - the table has no visible inlined rows. No file counter includes them, and
+//!   counting them per value would mean reading every inlined row's key.
+//!   (Official's table-wide `count(*)` fold adds them in; this is stricter.)
+//! - every visible data file is attributable: written under the live spec, with
+//!   exactly one canonically spelled value for the key. Any other file could
+//!   hold rows of any value, so every value is unknown;
 //! - every file of the value records a `record_count`;
 //! - no file of the value is a merged partial file read below its
-//!   `partial_max`, whose rows from later snapshots a scan drops one by one;
-//! - each file of the value has at most one visible delete file, which records
-//!   a `delete_count` between 0 and the file's `record_count`, and whose
-//!   deletions were all made by `S`. A delete file can begin before some of its
-//!   deletions: a delete file that rewrites an earlier one records the latest
-//!   deletion as `partial_max`, but a flush of inlined rows deleted while
-//!   inlined writes one that begins at its earliest deletion and records no
-//!   `partial_max` (official's `ducklake_flush_inlined_data` does the same). So a delete file counts
-//!   below the catalog head only with a `partial_max` at or below `S`; at the
-//!   head every deletion it holds has been made, as official answers
-//!   `count(*)` from delete counts only at the current snapshot;
-//! - a file of the value with inlined deletions has no delete file. The scan
-//!   applies the union of the two, and only reading the delete file could say
-//!   whether they overlap;
+//!   `partial_max`;
+//! - each file of the value has at most one visible delete file, with a
+//!   `delete_count` between 0 and the file's `record_count`, and all its
+//!   deletions made by `S`. Below the catalog head that requires a
+//!   `partial_max` at or below `S`, since a flush of inlined deletions writes a
+//!   delete file that begins at its earliest deletion and records no
+//!   `partial_max`. At the head every deletion has been made, as official
+//!   answers `count(*)` from delete counts only there;
+//! - a file of the value with inlined deletions has no delete file, since only
+//!   reading the delete file could tell whether the two overlap;
 //! - the sum fits in a `u64`.
 //!
 //! A requested value with no visible files is exact at zero. A catalog that

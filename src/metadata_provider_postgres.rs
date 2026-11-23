@@ -1630,26 +1630,20 @@ pub(crate) async fn delete_file_begin_snapshot_on(
 /// Statistics SQL for a catalog queried natively as PostgreSQL.
 ///
 /// Shared with [`crate::multicatalog_provider`], which speaks the same dialect
-/// to the same server; a divergence between two copies of the constructs below
-/// would be a silent correctness difference between the two readers.
+/// to the same server, so the two readers cannot diverge.
 ///
-/// PostgreSQL has no `TRY_CAST`, and a plain `CAST` of a stat string it cannot
-/// parse raises an error that aborts the whole listing query — one malformed or
-/// foreign-written `min_value` would turn a scan into a hard failure. The two
-/// constructs below are what stand in for `TRY_CAST`, and which one is used
-/// depends on the server:
+/// PostgreSQL has no `TRY_CAST`, and a `CAST` of an unparseable stat aborts the
+/// whole listing query. So a stat is cast only after it passes:
 ///
-/// - PostgreSQL 16 and later have `pg_input_is_valid(text, type)`, which runs a
-///   type's input function in soft-error mode. It is exact: it rejects garbage,
-///   out-of-range integers, overflowing and underflowing floats, and impossible
-///   calendar dates like `2020-02-31`, all of which a plain `CAST` would raise
-///   on.
-/// - Older servers get a regular-expression validity test instead. A regex
-///   cannot decide a calendar date, so temporal types are declined outright
-///   there rather than risking an abort; see [`postgres_castable_pattern`].
+/// - on every server, a shape test ([`postgres_castable_pattern`]) that admits
+///   only the text this crate and DuckDB write;
+/// - on PostgreSQL 16+, also `pg_input_is_valid(text, type)`, which rejects a
+///   value out of the type's range (an overflowing `numeric`).
 ///
-/// Both are wrapped in a `CASE`, whose arms PostgreSQL evaluates lazily, so the
-/// `CAST` never runs on a value the test rejected.
+/// Both are wrapped in a `CASE`, evaluated lazily, so the `CAST` never runs on a
+/// rejected value. Date and timestamp stats are never cast: they are compared
+/// as canonical text on every server
+/// ([`postgres_canonical_temporal_pattern`]).
 pub(crate) struct PostgresStatsDialect {
     /// `pg_input_is_valid` exists (PostgreSQL 16+).
     pub(crate) soft_input_validation: bool,
@@ -1801,19 +1795,12 @@ impl StatsSqlDialect for PostgresStatsDialect {
 /// Arrow's `Display` is not SQL, so the mapping is written out. Declining a type
 /// drops that one comparison, which costs pruning and never rows.
 ///
-/// Every integer width and `DECIMAL` maps to `numeric` rather than to
-/// `smallint` / `integer` / `bigint`. `numeric` holds all of them exactly, it
-/// compares exactly against the integer or fixed-point literal on the other
-/// side, and it has no range a stat written by another engine could overflow —
-/// a narrower target would decline such a stat and lose the pruning, and the
-/// stats table is small enough that the arithmetic is not what this query
-/// costs. Floats map to `double precision`: a `DOUBLE` constant compares
-/// exactly, and a `FLOAT` one arrives as a cast to `Float64` compared against
-/// the edges of its rounding window (see `stats_filter`, divergence 11).
-///
-/// Absent types are ones [`crate::stats_encode::encode_scalar`] has no
-/// canonical text for (`TIME`, `INTERVAL`, `Decimal256`, `UUID`, blobs, nested
-/// types), so no literal of that type ever reaches here.
+/// Every integer width and `DECIMAL` maps to `numeric`: it holds all of them,
+/// compares exactly with the literal, and cannot overflow on a stat another
+/// engine wrote, where a narrower type would decline it. Floats map to
+/// `double precision`; a `FLOAT` constant is compared through its rounding
+/// window (`stats_filter`, divergence 11). Other types have no canonical text
+/// in [`crate::stats_encode::encode_scalar`], so no literal of them reaches here.
 pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
     Some(match data_type {
         DataType::Boolean => "boolean",
@@ -1832,32 +1819,26 @@ pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
 }
 
 /// A pattern that admits only text `CAST(... AS <target>)` is guaranteed to
-/// accept, for servers without `pg_input_is_valid`. `None` declines the type.
+/// accept. Every server version runs it. `None` declines the type.
 ///
-/// Each pattern is deliberately narrower than the type's input function. It
-/// admits exactly the shapes [`crate::stats_encode`] writes — and DuckDB with
-/// it — and rejects everything else, including forms PostgreSQL would in fact
-/// accept (`+5`, `nan`, hexadecimal `numeric`, leading whitespace). A rejected
-/// stat yields SQL `NULL` and the file is kept, so being strict costs pruning
-/// and nothing else, whereas being one case too loose aborts the query.
+/// Each pattern admits exactly the shapes [`crate::stats_encode`] (and DuckDB)
+/// write, and rejects forms PostgreSQL would accept (`+5`, `nan`, hex
+/// `numeric`, leading whitespace). A rejected stat yields `NULL` and the file
+/// is kept, so strictness costs only pruning, while one case too loose aborts
+/// the query. Digit counts are capped at 255, the largest repetition count
+/// PostgreSQL's regex engine accepts:
 ///
-/// The digit-count bounds are what make that guarantee. 255 is also the largest
-/// repetition count PostgreSQL's regex engine accepts:
+/// - `numeric`: at most 255 digits on either side of the point, far below the
+///   131072 at which input overflows.
+/// - `double precision`: fixed-point within ±1e255 (and 1e-255 away from zero);
+///   scientific notation with one leading digit and a two-digit exponent. Larger
+///   magnitudes are declined rather than risk a `CAST` overflow. `inf` and
+///   `-inf` are admitted, since stored bounds spell infinities that way;
+///   [`crate::stats_filter`] never passes a non-finite constant.
 ///
-/// - `numeric`: at most 255 digits either side of the point, far short of the
-///   131072 at which `numeric` input overflows.
-/// - `double precision`: fixed-point is bounded to ±1e255 and, away from zero,
-///   1e-255, well inside the ±1.8e308 range and nowhere near underflow;
-///   scientific notation is bounded to a single leading digit and a two-digit
-///   exponent, so at most ~1e100. A magnitude beyond that is declined rather
-///   than risking the overflow error a plain `CAST` raises. `inf` and `-inf`
-///   are admitted because they are how a stored bound spells an infinity, and
-///   `float8` parses both on every server; no *constant* reaches here as one,
-///   since [`crate::stats_filter`] refuses a non-finite literal outright.
-///
-/// Temporal types have no pattern. `2020-02-31` matches every plausible date
-/// regex and `CAST`ing it raises, and no regular expression decides a calendar,
-/// so on these servers a date or timestamp comparison pushes down nothing.
+/// Temporal types have no pattern: no regex decides a calendar (`2020-02-31`
+/// matches and its `CAST` raises). Dates and timestamps are compared as text
+/// instead ([`postgres_canonical_temporal_pattern`]).
 pub(crate) fn postgres_castable_pattern(target: &str) -> Option<&'static str> {
     Some(match target {
         "boolean" => r"^(true|false|1|0)$",
@@ -1906,26 +1887,20 @@ pub(crate) struct StatsFilterSql {
     pub(crate) conditions: String,
 }
 
-/// Build the statistics fragments for `filters`, exactly as official DuckLake
-/// assembles them: one CTE per column selecting only the stats its condition
-/// reads, one `LEFT JOIN` on `data_file_id`, and the conditions ANDed onto the
-/// listing's existing `WHERE`.
+/// Build the statistics fragments for `filters` as official DuckLake assembles
+/// them: one CTE per column selecting only the stats its condition reads, one
+/// `LEFT JOIN` on `data_file_id`, and the conditions ANDed onto the listing's
+/// `WHERE`.
 ///
-/// `partitions` narrows the listing by partition value as well, and is applied
-/// in two places. The conjunct on the outer `WHERE` is what drops the files; the
-/// same conjunct inside each CTE body is what stops the CTE converting the
-/// statistics of files that conjunct has already dropped. Only the second one
-/// matters for cost, and only because the CTE is materialized: the outer
-/// conjunct cannot reach inside an optimization fence, so without the inner one
-/// a selective partition filter saves nothing at all.
+/// `partitions` adds a partition-value conjunct in two places: the outer
+/// `WHERE`, which drops the files, and each CTE body, which stops the
+/// materialized CTE converting statistics of files already dropped (the outer
+/// conjunct cannot reach inside that optimization fence). The pre-filter rides
+/// with the statistics conditions, so `None` means no narrowing at all and the
+/// caller's unfiltered retry still covers everything this emits.
 ///
-/// A pre-filter rides along with the statistics conditions rather than standing
-/// on its own: `None` here means no narrowing at all, which keeps the caller's
-/// unfiltered retry — the one thing that keeps a catalog whose narrowed query
-/// will not run from failing the scan — covering everything this emits.
-///
-/// Every literal is already inlined by [`crate::stats_filter`], so the listing
-/// query's bind placeholders are untouched and its `.bind()` chain does not move.
+/// Every literal is inlined by [`crate::stats_filter`], so the listing query's
+/// bind placeholders and `.bind()` chain are unchanged.
 pub(crate) fn stats_filter_sql(
     table_id: i64,
     filters: &[RenderedColumnFilter],
@@ -1997,22 +1972,16 @@ pub(crate) fn stats_filter_sql(
 /// `ducklake_inlined_delete_<table_id>`, which the table's first inlined
 /// deletion creates.
 ///
-/// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
-/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Only two things drop the
-/// table once it exists: expiring snapshots, for a table no surviving snapshot
-/// can see, and dropping its catalog from a multicatalog store. Table ids are
-/// never reused, so a dropped one is never created again, and "exists" can go
-/// stale only for a table no surviving snapshot reads. A read that finds it
-/// gone reads no deletions, and the memo then forgets the entry.
-/// "Absent" holds for reads at or below the catalog's head at the time of the
-/// check: a deletion committed later takes a snapshot above that head, which
-/// such a read does not see.
+/// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`). Once
+/// it exists, only expiring a table no surviving snapshot sees, or dropping its
+/// multicatalog catalog, drops it, and table ids are never reused, so "exists"
+/// goes stale only for tables nothing reads. A read that finds it gone reads no
+/// deletions, and the entry is forgotten.
 ///
-/// Official reads only committed snapshots, so its check is always at or below
-/// the head. This crate also accepts a snapshot above the head (for example
-/// from `DuckLakeCatalog::with_snapshot`), and a later commit can still create
-/// that snapshot. So absence is recorded up to the lower of the snapshot read
-/// and the head, never above the head.
+/// "Absent" holds only for reads at or below the head at the time of the
+/// check, since a later deletion commits above it. Unlike official, this crate
+/// accepts snapshots above the head (e.g. `DuckLakeCatalog::with_snapshot`),
+/// so absence is recorded up to the lower of the snapshot read and the head.
 #[derive(Debug, Clone, Copy)]
 enum InlinedDeletionTable {
     Exists,

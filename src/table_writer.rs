@@ -3313,7 +3313,7 @@ impl DuckLakeTableWriter {
 
     /// The id the catalog's next snapshot is expected to take, or `None` when
     /// the backend does not say
-    /// ([`MetadataWriter::next_snapshot_id`](crate::metadata_writer::MetadataWriter::next_snapshot_id)).
+    /// ([`MetadataWriter::next_snapshot_id`]).
     pub(crate) fn next_snapshot_id(&self) -> Result<Option<i64>> {
         self.metadata.next_snapshot_id()
     }
@@ -4653,23 +4653,19 @@ struct StagedFile {
 /// Writes batches into a sequence of parquet files, starting a new one whenever the
 /// current file reaches `target_file_size`.
 ///
-/// The single home for rollover, used by both write paths — the buffered
+/// The single home for rollover, used by both the buffered
 /// [`DuckLakeTableWriter::write_rolled_files`] and the streaming session's
-/// per-partition sink — so the check cannot be applied in one place and forgotten in
-/// the other. It was forgotten once already: a partitioned write left
-/// `target_file_size` unenforceable within a partition.
+/// per-partition sink, so neither path can skip the check.
 ///
 /// With a pool in its properties, row groups are encoded on the pool ahead of
-/// the files ([`crate::parallel_encode`]): each one finished is appended, in
-/// order, to the file in progress, and the file is finished as soon as one
-/// takes it past the target, so the row groups after it go to the next file.
-/// A file overshoots the target by at most one row group either way.
+/// the files ([`crate::parallel_encode`]) and appended in order to the file in
+/// progress, which is finished as soon as one takes it past the target. A file
+/// overshoots the target by at most one row group either way.
 ///
-/// Deliberately synchronous, and deliberately does NOT upload: `write` returns the
-/// finished [`StagedFile`]s whenever a roll happened and leaves the upload policy to
-/// the caller. That is what lets the streaming session keep
-/// [`TableWriteSession::write_batch`] synchronous (it hands each file to a background
-/// [`StagedUploads`]) while the buffered path awaits each upload in turn.
+/// Synchronous, and does not upload: `write` returns finished [`StagedFile`]s
+/// whenever a roll happens and leaves uploading to the caller, so the streaming
+/// session keeps [`TableWriteSession::write_batch`] synchronous (handing files to
+/// a background [`StagedUploads`]) while the buffered path awaits each upload.
 #[derive(Debug)]
 struct RollingFileWriter {
     table_key: String,
@@ -5184,32 +5180,28 @@ impl PartitionSink {
 /// Uploads a streaming write's finished files while the write goes on, and hands
 /// the commit their [`DataFileInfo`]s in write order.
 ///
-/// A file starts uploading as soon as it is finished — rolled, evicted from the
-/// open-partition set, or closed by `finish` — with at most `concurrency` uploads in
-/// flight; later files wait on local disk in the order they finished. Its local copy
-/// is removed when its upload ends, so a writer that waits for room
-/// ([`TableWriteSession::write_batch_async`]) holds no more than `concurrency`
-/// finished files on disk, rather than the whole output. Official DuckLake writes
-/// the same way: its insert is a `COPY ... TO` straight into the table's data path,
-/// so files land in storage while the statement runs and only the commit makes
-/// them visible.
+/// A file starts uploading as soon as it is finished (rolled, evicted from the
+/// open-partition set, or closed by `finish`), with at most `concurrency`
+/// uploads in flight; later files wait on local disk. A local copy is removed
+/// when its upload ends, so a writer that waits for room
+/// ([`TableWriteSession::write_batch_async`]) holds at most `concurrency`
+/// finished files on disk. Official DuckLake likewise writes files straight to
+/// storage during the statement, and only the commit makes them visible.
 ///
-/// Uploads run as tasks on the tokio runtime that is current when the first one
-/// starts, so they progress while the caller encodes the next file — including a
-/// caller that drives the synchronous `write_batch` from a blocking thread. With no
-/// runtime current, finished files wait and are uploaded by [`Self::finish`].
+/// Uploads run as tasks on the tokio runtime current when the first one
+/// starts, so they progress while the caller encodes, even from a blocking
+/// thread driving `write_batch`. With no runtime current, files wait for
+/// [`Self::finish`].
 ///
-/// Order is load-bearing: `register_data_files` walks the list assigning
-/// `row_id_start` from a running counter, so results are kept by write position,
-/// never by completion order. Official DuckLake assigns row ids in collection order
-/// too, which is what keeps the two equivalent.
+/// Order is load-bearing: `register_data_files` assigns `row_id_start` from a
+/// running counter, so results are kept by write position, never completion
+/// order, as official assigns row ids in collection order.
 ///
-/// No object uploaded here is referenced by any snapshot until the commit, and until
-/// [`Self::finish`] hands them to it, this owns them: a failed upload, an abort, or a
-/// drop removes every object it started. Removal is best effort; a survivor is an
-/// unreferenced orphan, never a file a snapshot names. Once handed over, the session
-/// removes them if the commit fails with nothing committed, as official DuckLake
-/// does, but keeps them when a `COMMIT` on a networked catalog fails with its
+/// Until [`Self::finish`] hands the objects to the commit, this owns them: a
+/// failed upload, an abort or a drop removes every object it started (best
+/// effort; a survivor is an unreferenced orphan). After the handover, the
+/// session removes them if the commit fails with nothing committed, as official
+/// does, but keeps them when a networked catalog's `COMMIT` fails with its
 /// outcome unknown, where official removes them; see
 /// [`commit_definitely_rolled_back`].
 #[derive(Debug)]

@@ -5,60 +5,48 @@
 //! source [`DuckLakeTable`] was opened at, in one commit, copying no Parquet
 //! data file:
 //!
-//! - every live data file is registered by reference
-//!   ([`MetadataWriter::register_existing_data_files`]): its absolute path, with
-//!   the catalog that owns the object (the source, or for a fork of a fork the
-//!   root of the chain) named as owner, so neither catalog's maintenance
-//!   deletes an object the other still reads;
-//! - a file's delete file is referenced the same way, unless the file has
-//!   deletions the source records inlined (`ducklake_inlined_delete_<id>`):
-//!   then the fork gets a delete file of its own holding every deleted
-//!   position, the referenced delete file's and the inlined ones, since an
-//!   inlined deletion lives in the source's catalog and cannot be referenced;
-//! - the source's inlined rows are written to a Parquet file of the fork's own,
-//!   as official DuckLake's flush writes them (ordered by the source's sort
-//!   keys at the snapshot, then `(row_id, begin_snapshot)`, each row keeping
-//!   its `rowid` and insert snapshot in embedded columns), rolled over into
-//!   further files at the target file size when the table is unpartitioned and
-//!   split by partition when it is, and
-//!   registered with the catalog row a flush records but for its
-//!   `begin_snapshot`: `row_id_start` its smallest row id (NULL when the id of
-//!   an inlined row deleted by the snapshot falls in its id range, since a
-//!   fork writes only the live rows) and `partial_max` its largest
-//!   insert snapshot, but the fork's
-//!   snapshot as `begin_snapshot`, since the fork's catalog has no earlier one. The fork
-//!   then holds what a flush of the source would have, without changing the
-//!   source.
+//! - Each live data file is registered by reference
+//!   ([`MetadataWriter::register_existing_data_files`]), owned by the catalog
+//!   that owns the object (the source, or the root of a fork chain), so neither
+//!   catalog's maintenance deletes an object the other still reads.
+//! - Delete files are referenced the same way, unless the source also has
+//!   inlined deletions for the file. Those live in the source's catalog and
+//!   cannot be referenced, so the fork writes its own delete file holding every
+//!   deleted position.
+//! - The source's inlined rows are written to Parquet files of the fork's own,
+//!   as official DuckLake's flush writes them: ordered by the source's sort
+//!   keys, then `(row_id, begin_snapshot)`, with each row's `rowid` and insert
+//!   snapshot embedded, split by partition or rolled over at the target file
+//!   size. They are registered as a flush registers them, except that
+//!   `begin_snapshot` is the fork's snapshot: the source's snapshots are not
+//!   snapshots of the fork's catalog.
+//!   `row_id_start` is the smallest row id (NULL when a deleted inlined row's
+//!   id falls in the range) and `partial_max` the largest insert snapshot.
 //!
-//! A referenced partial file (one the source flushed or merged) keeps its
-//! `partial_max`. The fork's change feed thus dates the rows of a file that
-//! embeds insert snapshots by those snapshots (the source's, which precede
-//! the fork's), as official reads such a file and as a merge of the fork's
-//! files dates them; the rows of any other file are dated to the fork's
-//! snapshot.
+//! A referenced partial file keeps its `partial_max`, so the fork's change feed
+//! dates rows with embedded insert snapshots by the source's snapshots, as
+//! official does; rows of other files are dated to the fork's snapshot.
 //!
-//! The fork's columns copy the source's catalog rows: their ids, exact types
-//! (`json`, `geometry`, `timetz`, ...), nullability and defaults, nested
-//! fields' included. A list column in the legacy catalog shape (one
-//! `list<...>` row, no `element` row) takes upstream's shape, its `element`
-//! under a fresh id, as a write to the source would migrate it; a re-fork into
-//! the same table keeps the id the earlier fork gave it. The source's
-//! tags and comments, the table's and its columns', are the fork's, recorded
-//! in the same commit.
+//! The fork's columns copy the source's catalog rows: ids, exact types (`json`,
+//! `geometry`, `timetz`, ...), nullability and defaults, nested fields
+//! included. A list column in the legacy shape (no `element` row) takes
+//! upstream's shape in the fork, with a fresh `element` id that a re-fork into
+//! the same table keeps. The source is not changed. The table's tags and
+//! comments, and its columns' comments, are copied in the same commit (a
+//! column tag other than `comment` is refused).
 //!
-//! Row ids are preserved: each file keeps its `row_id_start` (or its embedded
-//! row ids), and the fork's row id allocator starts past the source's, so a row
-//! has the same `rowid` in both tables and new rows in either never collide
-//! with carried ones.
+//! Row ids are preserved: each file keeps its `row_id_start` (or embedded row
+//! ids), and the fork's allocator starts past the source's, so a row has the
+//! same `rowid` in both tables and new rows in either never collide with
+//! carried ones.
 //!
-//! A source opened at an earlier snapshot than the catalog's head is forked as
-//! it read then: a file's later deletions, and the rows of a partial file
-//! inserted later, are masked by a delete file of the fork's own.
+//! A source opened before the catalog's head is forked as it read then: later
+//! deletions, and partial-file rows inserted later, are masked by a delete file
+//! of the fork's own.
 //!
-//! Official DuckLake has no fork; the closest equivalent, `CREATE TABLE ... AS
-//! SELECT`, copies the rows into new files with new row ids. A fork shares the
-//! files and keeps the row ids instead, so a fork into the same catalog, where
-//! one catalog would own a file twice, is refused.
+//! Official DuckLake has no fork; `CREATE TABLE ... AS SELECT` copies rows into
+//! new files with new row ids. Because a fork shares files, a fork into the
+//! same catalog, which would own a file twice, is refused.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

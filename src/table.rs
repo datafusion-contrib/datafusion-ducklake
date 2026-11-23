@@ -448,24 +448,13 @@ pub(crate) fn apply_initial_default_metadata(
 /// Catalog min/max exclude NaN, so a float column whose NaN state is unknown
 /// (`None`, e.g. register-by-reference loads) or positive (`Some(true)`, e.g.
 /// stats written by official DuckLake's INSERT) may hold values outside its
-/// recorded bounds, and pruning on them would wrongly drop rows.
+/// recorded bounds.
 ///
-/// **Both** bounds need the gate here, which is where this deliberately differs
-/// from official DuckLake — an engine-layer difference, not a format one.
-///
-/// Official gates only the max, and that is correct for DuckDB, which
-/// normalizes NaN: `-NaN = NaN` is true and either sign sorts above every
-/// value, so NaN can only ever hide above a recorded max. DataFusion compares
-/// floats with arrow's `total_cmp`, which is sign-sensitive:
-/// `(-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)` is `true` here and
-/// `false` in DuckDB. A negative NaN therefore sits *below* a recorded min in
-/// this engine, and `contains_nan` does not record the sign — so neither bound
-/// can be trusted.
-///
-/// Gating both is what keeps pruning consistent with the filter semantics this
-/// engine actually has. The underlying `total_cmp`-vs-DuckDB ordering
-/// difference is inherited from arrow and predates this gate; it is visible in
-/// query *results* for `±NaN` comparisons, not only in pruning.
+/// Official DuckLake gates only the max, which is right for DuckDB, where NaN
+/// of either sign sorts above every value. DataFusion uses arrow's
+/// sign-sensitive `total_cmp`, so a negative NaN sorts below every value, and
+/// `contains_nan` does not record the sign: both bounds need the gate. The same
+/// ordering difference shows in query results for `±NaN`, not only in pruning.
 fn float_bound_is_usable(data_type: &DataType, contains_nan: Option<bool>) -> bool {
     !matches!(
         data_type,
@@ -525,31 +514,19 @@ fn file_row_count(
 }
 
 /// This file's live row count taken from `record_count` alone, for the scan
-/// SUMMARY rather than for pruning.
+/// summary rather than for pruning.
 ///
-/// Deliberately does NOT fall back to a column's `value_count` the way
-/// [`file_row_count`] does. `value_count` is the count of NON-NULL values
-/// (official: "value_count should be the count of non-null values"), so on a
-/// nullable column it is smaller than the row count. As a pruning estimate that
-/// is harmless; published as a scan's `num_rows` it becomes the answer to
-/// `count(*)`, and a table whose files omit `record_count` would report fewer
-/// rows than it holds. Absent beats wrong: the aggregate then reads the data.
+/// Unlike [`file_row_count`], this never falls back to a column's
+/// `value_count`, which counts non-null values only. Published as a scan's
+/// `num_rows` it answers `count(*)`, so `Absent` (the aggregate reads the data)
+/// beats an undercount.
 ///
-/// DELETE-FREE FILES ONLY. A file carrying deletes reports `Absent`, because
-/// `record_count` alone over-reports it.
-///
-/// Do not "improve" this into a general count by subtracting `delete_count`:
-/// rows removed by an INLINED delete leave `delete_file` and `delete_count`
-/// both NULL, so such a file would report its gross count and `count(*)` would
-/// over-report by exactly the rows that were deleted. Any future with-deletes
-/// summary (see the `count(*)`-after-DELETE convergence issue) must take the
-/// inlined-delete map, not just this row.
-///
-/// CALLER PRECONDITION: files removed by INLINED deletes are not excluded here,
-/// because this row cannot see them — an inlined delete leaves `delete_file` and
-/// `delete_count` NULL. `scan()` routes any file in `inlined_deletes` to the
-/// with-deletes exec, so the only consumer never sees one; a new consumer must
-/// make the same exclusion itself, or take the inlined-delete map.
+/// Delete-free files only: a file with a delete file or a non-zero
+/// `delete_count` reports `Absent`. Do not generalize this by subtracting `delete_count`: an
+/// inlined delete leaves `delete_file` and `delete_count` NULL, so this row
+/// cannot see it. `scan()` routes every file in `inlined_deletes` to the
+/// with-deletes exec; a new caller must exclude those files too, or take the
+/// inlined-delete map.
 fn file_summary_row_count(file: &DuckLakeTableFile) -> Precision<usize> {
     if file.delete_file.is_some() || file.delete_count.is_some_and(|count| count > 0) {
         return Precision::Absent;
@@ -563,26 +540,17 @@ fn file_summary_row_count(file: &DuckLakeTableFile) -> Precision<usize> {
 /// Whether a catalog bound on this type may be a widened approximation rather
 /// than the value actually present in the file.
 ///
-/// The DuckLake spec requires `min_value`/`max_value` only to bound the column,
-/// not to equal its extremes, and writers exercise that latitude: a parquet
-/// writer truncates a long BYTE_ARRAY bound to a prefix and rounds it outward,
-/// and `ducklake_add_data_files` ingests those footers verbatim. Answering
-/// `max(v)` from such a bound returns a string the table does not contain.
+/// The spec requires `min_value`/`max_value` only to bound the column. Parquet
+/// writers truncate long BYTE_ARRAY bounds outward, and
+/// `ducklake_add_data_files` ingests those footers verbatim, so answering
+/// `max(v)` from such a bound can return a string the table does not contain.
+/// These bounds are used for pruning only; official refuses string MIN/MAX from
+/// statistics for the same reason (`min_max_optimization_basic`). Numeric and
+/// temporal bounds, `Decimal` and `Float16` included, are never truncated.
 ///
-/// Official refuses string MIN/MAX from statistics for exactly this reason (its
-/// `min_max_optimization_basic` test says so in as many words), so the bounds
-/// are usable for PRUNING — where a widened bound is safe — and never for the
-/// answer. Numeric and temporal bounds are stored whole and stay usable, including
-/// the fixed-length ones: parquet explicitly refuses to truncate `Decimal` and
-/// `Float16` statistics because their sort order is not the byte-array sort order.
-///
-/// This is a TYPE ALLOWLIST standing in for a property the catalog does not
-/// record. Parquet carries `is_min_value_exact` / `is_max_value_exact` flags for
-/// exactly this question; DuckLake has no column for them, and `add_data_files`
-/// ingests footer bounds without them. So the list has to be re-checked whenever
-/// the type map in `types.rs` grows a new mapping onto a variable-length physical
-/// type — a new type that lands on `Utf8View`/`BinaryView` is covered, one that
-/// invents its own is not.
+/// The catalog has no `is_min_value_exact` / `is_max_value_exact` flags, so
+/// this is a type allowlist. Re-check it whenever `types.rs` maps a new type
+/// onto a variable-length physical type other than `Utf8View`/`BinaryView`.
 fn bound_may_be_widened(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -1105,33 +1073,21 @@ fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
     }
 }
 
-/// Read `resolved_path`'s parquet footer once, through `state`'s shared
-/// `RuntimeEnv` file-metadata cache rather than the uncached
-/// one-shot `ParquetObjectReader` this used before: a warm cache serves this
-/// from memory, whether the entry was populated by an earlier call here or by
-/// the scan's own `CachedParquetFileReaderFactory` (same cache key — see
-/// [`epoch_object_meta`]).
+/// Read `resolved_path`'s parquet footer through `state`'s shared `RuntimeEnv`
+/// file-metadata cache, under the same key the scan's
+/// `CachedParquetFileReaderFactory` uses (see [`epoch_object_meta`]).
 ///
-/// `file_size_bytes` is the catalog's recorded size for the file, needed to
-/// build the `ObjectMeta` the cache validates against. It is taken as a
-/// parameter rather than resolved via a `head()` call, which would cost
-/// exactly the round trip this function exists to avoid.
-///
-/// `footer_size` is the catalog's recorded footer size, when known. It becomes
-/// the reader's metadata size hint (see [`metadata_size_hint`]) so a cold footer
-/// read is one ranged read rather than a length probe followed by the footer.
-///
-/// `encryption_key` is the file's DuckLake encryption key when it has one; it
-/// is only usable with the `encryption` feature, and this function cannot
-/// open an encrypted file without it. Note an encrypted footer is never
-/// cached — `DFParquetMetadata::fetch_metadata` treats a fetch made with
-/// decryption properties as uncacheable (see its `cache_metadata` gate) — so
-/// this saves nothing for that path beyond sharing one code path with the
-/// unencrypted one.
-///
-/// `page_index_policy` overrides whether the page index is loaded with the
-/// footer; `None` leaves it to `DFParquetMetadata`, which loads it when the
-/// footer is cached.
+/// - `file_size_bytes`: the catalog's recorded size, used to build the
+///   `ObjectMeta` the cache validates against, so no `head()` call is needed.
+///   `None` (a delete file with no recorded size) costs one `head()`.
+/// - `footer_size`: the recorded footer size, when known. It becomes the
+///   metadata size hint ([`metadata_size_hint`]), so a cold read is one ranged
+///   read.
+/// - `encryption_key`: required to open an encrypted file (`encryption`
+///   feature). `DFParquetMetadata` never caches an encrypted footer.
+/// - `page_index_policy`: overrides whether the page index is loaded with the
+///   footer; `None` leaves it to `DFParquetMetadata`, which loads it when the
+///   footer is cached.
 pub(crate) async fn fetch_parquet_metadata(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
@@ -1507,27 +1463,22 @@ pub(crate) fn cached_parquet_reader_factory(
 }
 
 /// Build a [`ParquetSource`] over `schema` carrying the session's
-/// `datafusion.execution.parquet.*` settings, so one of them means the same
-/// thing on a DuckLake table as on a plain parquet one. Every query-time
-/// `ParquetSource` this crate builds goes through here, which `clippy.toml`
-/// enforces by disallowing the constructor everywhere else.
+/// `datafusion.execution.parquet.*` settings. Every query-time `ParquetSource`
+/// this crate builds goes through here; `clippy.toml` disallows the
+/// constructor everywhere else.
 ///
-/// The settings have to be attached explicitly: `ParquetSource::new` starts from
-/// `TableParquetOptions::default()` and nothing later consults the session, so a
-/// bare source reads the defaults for everything the reader takes from there —
-/// `pruning`, `reorder_filters`, `enable_page_index`, `bloom_filter_on_read`,
+/// `ParquetSource::new` starts from `TableParquetOptions::default()` and never
+/// consults the session, so a bare source ignores `pruning`,
+/// `reorder_filters`, `enable_page_index`, `bloom_filter_on_read`,
 /// `max_predicate_cache_size`, `max_in_list_size` and the `coerce_int96` pair.
-/// `max_in_list_size` is the one that fails quietly: an `IN` list longer than it
-/// contributes nothing to row-group statistics pruning, and the scan still
-/// reports a pruning predicate while pruning no row group at all.
-/// `pushdown_filters` is not among them — `ParquetSource` reads that one off the
-/// session itself and ORs it with its own.
+/// `max_in_list_size` fails quietly: a longer `IN` list prunes no row group
+/// while the scan still reports a pruning predicate. (`pushdown_filters` is
+/// read from the session by the source itself.)
 ///
-/// Only the `global` section is taken, not the whole of
-/// `Session::default_table_options().parquet`: the `crypto` and
-/// `column_specific_options` sections beside it come from whatever
-/// `TableOptions` the embedder installed, and an explicit decryption property
-/// there wins over the encryption factory this crate attaches per file.
+/// Only the `global` section is taken: the `crypto` and
+/// `column_specific_options` sections come from the embedder's `TableOptions`,
+/// and an explicit decryption property in `crypto` would override the
+/// encryption factory this crate attaches per file.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn session_parquet_source(
     state: &dyn Session,
@@ -1764,27 +1715,13 @@ impl std::fmt::Debug for DuckLakeTable {
 /// The decryption keys installed on a table, and the factory every reader
 /// clones from them ([`DuckLakeTable::create_parquet_source`]).
 ///
-/// Keys only ever accumulate here: [`DuckLakeTable::install_encryption_keys`]
-/// merges a listing's keys into the set instead of replacing it. No single
-/// listing sees every file — the catalog leaves files unlisted for
-/// [`DuckLakeTable::files_matching`] (see [`crate::stats_filter`]) and a scan
-/// installs page by page — so replacing would drop the key of a file the caller
-/// is still holding from an earlier listing, with no way to get it back short
-/// of listing again. The cell is shared with every clone of the table, so that
-/// caller need not be the one that listed.
-///
-/// Accumulating cannot install a wrong key: a path maps to one key for the life
-/// of the snapshot, because DuckLake data files are immutable and a rewritten or
-/// compacted file is written under a fresh path. A key kept past its file's last
-/// read is dead weight, never a wrong answer, and the set is bounded by the
-/// encrypted files this table has listed.
-///
-/// The factory reads the very map that keys are installed into, so the two
-/// halves cannot drift apart. Whatever key a path maps to now is the key a
-/// reader gets for it, including after a second install of the same path —
-/// which nothing here produces, every data and delete file being named by a
-/// fresh UUID, but which the factory would otherwise be free to answer from a
-/// stale copy.
+/// Keys only accumulate: [`DuckLakeTable::install_encryption_keys`] merges a
+/// listing's keys into the set. No single listing sees every file (a scan
+/// installs page by page, and [`DuckLakeTable::files_matching`] lists a pruned
+/// subset), and the cell is shared by every clone of the table, so replacing
+/// would drop the key of a file a caller still holds. Accumulating cannot serve
+/// a wrong key: data files are immutable and every rewrite gets a fresh path.
+/// The factory reads this same map, so installed and served keys cannot drift.
 ///
 /// Deliberately not `Debug`: the keys are secrets, which is why
 /// [`DuckLakeEncryptionFactory`] prints only its file count.
@@ -2720,9 +2657,9 @@ impl DuckLakeTable {
     ///   catalog's bounds are never tightened when rows are removed, so the
     ///   extreme may name a row that is gone. This mirrors official's
     ///   `min_max_exact` gate.
-    /// - **`num_rows`** comes from [`file_summary_row_count`], which subtracts
-    ///   deletes and refuses the `value_count` fallback, so it stays exact
-    ///   through a DELETE exactly as official's `count(*)` does.
+    /// - **`num_rows`** comes from [`file_summary_row_count`], which is
+    ///   `Absent` for a file with deletes and refuses the `value_count`
+    ///   fallback, so it is never an overcount after a DELETE.
     fn page_files_with_both_statistics(
         &self,
         metadata: Vec<DuckLakeFileMetadata>,
@@ -5825,7 +5762,7 @@ impl DuckLakeTable {
     /// A read-only clone of this table (no writer, no rowid projection, fresh
     /// per-file read-config cache) carrying exactly the metadata a scan needs.
     /// [`DuckLakeUpdateExec`] holds one so it can drive the per-file update
-    /// scans ([`Self::compute_file_update`]) at execute time — `update()` only
+    /// scans ([`Self::apply_update_to_batches`]) at execute time — `update()` only
     /// has `&self`, so it cannot hand the exec an `Arc<Self>` directly.
     #[cfg(feature = "write")]
     fn read_only_clone(&self) -> DuckLakeTable {
@@ -7415,42 +7352,25 @@ fn sort_ordering_for(
 /// Re-state a page's per-file statistics for a caller that reads a data file
 /// **without applying its delete file**.
 ///
-/// [`build_datafusion_statistics`] marks a delete-bearing file's recorded bounds
+/// [`build_datafusion_statistics`] marks a delete-bearing file's bounds
 /// [`Precision::Inexact`], and [`FilePruningStatistics`] prunes only on `Exact`
-/// ones. So the first mutation that writes a delete file also stops that file
-/// contributing usable bounds, and every later call opens it whatever its key
-/// range. Nothing restores them: compaction skips delete-bearing files.
+/// ones, so once a mutation writes a delete file, every later call would open
+/// that file whatever its key range (compaction skips such files, so nothing
+/// restores them). [`DuckLakeTable::resolve_positions`] scans physical rows and
+/// ignores delete files, so the recorded bounds and the footer's `null_count`
+/// still cover every row it sees. `Exact` is DataFusion's word for "usable";
+/// the spec promises only a bound, and a bound over all rows bounds any subset.
 ///
-/// Those bounds stay usable for this caller. [`DuckLakeTable::resolve_positions`]
-/// scans physical rows and does not apply delete files — it exists to compute
-/// the positions a delete file records — so a recorded bound still contains
-/// every row it can see, and `null_count`, harvested from the parquet footer,
-/// still counts them.
+/// This also promotes the widened envelopes from
+/// [`DuckLakeTable::apply_partition_bounds`]. That is safe only because the
+/// returned map stays inside [`DuckLakeTable::files_matching`]. It must never
+/// reach scan or aggregate statistics, where an envelope could answer a MIN/MAX
+/// query wrongly.
 ///
-/// `Exact` here is DataFusion's word for "usable", not a claim of a true
-/// extreme. The DuckLake spec requires `min_value`/`max_value` only to be a
-/// lower and upper bound ("does not have to be exact"), and this promotes them
-/// no further than that: a bound over the physical rows is still a bound over
-/// any subset of them, which is what makes it valid for a delete-applying
-/// reader too.
-///
-/// This promotes every `Inexact` bound on such a file, including the widened
-/// envelopes [`DuckLakeTable::apply_partition_bounds`] synthesises, which it
-/// leaves `Inexact` so they cannot be mistaken for real extrema. That is
-/// deliberate and safe for pruning — an envelope is a true bound — and safe
-/// only because the map this returns lives and dies inside
-/// [`DuckLakeTable::files_matching`]. It must not reach scan or aggregate
-/// statistics, where an envelope presented as an extreme could answer a
-/// MIN/MAX-from-statistics query wrongly.
-///
-/// The live row count is deliberately left out. [`file_row_count`] subtracts
-/// `delete_count`, making it the one figure deletes genuinely change. Promoting
-/// it alongside a physical `null_count` would be unsound rather than imprecise:
-/// DataFusion guards a comparison with `null_count != row_count`, so a file with
-/// two physical rows — one NULL, one matching, the NULL deleted — would present
-/// `null_count == row_count`, be judged entirely null, and be dropped while
-/// still physically holding the row the caller must find. Withholding the count
-/// leaves that rewrite inert.
+/// The live row count is left out. [`file_row_count`] subtracts
+/// `delete_count`, and promoting it next to a physical `null_count` is unsound:
+/// a file with one NULL row and one matching row, the NULL deleted, would show
+/// `null_count == row_count` and be dropped as all-null.
 fn restate_in_physical_row_space(
     statistics: &mut HashMap<i64, Arc<Statistics>>,
     files: &[DuckLakeTableFile],

@@ -2307,7 +2307,7 @@ async fn migrate_snapshot_changes_nullable(pool: &SqlitePool) -> Result<()> {
 /// or `end_snapshot` newer than `base_snapshot` (the head observed when this
 /// write began), or an inlined data or inlined delete row was committed after
 /// it, another writer changed the table in the meantime, so this `Replace`
-/// aborts with [`DuckLakeError::Conflict`] rather than clobbering it.
+/// aborts with [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict) rather than clobbering it.
 /// (`Append` does not call this unless the write set an expected base snapshot:
 /// concurrent appends commute.)
 /// An inlined-data flush ([`ConflictScope::InlinedFlush`]) does not count delete
@@ -3049,19 +3049,6 @@ async fn record_schema_version(
     Ok(())
 }
 
-/// The atomic commit point for a single-catalog write. Inserts the deferred
-/// `ducklake_snapshot` row (its reserved id was returned by
-/// `begin_write_transaction` but NOT inserted there), finalizes the column
-/// generation, and — for `Replace` — retires the prior data generation. All
-/// within the caller's transaction, so `COALESCE(MAX(snapshot_id), 0)` only
-/// ever resolves to a fully-populated head (no transient empty read).
-///
-/// The column generation is deferred to here (rather than written in
-/// `begin_write_transaction` like the Postgres backend) because the SQLite read
-/// path resolves a table's columns by `end_snapshot IS NULL` ONLY (not
-/// snapshot-scoped), so inserting the new generation at begin would leak it to
-/// concurrent reads during the upload window. `column_ids` are the ids reserved
-/// at begin and already baked into the staged parquet's `field_id` metadata.
 /// Persist a partitioned data file's partition metadata within the commit
 /// transaction: set `ducklake_data_file.partition_id` and insert one
 /// `ducklake_file_partition_value` row per partition key. A no-op for an
@@ -3313,6 +3300,19 @@ async fn merge_inlined_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
+/// The atomic commit point for a single-catalog write. Inserts the
+/// `ducklake_snapshot` row (its id assigned here, `MAX(snapshot_id)+1`),
+/// finalizes the column generation, and — for `Replace` — retires the prior
+/// data generation. All within the caller's transaction, so
+/// `COALESCE(MAX(snapshot_id), 0)` only ever resolves to a fully-populated head
+/// (no transient empty read).
+///
+/// The column generation is deferred to here (rather than written in
+/// `begin_write_transaction`) because the SQLite read path resolves a table's
+/// columns by `end_snapshot IS NULL` ONLY (not snapshot-scoped), so inserting
+/// the new generation at begin would leak it to concurrent reads during the
+/// upload window. `column_ids` are the ids reserved at begin and already baked
+/// into the staged parquet's `field_id` metadata.
 #[expect(
     clippy::too_many_arguments,
     reason = "snapshot finalization requires the complete atomic write state"

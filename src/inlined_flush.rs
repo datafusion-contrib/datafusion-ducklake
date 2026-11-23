@@ -3,45 +3,41 @@
 //!
 //! Mirrors official DuckLake's flush (`ducklake_flush_inlined_data.cpp`):
 //!
-//! - Every physical inlined-data table of a table is written to Parquet, in files
-//!   per partition of the partition spec in effect when its rows were inserted,
-//!   rolled over at the table's `target_file_size` and placed in Hive directories
-//!   unless `hive_file_pattern` is `false`. The files hold every row the table
-//!   holds at the flush snapshot — deleted rows included — with its row id and
-//!   insert snapshot embedded (`_ducklake_internal_row_id`,
-//!   `_ducklake_internal_snapshot_id`), ordered by the table's current sort order
-//!   and then `(row_id, begin_snapshot)`. Each file's catalog row begins at its
-//!   smallest embedded snapshot, records the largest as `partial_max` and the
-//!   smallest row id as `row_id_start`, so time travel to any earlier snapshot
+//! - Each of a table's inlined-data tables is written to Parquet, one set of
+//!   files per partition of the spec in effect when its rows were inserted,
+//!   rolled over at `target_file_size`, in Hive directories unless
+//!   `hive_file_pattern` is `false`. The files hold every row at the flush
+//!   snapshot, deleted rows included, with row id and insert snapshot embedded
+//!   (`_ducklake_internal_row_id`, `_ducklake_internal_snapshot_id`), ordered
+//!   by the current sort order then `(row_id, begin_snapshot)`. Each file's
+//!   catalog row begins at its smallest embedded snapshot, with the largest as
+//!   `partial_max` and the smallest row id as `row_id_start`, so time travel
 //!   returns exactly what the inlined rows returned.
-//! - Rows deleted while inlined become positions of a delete file per data file,
-//!   counted from that file's first row, that records each deleting snapshot and
-//!   is registered from the earliest of them.
+//! - Rows deleted while inlined become a delete file per data file, recording
+//!   each deleting snapshot and registered from the earliest.
 //! - Inlined deletions of Parquet rows (`ducklake_inlined_delete_<table_id>`)
-//!   are merged with the data file's live delete file into a new one that
-//!   records each position's snapshot; the replaced delete file is removed and
-//!   scheduled for deletion.
-//! - One snapshot commits every table, deletes the flushed inlined rows, and
-//!   records `deleted_from_table:<id>` / `inline_flush:<id>`; then empty
-//!   superseded inlined tables are dropped. A table that cannot be flushed fails
-//!   the whole flush, as official's single transaction does, and every object the
-//!   attempt wrote is removed (official's `CleanupFiles`); so is every object of
-//!   a commit the catalog rejected.
+//!   are merged with the file's live delete file into a new one recording each
+//!   position's snapshot; the old delete file is removed and scheduled for
+//!   deletion.
+//! - One snapshot commits every table, deletes the flushed inlined rows and
+//!   records `deleted_from_table:<id>` / `inline_flush:<id>`; empty superseded
+//!   inlined tables are then dropped. A table that cannot be flushed fails the
+//!   whole flush, as official's single transaction does, and every object the
+//!   attempt wrote is removed (official's `CleanupFiles`), as is every object
+//!   of a commit the catalog rejected.
 //!
 //! Deliberate differences from official:
 //!
 //! - Inlined deletions of a data file retired since (by `rewrite_data_files`,
-//!   say) whose delete file has ended merge into that delete file's history:
-//!   the new file replaces the latest one and ends where it ended. Official
-//!   writes a second, never-ending delete file beside the ended one, and time
-//!   travel to the snapshots both cover then reads duplicated rows and
-//!   resurrects the ended file's deletions. Deletions that cannot merge (the
-//!   merged file would overlap an earlier delete file, or a deletion is later
-//!   than the delete file's end) stay inlined.
+//!   say) merge into its ended delete file's history: the new file replaces the
+//!   latest one and ends where it ended. Official writes a second, never-ending
+//!   delete file beside it, so time travel reads duplicated rows and resurrects
+//!   the ended file's deletions. Deletions that cannot merge (an overlap with
+//!   an earlier delete file, or a deletion after its end) stay inlined.
 //! - A catalog whose `encrypted` option is `true` is refused, as every
-//!   Parquet-writing operation is there. In a catalog not marked encrypted,
-//!   inlined deletions of an encrypted data or delete file stay inlined (this
-//!   crate cannot write encrypted delete files), and reads keep applying them.
+//!   Parquet-writing operation is. Otherwise, inlined deletions of an encrypted
+//!   data or delete file stay inlined (this crate cannot write encrypted delete
+//!   files), and reads keep applying them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

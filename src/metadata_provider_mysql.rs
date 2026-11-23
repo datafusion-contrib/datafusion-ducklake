@@ -242,30 +242,23 @@ fn quote_ident(name: &str) -> String {
 
 /// MySQL spelling of the statistics comparisons in [`crate::stats_filter`].
 ///
-/// Two engine facts shape everything here.
-///
-/// MySQL has no `TRY_CAST`, and `CAST` to a number does not fail: `CAST('abc' AS
-/// DOUBLE)` and `CAST('abc' AS DECIMAL)` are `0` with a warning, so casting a
-/// malformed bound unconditionally would compare it as zero and could prune a
-/// file that matches. Every numeric cast below is therefore gated on a `REGEXP`
-/// that the text really is a number of that shape, and yields SQL `NULL`
-/// otherwise; [`StatsSqlDialect::keep_when_unknown`] turns that `NULL` back into
-/// "keep the file". The temporal casts need no gate — MySQL already returns
-/// `NULL` for a datetime it cannot parse.
-///
-/// MySQL's default collation is `utf8mb4_0900_ai_ci`, which is case- *and*
-/// accent-insensitive: with it, `'Apple' = 'apple'` and `'cafe' = 'café'` are
-/// both true. DataFusion compares `Utf8` byte-wise, so a raw string bound
-/// compared under that collation can place a value inside a range the engine
-/// puts outside it, and drop a file that matches. [`Self::collate_binary`]
-/// forces byte-wise comparison on every uncast string comparison.
-///
-/// MySQL has no CTE materialization modifier — `WITH ... AS MATERIALIZED` is a
-/// syntax error there — so this dialect keeps
-/// [`StatsSqlDialect::cte_materialization`]'s empty default and the optimizer
-/// decides for itself whether to merge the stats CTE into the join. Its lever
-/// for the same thing is the `NO_MERGE` optimizer hint, which sits in the outer
-/// query block rather than on the CTE and so is not this seam.
+/// - **No `TRY_CAST`, and numeric `CAST` never fails:** `CAST('abc' AS DOUBLE)`
+///   is `0` with a warning, so a malformed bound would compare as zero and
+///   could prune a matching file. Every numeric cast is gated on a `REGEXP`
+///   for that number shape and yields `NULL` otherwise, which
+///   [`StatsSqlDialect::keep_when_unknown`] turns into "keep the file". A
+///   `DATE` stat is also checked for its canonical shape before the cast, since
+///   MySQL reads `2020/01/01` and `20200101` as dates. Timestamps are compared
+///   as canonical text, not cast.
+/// - **Case- and accent-insensitive default collation**
+///   (`utf8mb4_0900_ai_ci`): `'Apple' = 'apple'` and `'cafe' = 'café'` are
+///   true, while DataFusion compares `Utf8` byte-wise, so a raw bound could
+///   drop a matching file. [`Self::collate_binary`] forces byte-wise comparison
+///   on every uncast string comparison.
+/// - **No CTE materialization modifier** (`AS MATERIALIZED` is a syntax error),
+///   so this dialect keeps [`StatsSqlDialect::cte_materialization`]'s empty
+///   default. MySQL's equivalent, the `NO_MERGE` hint, belongs to the outer
+///   query block, not this seam.
 struct MySqlStatsDialect;
 
 impl StatsSqlDialect for MySqlStatsDialect {

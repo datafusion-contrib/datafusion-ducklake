@@ -3,39 +3,32 @@
 //! Two maintenance operations, each invoked programmatically (never
 //! automatically on write) and returning a [`CompactionResult`] with metrics:
 //!
-//! 1. [`DuckLakeTable::merge_adjacent_files`] coalesces several small data files
-//!    of one table (of the SAME schema version — never across a DDL boundary)
-//!    into fewer larger ones. A merged file keeps each row's original rowid:
-//!    when the sources' rowid ranges are adjacent it writes the rows in rowid
-//!    order and keeps the first source's `row_id_start`, otherwise it embeds
-//!    each rowid as a column. A merged file that spans more than one origin
-//!    snapshot is written as a DuckLake **partial data file**: it embeds a
-//!    per-row `_ducklake_internal_snapshot_id` column, and its catalog row
-//!    records `partial_max` (the maximum origin snapshot id among its rows), so
-//!    time travel / change feeds can still attribute every merged row to its
-//!    origin snapshot. A partial file is itself a merge
-//!    candidate: its scan projects that embedded column, so each row keeps its
-//!    own origin through a re-merge and a partition never accumulates a floor of
-//!    files it can no longer reduce.
+//! 1. [`DuckLakeTable::merge_adjacent_files`] coalesces small data files of one
+//!    table, of the same schema version, into fewer larger ones. Each row keeps
+//!    its rowid: when the sources' rowid ranges are adjacent the rows are
+//!    written in rowid order under the first source's `row_id_start`, otherwise
+//!    each rowid is embedded as a column. A merged file spanning several origin
+//!    snapshots is a DuckLake **partial data file**: it embeds a per-row
+//!    `_ducklake_internal_snapshot_id` and records `partial_max`, so time
+//!    travel and change feeds still attribute each row to its origin. A partial
+//!    file can itself be merged again, keeping each row's origin.
 //! 2. [`DuckLakeTable::rewrite_data_files`] rewrites a data file whose deleted
-//!    fraction exceeds a threshold (DuckDB's default is 0.95): it reads only the
-//!    file's LIVE rows (delete-aware), writes them to a new file preserving each
-//!    row's rowid, and retires BOTH the old data file and its delete file.
+//!    fraction (inlined deletions included) reaches a threshold (DuckDB's
+//!    default is 0.95): it writes the file's live rows to a new file,
+//!    preserving rowids, and retires both the old data file and its delete
+//!    file.
 //!
-//! Both operations commit ATOMICALLY in one snapshot via
-//! `MetadataWriter::commit_compaction`: the rewritten outputs are registered, the
-//! source files (and, for a rewrite, their delete files) are retired
-//! (`end_snapshot` set) and scheduled for physical deletion, and
-//! `ducklake_snapshot_changes.changes_made` records `merge_adjacent:<table_id>` or
-//! `rewrite_delete:<table_id>`, as official's compaction does.
-//! Compaction changes the physical layout, not the logical rows, so the commit is
-//! structured NOT to conflict with a concurrent append; it aborts only if a
-//! source file was retired, or its live rows changed, since it was read (the
-//! `base_snapshot` conflict check), which prevents ever resurrecting a
-//! retired/deleted row into an output.
+//! Both commit in one snapshot via `MetadataWriter::commit_compaction`: outputs
+//! are registered, sources (and a rewrite's delete files) are retired and
+//! scheduled for deletion, and `changes_made` records
+//! `merge_adjacent:<table_id>` or `rewrite_delete:<table_id>`, as official's
+//! compaction does. Compaction changes layout, not rows, so it does not
+//! conflict with a concurrent append; it aborts only if a source file was
+//! retired or its live rows changed since it was read (the `base_snapshot`
+//! check), so a deleted row is never resurrected.
 //!
-//! Retired files are only SCHEDULED for deletion, never removed here, so time
-//! travel to a pre-compaction snapshot still reads them until
+//! Retired files are only scheduled for deletion, so time travel to a
+//! pre-compaction snapshot still reads them until
 //! [`cleanup_old_files_sqlite`](crate::maintenance::cleanup_old_files_sqlite)
 //! reclaims them.
 
@@ -523,7 +516,7 @@ fn partition_key(file: &DuckLakeTableFile) -> (Option<i64>, Vec<Option<String>>)
 }
 
 /// Re-key normalized partition values back to the `(partition_key_index, value)`
-/// pairs [`DataFileInfo::with_partition`] persists.
+/// pairs [`DataFileInfo::with_partition`](crate::metadata_writer::DataFileInfo::with_partition) persists.
 fn partition_value_pairs(values: &[Option<String>]) -> Vec<(i32, Option<String>)> {
     values
         .iter()
@@ -645,40 +638,25 @@ fn adjacent_row_id_start(bin: &[&DuckLakeTableFile]) -> Option<i64> {
 /// Stream a rowid-adjacent merge's rows in source order, as official writes
 /// them (`PRESERVE_ORDER` on its copy of adjacent files).
 ///
-/// The partitions of `input` are numbered in source order: the union lists the
+/// The partitions of `input` are numbered in source order (the union lists the
 /// bin's sources in order and the byte-range split numbers a file's ranges
-/// ascending. Reading the partitions one after another is therefore the source
-/// order, with nothing to merge. With `read_ahead` 0 the scan's file-stream
-/// work stealing is left as configured; on by default, it has the first
-/// partition of each source pop all of that source's ranges, in order, before
-/// its siblings open.
+/// ascending), so reading them one after another is the source order. Batches
+/// in flight are bounded by `read_ahead`, not by the partition count. With
+/// `read_ahead` 0 the scan's work stealing is left as configured; on by
+/// default, it has each source's first partition pop all of its ranges in order.
 ///
-/// A sort-preserving merge on a source-order key gave the same order but held
-/// one decoded batch per partition in a reservation that cannot spill, which
-/// failed for wide rows against a pool that holds a few batches but not one per
-/// partition. Here the batches in flight are bounded by `read_ahead`, not by the
-/// partition count.
+/// `read_ahead` partitions past the one being emitted are read by spawned
+/// producers, each into a channel of `READ_AHEAD_CHANNEL_BATCHES`, so their
+/// object-store requests overlap the writer's encoding; work stealing is off
+/// for them so none takes another's ranges. Each producer reserves a batch in
+/// the memory pool before decoding it, sized by the largest batch so far. Once
+/// the pool refuses, no further partition is read ahead and the merge falls
+/// back to reading in place rather than failing. Read-ahead starts after the
+/// first batch, which gives the first size to reserve.
 ///
-/// `read_ahead` partitions past the one being emitted are opened and read by
-/// spawned producers, each into a channel of `READ_AHEAD_CHANNEL_BATCHES`, so
-/// their object-store requests overlap the writer's encoding; the one being
-/// emitted keeps its producer, so its decoding overlaps the writer too. Work
-/// stealing is turned off for those, or a partition read ahead would take ranges
-/// that are not its own. A producer reserves each batch in the memory pool
-/// before decoding it, sized by the largest batch so far, and the reservation
-/// is released as the batch is emitted. Once the pool refuses one, no further
-/// partition is read ahead and the producers hand their readers back, so the
-/// merge degrades to reading in place rather than failing. Read-ahead starts
-/// after the first batch, which gives the first size to reserve.
-///
-/// Strictly sequential reading (`read_ahead` 0) left the writer waiting on
-/// every partition's first requests. Against an S3-compatible store behind
-/// 30 ms of injected first-byte latency and a 100 MiB/s per-connection cap,
-/// merging three 448 MiB files of wide text took 21.7 s in sequence, 15.0 s
-/// with one partition read ahead, 14.1 s with two and 13.9 s with four, against
-/// 13.0 s for the sort-preserving merge, at a peak RSS of 1053, 1367, 1518 and
-/// 1863 MiB against 2497 MiB. Three 75 MiB files of numeric columns took 6.2, 4.2, 3.4 and
-/// 3.2 s, against 4.3 s. On a local disk the difference was about 5%.
+/// On a high-latency object store, the default two partitions of read-ahead
+/// cut a three-file merge from 21.7 s (sequential) to 14.1 s, at a peak RSS well
+/// below that of a sort-preserving merge.
 fn source_ordered_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,

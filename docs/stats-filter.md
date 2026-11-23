@@ -131,7 +131,7 @@ synthetic catalog of 8192 files carrying one statistics row each, with a
 32-value `IN` predicate: **roughly twenty times faster**, 2703 ms with the
 conversion in the join filter against 127 ms with it in the CTE body, the
 same 32 rows from both. Read the ratio, not the milliseconds — every figure
-in this module is bound to that fixture, and an independent rebuild of the
+on this page is bound to that fixture, and an independent rebuild of the
 same shape reproduced the direction with different magnitudes. Results are
 unchanged, and
 structurally so: the raw statistics stay in the projection because the

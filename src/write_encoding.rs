@@ -2,43 +2,36 @@
 //! DuckLake's writer (DuckDB's parquet writer).
 //!
 //! DuckDB decides dictionary encoding per column chunk after buffering the row
-//! group: it counts the chunk's distinct values and keeps a dictionary only when
-//! they number at most a fifth of the row group's rows, and never for a column
-//! with no values. A chunk that keeps its dictionary also gets a bloom filter
-//! built from it (false-positive rate 0.01); a chunk without one gets neither.
+//! group: it keeps a dictionary only when the distinct values number at most a
+//! fifth of the row group's rows, and never for a column with no values. A
+//! chunk with a dictionary also gets a bloom filter built from it
+//! (false-positive rate 0.01); one without gets neither.
 //!
-//! arrow-rs applies one set of writer properties to a whole file. So a data file
-//! buffers its first row group — up to the row-group row cap, or the byte cap
-//! when one is set, or the end of the write — counts each column exactly as
-//! DuckDB does, and fixes the file's properties from that count:
+//! arrow-rs applies one set of properties to a whole file, so a data file
+//! buffers its first row group (up to the row cap, the byte cap if set, or the
+//! end of the write), counts each column as DuckDB does, and fixes the file's
+//! properties from that:
 //!
-//! - a column over the limit, or with no values, is written without a dictionary
-//!   and without a bloom filter;
+//! - a column over the limit, or with no values, gets no dictionary and no
+//!   bloom filter;
 //! - any other column keeps its dictionary and gets a bloom filter at DuckDB's
-//!   rate. Its dictionary byte limit is sized for the limit of a full row group,
-//!   so a later row group that outgrows it falls back as DuckDB's would drop its
-//!   dictionary; arrow-rs keeps the pages written before the fallback
-//!   dictionary-encoded, and the file's bloom filter stays on.
+//!   rate. Its dictionary byte limit is sized for the dictionary limit of a
+//!   full row group (a fifth of its rows), so a later row group that outgrows
+//!   it falls back as DuckDB would; pages written before the fallback stay
+//!   dictionary-encoded, and the bloom filter stays on.
 //!
-//! The file's first row group is decided exactly as DuckDB decides it. A later
-//! row group follows the first one's choice, apart from that fallback.
+//! A file encoded on several threads ([`crate::parallel_encode`]) instead
+//! decides each row group from its own rows, as DuckDB decides each chunk,
+//! since its row groups are encoded before their file is known.
 //!
-//! A file whose row groups are encoded on several threads
-//! ([`crate::parallel_encode`]) instead decides every row group from its own
-//! rows, as DuckDB decides each column chunk: its row groups are encoded
-//! before it is known which file they land in.
-//!
-//! Only top-level columns are tuned. Nested columns, booleans, intervals and
-//! dictionary-typed arrays keep arrow-rs's defaults, as do fixed-length byte
-//! array columns under Parquet V1, where arrow-rs writes no dictionary for them.
-//! A column whose dictionary the caller set ([`DataFileProperties::dictionary_set`])
-//! is not tuned either: it keeps the caller's setting and gets no bloom filter.
-//!
-//! A column whose bloom filter the caller set
-//! ([`DataFileProperties::bloom_filter_set`]) keeps that setting, whatever its
-//! dictionary: its dictionary is still decided as above, but the decision no
-//! longer turns its filter on or off. The caller's filter starts at the size of
-//! a full row group, and arrow-rs folds it down to the values written.
+//! Only top-level columns are tuned. Nested columns, booleans, intervals,
+//! dictionary-typed arrays, and fixed-length byte arrays under Parquet V1 keep
+//! arrow-rs's defaults. A column whose dictionary the caller set
+//! ([`DataFileProperties::dictionary_set`]) keeps that setting and gets no
+//! bloom filter unless the caller set one. A column whose bloom filter the
+//! caller set ([`DataFileProperties::bloom_filter_set`]) keeps that setting,
+//! sized for a full row group and folded down by arrow-rs; its dictionary is
+//! still decided as above unless the caller set it too.
 
 use std::collections::HashSet;
 use std::io::Write;

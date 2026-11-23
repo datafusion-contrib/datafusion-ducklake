@@ -1,33 +1,26 @@
 //! Physical row position and synthetic `rowid` column injection for DuckLake
 //! row lineage.
 //!
-//! DuckLake assigns each row a globally unique `rowid` BIGINT. For files written
-//! by INSERT, the catalog records the file's `row_id_start`, and the per-row
-//! rowid is `row_id_start + physical_row_position`, where `physical_row_position`
-//! is the row's 0-based position in the physical Parquet file. Positional delete
-//! files use the same physical position in their `pos` column.
+//! DuckLake gives each row a globally unique `rowid` BIGINT. For a file written
+//! by INSERT, the catalog records `row_id_start`, and a row's rowid is
+//! `row_id_start` plus its 0-based position in the physical Parquet file.
+//! Positional delete files use the same position in `pos`.
 //!
-//! The physical position is **not** derivable from stream arrival order: once a
-//! scan prunes row groups, selects rows, or splits a file across partitions,
-//! arrival order no longer tracks file order. It comes instead from the parquet
-//! reader itself, as a virtual column carrying the `RowNumber` extension type
-//! (see `positional_table_schema`). The reader knows each row group's absolute
-//! first row from the footer, so the values stay true physical positions however
-//! the scan is pruned, filtered, split or reordered.
+//! The position cannot come from stream arrival order, which stops tracking
+//! file order once a scan prunes row groups, selects rows or splits a file. It
+//! comes from the parquet reader, as a virtual column with the `RowNumber`
+//! extension type (see `positional_table_schema`), computed from each row
+//! group's first row in the footer. Official DuckLake does the same with
+//! DuckDB's `COLUMN_IDENTIFIER_FILE_ROW_NUMBER` virtual column.
 //!
-//! This mirrors official DuckLake, which computes `rowid` the same way from
-//! DuckDB's reader-level `COLUMN_IDENTIFIER_FILE_ROW_NUMBER` virtual column
-//! (`ducklake_multi_file_reader.cpp::GetVirtualColumnExpression`).
+//! The scan's row-lineage node and the delete filters read that column, so none
+//! depends on partitioning or merge order. [`RowIdExec`] computes `rowid` the
+//! same way over a single file.
 //!
-//! Downstream, the table scan's row-lineage node reads that column to compute
-//! `rowid`, and the delete filters read it to filter deleted positions — none
-//! counts stream rows, so all are correct regardless of partitioning or merge
-//! order. [`RowIdExec`] computes `rowid` the same way over a single file.
-//!
-//! Files written by `UPDATE` / compaction store the original rowids inline in
-//! the parquet as a column tagged with [`ROW_ID_PARQUET_FIELD_ID`] (typically
-//! named `_ducklake_internal_row_id`); the scan reads that column instead,
-//! resolved per file as the reader opens it (see `row_lineage.rs`).
+//! Files written by `UPDATE` or compaction store the original rowids in a
+//! column tagged [`ROW_ID_PARQUET_FIELD_ID`] (usually
+//! `_ducklake_internal_row_id`), which the scan reads instead, resolved per
+//! file as it opens (see `row_lineage.rs`).
 
 use std::pin::Pin;
 use std::sync::Arc;

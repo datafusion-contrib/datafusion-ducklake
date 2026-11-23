@@ -2,48 +2,36 @@
 //!
 //! [`DuckLakeTable::restore_rows_to`] makes a table's live rows equal to its
 //! rows at an earlier snapshot, the *mark*, by committing one new snapshot.
-//! History is never rewritten: every snapshot, the ones between the mark and
-//! the restore included, still reads what it read. A restored row keeps the
-//! `rowid` it had at the mark, so anything keyed by `rowid` stays valid.
+//! History is never rewritten: every snapshot, including those between the mark
+//! and the restore, still reads what it read. A restored row keeps the `rowid`
+//! it had at the mark, so anything keyed by `rowid` stays valid.
 //!
-//! This is a library extension; official DuckLake has no equivalent. The
-//! restore commits what a SQL `UPDATE` commits (official's
-//! `ducklake_update.cpp`: a delete of row versions plus an insert of row
-//! versions that keep their row ids), through the same staged write, so it
-//! leaves the catalog as an `UPDATE` leaves it, and the change ledger records
-//! `inserted_into_table`/`deleted_from_table` or `inlined_insert`/
-//! `inlined_delete` as an `UPDATE` would.
+//! This is a library extension with no official equivalent. It commits what a
+//! SQL `UPDATE` commits (deletes of row versions plus inserts that keep their
+//! row ids) through the same staged write, so the catalog and the change ledger
+//! look as they would after an `UPDATE`.
 //!
 //! # What changes
 //!
 //! The restore compares where the table's rows live at the mark and at the
-//! snapshot the table was opened at (its *head*), reading nothing the catalog
-//! had to keep for it besides the mark itself:
+//! snapshot the table was opened at (its *head*). Only the mark must survive:
+//! snapshots between the two can be expired, and the files only they reach
+//! cleaned up.
 //!
-//! - **Removed**: rows live at the head that were not live at the mark, deleted
-//!   as a `DELETE` deletes them: the live rows of a data file added since the
-//!   mark, rows a file live at both holds from after the mark (a partial file a
-//!   flush or merge wrote), and inlined rows inserted since the mark. A file's
-//!   deletions within the scoped `data_inlining_row_limit` go to
-//!   `ducklake_inlined_delete_<table_id>`; above it a file added since the mark
-//!   is ended whole, by metadata only (unless some of its rows were deleted
-//!   through `ducklake_inlined_delete_<table_id>`, over which official never
-//!   ends a file), and other files get a delete file.
-//! - **Restored**: rows live at the mark that are not live at the head: the
-//!   rows of data files ended since the mark, the rows of files live at both
-//!   that were deleted since (each delete file's per-position snapshots where
-//!   it records them, else the difference of the two delete sets, and inlined
-//!   deletions since the mark), and inlined rows ended since. They are
-//!   inserted again with their row ids, inlined when they number at most the
-//!   table's scoped `data_inlining_row_limit` (as an `UPDATE`'s new versions
-//!   are), else written to Parquet files that embed each row's id, each row
-//!   routed to its partition on a partitioned table.
+//! - **Removed**: rows live at the head but not at the mark (rows of files
+//!   added since, rows a partial file live at both holds from after the mark,
+//!   and inlined rows inserted since), deleted as a `DELETE` deletes them.
+//! - **Restored**: rows live at the mark but not at the head (rows of files
+//!   ended since, rows of files live at both that were deleted since, and
+//!   inlined rows ended since), inserted again with their row ids. They are
+//!   inlined within the table's `data_inlining_row_limit`, else written to
+//!   Parquet files that embed each row's id, routed to its partition on a
+//!   partitioned table.
 //!
 //! An update since the mark is both: its new version is removed and its old one
-//! restored. A flush or merge since the mark that wrote a partial file
-//! leaves the rows it moved where they are; a rewrite that ended files and
-//! wrote new ones has its new files ended and the rows of the files it ended
-//! restored.
+//! restored. A flush or merge that wrote a partial file leaves the moved rows
+//! where they are; a rewrite has its new files ended and the rows of the files
+//! it ended restored.
 //!
 //! # Column changes
 //!

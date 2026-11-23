@@ -1040,36 +1040,24 @@ pub(crate) const LIST_ELEMENT_NAME: &str = "item";
 
 /// Rename every list element in `schema` to [`LIST_ELEMENT_NAME`], at any depth.
 ///
-/// A read schema takes each nested node's name from the file, which for a list
-/// element means whichever of `element`, `array` or `list` its writer chose.
-/// Bringing it onto the catalog's spelling is what official DuckLake does to its
-/// reader's columns, and it matters for two reasons. A read schema that differs
-/// from the catalog schema by a name nothing reads costs the *whole* table its
-/// filter, sort and limit pushdown, because
-/// [`ColumnRenameExec`](crate::column_rename::ColumnRenameExec) decides that for
-/// the schema at once. And a list element's name is observable — `arrow_typeof`
-/// renders it — so a predicate that reads the list's type would otherwise answer
-/// one way inside the reader and another above the scan.
+/// A read schema takes each list element's name from the file (`element`,
+/// `array`, `list`, or anything else its writer chose). Official DuckLake
+/// renames them to the catalog's spelling too, and it matters twice here: a
+/// read schema that differs from the catalog's only by such a name costs the
+/// whole table its filter, sort and limit pushdown in
+/// [`ColumnRenameExec`](crate::column_rename::ColumnRenameExec), and the name is
+/// observable through `arrow_typeof`. Every element is renamed, not only those
+/// spelled `array` or `element` as official's rule reads.
 ///
-/// Every element is renamed, not only one spelled `array` or `element` the way
-/// official DuckLake's own rule reads. A file may spell it anything at all —
-/// arrow-rs reports back what the file records — and a file spelling it `foo`
-/// would be left observable by the conditional rule, which is the bug over
-/// again.
+/// A synthetic element, named for a field id the file lacks, keeps its name,
+/// the only record that nothing physical answers to it; its metadata is cleared
+/// like every other element's. Lists inside dictionaries, unions and run-end
+/// encoding are not normalized; the read path produces none of them.
 ///
-/// A synthetic element, named for a field id the file does not carry, keeps that
-/// name: it is the only record that nothing physical answers to it. Its metadata
-/// is cleared like every other element's.
-///
-/// Dictionaries, unions and run-end encoding fall through, so a list nested
-/// inside one is not normalized. The read path produces none of them, and
-/// [`types_equal_ignoring_field_metadata`](crate::column_rename::types_equal_ignoring_field_metadata)
-/// carves them out of its own recursion for the same reason.
-///
-/// This is for the schema a file is *read* with. The schemas
+/// This is for the schema a file is *read* with.
 /// [`build_read_schema_with_field_id_mapping`] and
-/// [`build_read_schema_with_name_mapping`] return still describe the file as it
-/// is spelled, which is what a caller driving arrow-rs with one of them needs.
+/// [`build_read_schema_with_name_mapping`] still describe the file as spelled,
+/// which a caller driving arrow-rs with them needs.
 pub(crate) fn normalize_list_element_names(schema: &Schema) -> Schema {
     fn normalize(data_type: &DataType) -> DataType {
         let element = |field: &Arc<Field>| {

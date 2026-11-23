@@ -1,34 +1,29 @@
 //! DuckLake table sort order: sort spec model.
 //!
-//! A sorted DuckLake table records, in the catalog, a **sort spec**
-//! (`ducklake_sort_info` + `ducklake_sort_expression`). Unlike a partition spec, a
-//! sort spec is *not* a pruning mechanism and carries no per-file catalog rows: its
-//! sole job is to order rows *within* each data file on write, which tightens the
-//! per-file min/max statistics so the existing statistics-based file pruner skips
-//! more files at query time. It is the DuckLake analogue of an Iceberg sort order;
-//! there is no Z-order / multi-dimensional clustering.
+//! A sorted DuckLake table records a **sort spec** in the catalog
+//! (`ducklake_sort_info` + `ducklake_sort_expression`). Unlike a partition spec
+//! it has no per-file rows and prunes nothing directly: it orders rows within
+//! each data file on write, which tightens per-file min/max statistics so the
+//! statistics pruner skips more files. It is the analogue of an Iceberg sort
+//! order, without Z-ordering.
 //!
-//! Following the DuckLake spec, each sort key is stored as an **expression** string
-//! (with a `dialect`, always `"duckdb"`), plus a sort direction (`ASC`/`DESC`) and a
-//! null ordering (`NULLS_FIRST`/`NULLS_LAST`). Storing an expression (rather than a
-//! `column_id`) is what lets DuckDB sort by arbitrary expressions/macros.
+//! Per the spec, each key is an **expression** string (with `dialect`
+//! `"duckdb"`), a direction (`ASC`/`DESC`) and a null ordering
+//! (`NULLS_FIRST`/`NULLS_LAST`), which lets DuckDB sort by arbitrary
+//! expressions.
 //!
-//! Scope note: `SET SORTED BY` through this crate records only **bare column
-//! references** (`SORTED BY (device_id, ts DESC)`). A spec with any other
-//! expression (written by DuckDB) is round-tripped verbatim; inserts, the
-//! inlined-data flush and compaction sort by it, evaluating it with
-//! **DataFusion's** semantics.
-//! Where those differ from DuckDB's (integer division, overflow, type
-//! promotion, function behaviour), rows may be ordered differently inside files
-//! than official orders them; query results are unaffected. When DataFusion
-//! cannot plan an expression, or evaluating it fails over the rows being
-//! written, the rows keep their arrival order (a flush: row id order; a
-//! compaction: the order an unsorted compaction writes): the order is a layout
-//! preference and never fails a write.
+//! `SET SORTED BY` through this crate records only bare column references
+//! (`SORTED BY (device_id, ts DESC)`). A spec with other expressions (written
+//! by DuckDB) is kept verbatim, and inserts, the inlined-data flush and
+//! compaction sort by it with **DataFusion's** semantics. Where those differ
+//! from DuckDB's (integer division, overflow, type promotion, functions), rows
+//! may be ordered differently within files; query results are unaffected. If
+//! DataFusion cannot plan or evaluate an expression, rows keep their arrival
+//! order: sort order is a layout preference and never fails a write.
 //!
-//! A key names a column as DuckDB's binder resolves it: the column spelled
-//! exactly as the key, else the one equal to it ignoring ASCII case. A key
-//! naming a column the table lacks fails the write, as official's does.
+//! A key names a column as DuckDB's binder resolves it: the exact spelling,
+//! else a match ignoring ASCII case. A key naming a missing column fails the
+//! write, as official's does.
 
 /// A sort key's direction. Serializes to the catalog `sort_direction` string
 /// (`"ASC"` / `"DESC"`), matching DuckLake's on-disk form.

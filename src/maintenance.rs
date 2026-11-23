@@ -1,30 +1,39 @@
 //! Maintenance operations for DuckLake catalogs: snapshot expiration, physical
 //! file cleanup, and orphaned-file reclamation.
 //!
-//! These port the three official DuckLake maintenance commands:
+//! These port official DuckLake's three maintenance commands:
 //!
-//! 1. **expire** ([`crate::metadata_writer_sqlite::SqliteMetadataWriter::expire_snapshots`],
-//!    [`crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog`]) deletes the
-//!    chosen snapshots, garbage-collects every table / data file / delete file that is no
-//!    longer reachable by any surviving snapshot, and records the orphaned physical paths in
-//!    `ducklake_files_scheduled_for_deletion`. No object storage is touched. A dead table's
-//!    catalog-inlined storage goes too, in the metadata database: its inlined data and
-//!    inlined delete tables are dropped.
-//! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`], [`cleanup_old_files_in_catalog`])
-//!    reads the scheduled rows, deletes the objects from the object store, and removes the rows.
+//! 1. **expire** (`expire_snapshots` on
+//!    [`crate::metadata_writer_sqlite::SqliteMetadataWriter`],
+//!    [`crate::metadata_writer_duckdb::DuckdbMetadataWriter`] and
+//!    [`crate::metadata_writer_mysql::MySqlMetadataWriter`];
+//!    [`crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog`])
+//!    deletes the chosen snapshots, removes every table, data file and delete
+//!    file no surviving snapshot reaches, and records their paths in
+//!    `ducklake_files_scheduled_for_deletion`. It touches no object storage; a
+//!    dead table's inlined data and inlined delete tables are dropped from the
+//!    metadata database.
+//! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`],
+//!    [`cleanup_old_files_duckdb`], [`cleanup_old_files_mysql`],
+//!    [`cleanup_old_files_in_catalog`]) deletes the scheduled objects from the
+//!    object store and removes their rows.
 //! 3. **delete_orphaned_files** ([`delete_orphaned_files_sqlite`],
-//!    [`delete_orphaned_files_in_catalog`], [`delete_orphaned_files_multicatalog`]) lists a data
-//!    path, subtracts referenced data files, delete files, and files still scheduled for deletion,
-//!    and deletes whatever is left. The catalog-scoped form catches files left by aborted writes.
-//!    The global form also reclaims dropped-catalog files from retained data-path tombstones.
+//!    [`delete_orphaned_files_duckdb`], [`delete_orphaned_files_mysql`],
+//!    [`delete_orphaned_files_in_catalog`],
+//!    [`delete_orphaned_files_multicatalog`]) lists a data path, subtracts
+//!    every referenced or still-scheduled file, and deletes the rest, such as
+//!    files left by aborted writes. The global form also reclaims dropped
+//!    catalogs' files from retained data-path tombstones.
 //!
-//! [`CatalogMaintenance`] dispatches the three per backend; a writer exposes it through
-//! [`MetadataWriter::maintenance`](crate::metadata_writer::MetadataWriter::maintenance), which
-//! is how [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint) runs them.
+//! [`CatalogMaintenance`] dispatches the three per backend; a writer exposes it
+//! through
+//! [`MetadataWriter::maintenance`](crate::metadata_writer::MetadataWriter::maintenance),
+//! which [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint)
+//! uses.
 //!
-//! The metadata writers deliberately hold no object store — physical I/O lives here so the
-//! catalog layer stays storage-agnostic (the object store comes from the caller, e.g. the
-//! same one a [`crate::table_writer::DuckLakeTableWriter`] was built with).
+//! The metadata writers hold no object store, so the catalog layer stays
+//! storage-agnostic; the caller supplies one, such as the store a
+//! [`crate::table_writer::DuckLakeTableWriter`] was built with.
 
 use crate::Result;
 #[cfg(feature = "write-postgres")]
@@ -212,7 +221,7 @@ struct DataPathGroup {
     data_paths: Vec<String>,
 }
 
-/// Render a UTC timestamp as a SQL literal both backends parse and compare correctly.
+/// Render a UTC timestamp as a SQL literal every backend parses and compares correctly.
 ///
 /// SQLite stores `CURRENT_TIMESTAMP` as `'YYYY-MM-DD HH:MM:SS'` text — lexicographic
 /// comparison with this format works because the components are zero-padded and in
@@ -577,7 +586,7 @@ pub struct ScheduledFile {
 
 /// Resolve scheduled rows against `data_path`, delete the objects (unless `dry_run`),
 /// and return the resolved absolute paths that were (or would be) deleted. Shared
-/// by both backends; the row listing / row removal is backend-specific and passed in.
+/// by every backend; the row listing / row removal is backend-specific and passed in.
 async fn run_cleanup<RemoveFut>(
     data_path: &str,
     files: Vec<ScheduledFile>,
@@ -767,38 +776,27 @@ pub async fn cleanup_old_files_in_catalog(
 
 /// Drop from `files` every scheduled row this catalog must not delete: one whose
 /// object a reference row in some catalog still names (deferred, so the owner
-/// reclaims it once the last reference goes), and one whose object this catalog does
-/// not own at all (skipped and warned about, never deleted).
+/// reclaims it once the last reference goes), and one whose object this catalog
+/// does not own (skipped with a warning, never deleted).
 ///
-/// Both comparisons are on canonical object-store keys, not raw strings — see
-/// [`canonical_key`] for why a raw comparison is unsafe here.
+/// Both comparisons use canonical object-store keys; see [`canonical_key`] for
+/// why raw strings are unsafe here. Two guards make this fail closed:
 ///
-/// Two guards make this fail closed, and the first holds unconditionally.
-///
-/// **An object inside another catalog's `cat_{id}/` layout is never reclaimed here**,
-/// however the row was scheduled and whenever. That catalog owns everything under its
-/// own prefix by construction, so a scheduled row of ours naming one is wrong whatever
-/// produced it. The check cannot be waived by the row's own claim of ownership,
-/// because the case that most needs catching is a row whose claim is the thing that is
-/// wrong: a reference registered while `path_is_relative = false` still meant
-/// "reference" reads as owned once ownership is recorded explicitly (such a row got no
-/// reference record), so this catalog's expire schedules the owner's live object
-/// and stamps it as its own to reclaim. Trusting that stamp deletes another catalog's
-/// data. A legacy pre-`cat_{id}` layout is unaffected: its files sit under no
-/// `cat_{id}/` prefix at all, so nothing matches.
-///
-/// **A row of unknown provenance is reclaimed only under this catalog's own layout.**
-/// A row this code scheduled carries `scheduled_by_owner` — a catalog only ever
-/// schedules what it owns — which is what lets a catalog reclaim its own file written
-/// outside its layout (a [`crate::DuckLakeTableWriter::begin_write_to_path`] target,
-/// which may sit outside `data_path` entirely). A row without that marker predates the
-/// ownership rule: a build without the rule did schedule files it merely referenced,
-/// so a metadata database written by a mixed pair of versions can hold one naming a
-/// live file another catalog reads, with the reference row that would have protected
-/// it already gone. Absolute rows like that are refused, with a warning, anywhere but
-/// this catalog's own prefix. Relative rows are exempt from this second guard only:
-/// they resolve through this catalog's own schema and table rows by construction,
-/// which is what a legacy pre-`cat_{id}` layout registers.
+/// - **An object inside another catalog's `cat_{id}/` layout is never reclaimed
+///   here**, whatever the row claims. That catalog owns its prefix by
+///   construction, and the row's ownership claim is exactly what may be wrong:
+///   a reference registered while `path_is_relative = false` still meant
+///   "reference" got no reference record, so it now reads as owned, and this
+///   catalog's expire would delete the owner's live object. Legacy
+///   pre-`cat_{id}` layouts sit under no such prefix and are unaffected.
+/// - **A row of unknown provenance is reclaimed only under this catalog's own
+///   layout.** A row this code scheduled carries `scheduled_by_owner`, which
+///   lets a catalog reclaim its own file outside its layout (a
+///   [`crate::DuckLakeTableWriter::begin_write_to_path`] target). A row without
+///   it predates the ownership rule, when files were scheduled that were merely
+///   referenced, so an absolute row like that is refused, with a warning,
+///   outside this catalog's prefix. Relative rows resolve through this
+///   catalog's own schema and table rows and are exempt from this guard.
 #[cfg(feature = "write-postgres")]
 async fn retain_unreferenced(
     mgr: &crate::multicatalog::MulticatalogManager,
