@@ -94,9 +94,8 @@ tls-native-tls = ["sqlx?/tls-native-tls"]
 tls-rustls-aws-lc-rs = ["sqlx?/tls-rustls-aws-lc-rs"]
 tls-rustls-ring = ["sqlx?/tls-rustls-ring"]
 
-# Compile DuckDB C++ from source and statically bundle it. Enabled by default.
-# Consumers who want to dynamically link against a system libduckdb can disable
-# this by using `default-features = false, features = ["metadata-duckdb"]`.
+# Compile DuckDB C++ from source and statically bundle it. Not a default feature:
+# enable `metadata-duckdb` alone to link against a system libduckdb instead.
 duckdb-bundled = ["metadata-duckdb", "duckdb/bundled"]
 
 # Encryption support for Parquet files

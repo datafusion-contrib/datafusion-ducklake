@@ -3139,8 +3139,6 @@ mod tests {
         data_file_partition_id: false,
     };
 
-    /// Render `filters` for the DuckDB dialect and splice them into the
-    /// data-file listing, for a single Int32 column with the given `column_id`.
     /// Count `?` outside single-quoted string literals, which is what a driver
     /// treats as a bind placeholder.
     fn placeholders_outside_literals(sql: &str) -> usize {
@@ -3156,6 +3154,8 @@ mod tests {
         count
     }
 
+    /// Render `filters` for the DuckDB dialect and splice them into the
+    /// data-file listing, for a single Int32 column with the given `column_id`.
     fn filtered_listing_sql(
         predicate: Arc<dyn PhysicalExpr>,
         column_id: i64,

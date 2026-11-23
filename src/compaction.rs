@@ -4,18 +4,19 @@
 //! automatically on write) and returning a [`CompactionResult`] with metrics:
 //!
 //! 1. [`DuckLakeTable::merge_adjacent_files`] coalesces small data files of one
-//! table, of the same schema version, into fewer larger ones. Each row keeps
-//! its rowid: when the sources' rowid ranges are adjacent the rows are written
-//! in rowid order under the first source's `row_id_start`, otherwise each rowid
-//! is embedded as a column. A merged file spanning several origin snapshots is
-//! a DuckLake **partial data file**: it embeds a per-row
-//! `_ducklake_internal_snapshot_id` and records `partial_max`, so time travel
-//! and change feeds still attribute each row to its origin. A partial file can
-//! itself be merged again, keeping each row's origin. 2.
-//! [`DuckLakeTable::rewrite_data_files`] rewrites a data file whose deleted
-//! fraction exceeds a threshold (DuckDB's default is 0.95): it writes the
-//! file's live rows to a new file, preserving rowids, and retires both the old
-//! data file and its delete file.
+//!    table, of the same schema version, into fewer larger ones. Each row keeps
+//!    its rowid: when the sources' rowid ranges are adjacent the rows are
+//!    written in rowid order under the first source's `row_id_start`, otherwise
+//!    each rowid is embedded as a column. A merged file spanning several origin
+//!    snapshots is a DuckLake **partial data file**: it embeds a per-row
+//!    `_ducklake_internal_snapshot_id` and records `partial_max`, so time
+//!    travel and change feeds still attribute each row to its origin. A partial
+//!    file can itself be merged again, keeping each row's origin.
+//! 2. [`DuckLakeTable::rewrite_data_files`] rewrites a data file whose deleted
+//!    fraction (inlined deletions included) reaches a threshold (DuckDB's
+//!    default is 0.95): it writes the file's live rows to a new file,
+//!    preserving rowids, and retires both the old data file and its delete
+//!    file.
 //!
 //! Both commit in one snapshot via `MetadataWriter::commit_compaction`: outputs
 //! are registered, sources (and a rewrite's delete files) are retired and
@@ -653,8 +654,8 @@ fn adjacent_row_id_start(bin: &[&DuckLakeTableFile]) -> Option<i64> {
 /// back to reading in place rather than failing. Read-ahead starts after the
 /// first batch, which gives the first size to reserve.
 ///
-/// On a high-latency object store, one or two partitions of read-ahead cut a
-/// three-file merge from 21.7 s (sequential) to about 14 s, at a peak RSS well
+/// On a high-latency object store, the default two partitions of read-ahead
+/// cut a three-file merge from 21.7 s (sequential) to 14.1 s, at a peak RSS well
 /// below that of a sort-preserving merge.
 fn source_ordered_output(
     context: Arc<TaskContext>,

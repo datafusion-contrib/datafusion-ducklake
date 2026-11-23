@@ -9,23 +9,24 @@
 //!
 //! ## How this differs from the SQLite writer
 //!
-//! 1. **Synchronous driver.** The `duckdb` crate is synchronous, so the trait's
-//! methods run directly on a `duckdb::Connection` with no `block_on`. One
-//! connection behind a `Mutex` serializes commits, which is the write lock the
-//! SQLite writer relies on (DuckLake file catalogs are single-writer). Each
-//! mutating method runs in one DuckDB transaction, rolled back on drop. 2. **Id
-//! allocation as official DuckDB allocates.** Schema, table, partition and sort
-//! ids come from one `next_catalog_id` counter, and data and delete file ids
-//! from one `next_file_id` counter, both in `ducklake_metadata`; every snapshot
-//! row carries them, since official DuckDB reads them at the head.
-//! `snapshot_id` keeps SQLite's commit-time `MAX(snapshot_id)+1`, and
-//! `column_id` keeps SQLite's counter row. Columns of `ducklake_schema`,
-//! `ducklake_table`, `ducklake_data_file` and `ducklake_delete_file` follow
-//! official's order, since official inserts by position. 3. **Same ordering and
-//! conflict detection.** The snapshot is allocated before the table reads, and
-//! a `Replace` commit aborts with [`crate::DuckLakeError::Conflict`] if any of
-//! the table's data files has a `begin_snapshot`/`end_snapshot` newer than the
-//! base observed at begin.
+//! 1. **Synchronous driver.** The `duckdb` crate is synchronous, so the
+//!    trait's methods run directly on a `duckdb::Connection` with no
+//!    `block_on`. One connection behind a `Mutex` serializes commits, which is
+//!    the write lock the SQLite writer relies on (DuckLake file catalogs are
+//!    single-writer). Each mutating method runs in one DuckDB transaction,
+//!    rolled back on drop.
+//! 2. **Id allocation as official DuckDB allocates.** Schema, table, partition
+//!    and sort ids come from one `next_catalog_id` counter, and data and delete
+//!    file ids from one `next_file_id` counter, both in `ducklake_metadata`;
+//!    every snapshot row carries them, since official DuckDB reads them at the
+//!    head. `snapshot_id` keeps SQLite's commit-time `MAX(snapshot_id)+1`, and
+//!    `column_id` keeps SQLite's counter row. Columns of `ducklake_schema`,
+//!    `ducklake_table`, `ducklake_data_file` and `ducklake_delete_file` follow
+//!    official's order, since official inserts by position.
+//! 3. **Same ordering and conflict detection.** The snapshot is allocated
+//!    before the table reads, and a `Replace` commit aborts with
+//!    [`crate::DuckLakeError::Conflict`] if any of the table's data files has a
+//!    `begin_snapshot`/`end_snapshot` newer than the base observed at begin.
 
 use crate::Result;
 use crate::catalog_version::{CatalogState, SINGLE_CATALOG, require_migratable, require_writable};
@@ -1649,7 +1650,6 @@ fn reserve_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
     Ok((first..first + n).collect())
 }
 
-/// Register a delete file an inlined flush wrote for `data_file_id`.
 /// Register each of `entries`, a delete file that records its positions'
 /// snapshots, against its data file. One that replaces the file's live delete
 /// file carries every position of it, so the replaced row is removed and its
@@ -1707,6 +1707,7 @@ fn replace_delete_files(
     Ok(())
 }
 
+/// Register a delete file an inlined flush wrote for `data_file_id`.
 fn insert_flush_delete_file(
     tx: &Transaction<'_>,
     table_id: i64,
@@ -2177,14 +2178,6 @@ fn retire_prior_generation(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64
     Ok(())
 }
 
-/// The atomic commit point for a single-catalog write. Inserts the deferred
-/// `ducklake_snapshot` row, finalizes the column generation surgically (stable
-/// `column_id`s), classifies the commit as DDL vs pure data write to bump/carry
-/// `schema_version`, and — for `Replace` — fences on the base snapshot and
-/// retires the prior data generation. A faithful port of the SQLite writer's
-/// `finalize_snapshot`; the only structural change is reading the current
-/// columns into an owned `Vec` (dropping the prepared statement) before issuing
-/// further writes on the same connection.
 /// Persist the harvested per-column stats for a just-registered data file
 /// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
 fn insert_file_column_stats(
@@ -2632,6 +2625,14 @@ fn apply_inlined_deletes(
     Ok(())
 }
 
+/// The atomic commit point for a single-catalog write. Inserts the deferred
+/// `ducklake_snapshot` row, finalizes the column generation surgically (stable
+/// `column_id`s), classifies the commit as DDL vs pure data write to bump/carry
+/// `schema_version`, and — for `Replace` — fences on the base snapshot and
+/// retires the prior data generation. A faithful port of the SQLite writer's
+/// `finalize_snapshot`; the only structural change is reading the current
+/// columns into an owned `Vec` (dropping the prepared statement) before issuing
+/// further writes on the same connection.
 #[allow(clippy::too_many_arguments)]
 fn finalize_snapshot(
     tx: &Transaction<'_>,

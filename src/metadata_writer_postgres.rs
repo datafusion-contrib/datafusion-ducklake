@@ -1219,10 +1219,9 @@ pub(crate) async fn migrate_directory_paths(conn: &mut sqlx::PgConnection) -> Re
 }
 
 /// Batch size for one `DELETE` inside the orphan purge, and the cap on how many
-/// batches a single call will run. Bounded on purpose: this runs during schema
-/// initialization, which callers do on startup and often behind a lock, so no
-/// single statement may run long and no single call may run away. A backlog
-/// larger than the cap drains over the next few initializations.
+/// batches a single call will run. Bounded on purpose, so no single statement
+/// may run long and no single call may run away. A backlog larger than the cap
+/// drains over later maintenance sweeps.
 const ORPHAN_PURGE_BATCH: i64 = 20_000;
 const ORPHAN_PURGE_MAX_BATCHES: usize = 10;
 
@@ -2962,10 +2961,6 @@ async fn insert_file_column_stats(
     Ok(())
 }
 
-/// Persist a partitioned data file's partition metadata within the commit
-/// transaction: set `ducklake_data_file.partition_id` and insert one
-/// `ducklake_file_partition_value` row per partition key. A no-op for an
-/// unpartitioned file.
 /// Record `snapshot_id` as a DDL snapshot for `table_id`: bump the catalog's
 /// `schema_version` and write the matching `ducklake_schema_versions` row.
 ///
@@ -3148,6 +3143,10 @@ async fn write_sort_generation(
     Ok(())
 }
 
+/// Persist a partitioned data file's partition metadata within the commit
+/// transaction: set `ducklake_data_file.partition_id` and insert one
+/// `ducklake_file_partition_value` row per partition key. A no-op for an
+/// unpartitioned file.
 async fn insert_partition_metadata(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -3388,8 +3387,8 @@ pub(crate) async fn merge_inlined_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
-/// The atomic commit point for a multicatalog Postgres write, shared by
-/// `register_data_file` (with a data file) and `publish_snapshot` (fileless).
+/// The atomic commit point for a multicatalog Postgres write, shared by every
+/// multicatalog commit path, with data files or without (`publish_snapshot`).
 /// The caller already holds the catalog `FOR UPDATE` lock and an open tx.
 ///
 /// All metadata (the snapshot row, get-or-create schema and table rows, the
@@ -3401,7 +3400,7 @@ pub(crate) async fn merge_inlined_table_column_stats(
 /// at begin are inserted with `OVERRIDING SYSTEM VALUE`; reused column ids keep
 /// parquet field ids stable.
 ///
-/// Returns `(committed_snapshot_id, table_id)`. `table_id_hint` is the id
+/// Returns `(snapshot_id, schema_id, table_id)`. `table_id_hint` is the id
 /// reserved at begin, used only on a table's first write. The schema id is
 /// looked up, or freshly reserved, here, since nothing depends on the one
 /// reserved at begin (the parquet path encodes the catalog id, not the schema).

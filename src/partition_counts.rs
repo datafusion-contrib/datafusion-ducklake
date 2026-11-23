@@ -12,8 +12,9 @@
 //! [`PartitionRowCount::Unknown`] otherwise. Unknown is never zero: a caller
 //! that needs the number must count the rows.
 //!
-//! The column must be the one identity key of the table's live partition spec,
-//! and each requested value must be spelled as the writer stores it (see
+//! The column must be the one identity key of the table's live partition spec
+//! and not a float ([`PartitionCountUnknown::FloatKey`]). Each requested value
+//! must be spelled as the writer stores it (see
 //! [`PartitionCountUnknown::NonCanonicalValue`]). A value is then exact when
 //! all of these hold at the read snapshot `S`:
 //!

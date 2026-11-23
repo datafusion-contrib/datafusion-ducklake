@@ -64,8 +64,9 @@ use crate::table::{SCAN_READ_ATTEMPTS, inlined_rows_kept_moving, written_since};
 ///    older snapshots' listings. The low-level
 ///    [`MetadataWriter`](crate::metadata_writer::MetadataWriter) calls after
 ///    `create_snapshot` (`register_data_file`, `end_table_files`) do not, so a
-///    memo filled between them misses those changes until the next commit. So
-///    does any writer that changes the catalog without a new snapshot.
+///    memo filled between them misses those changes until the next commit.
+///    Any other writer that changes the catalog tables without a new snapshot
+///    breaks the memo in the same way.
 /// 2. Snapshot ids only grow. A bind that sees a newer head drops every entry.
 /// 3. Expire and cleanup do not move the head. A kept entry for an expired
 ///    snapshot returns old rows until cleanup deletes their files, then fails.

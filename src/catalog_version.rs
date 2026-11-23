@@ -9,9 +9,9 @@
 //! so it works on catalogs from before `ducklake_metadata` had a `scope`
 //! column.
 //!
-//! - **Older or unrecorded layout version:** refused until the caller runs the
-//!   writer's `migrate` function. Migration is never automatic, as in official
-//!   DuckDB without `AUTOMATIC_MIGRATION`.
+//! - **Older or unrecorded layout version:** refused by writers until the
+//!   caller runs the writer's `migrate` function. Migration is never automatic,
+//!   as in official DuckDB without `AUTOMATIC_MIGRATION`.
 //! - **Newer layout version:** read and written as it is when its minimum
 //!   version ([`MIN_VERSION_KEY`], or [`MULTICATALOG_MIN_VERSION_KEY`]) is at
 //!   most this release's layout version, refused otherwise. `migrate` leaves it

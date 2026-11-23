@@ -521,8 +521,8 @@ fn file_row_count(
 /// `num_rows` it answers `count(*)`, so `Absent` (the aggregate reads the data)
 /// beats an undercount.
 ///
-/// Delete-free files only: a file with a delete file or a `delete_count`
-/// reports `Absent`. Do not generalize this by subtracting `delete_count`: an
+/// Delete-free files only: a file with a delete file or a non-zero
+/// `delete_count` reports `Absent`. Do not generalize this by subtracting `delete_count`: an
 /// inlined delete leaves `delete_file` and `delete_count` NULL, so this row
 /// cannot see it. `scan()` routes every file in `inlined_deletes` to the
 /// with-deletes exec; a new caller must exclude those files too, or take the
@@ -1079,6 +1079,7 @@ fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
 ///
 /// - `file_size_bytes`: the catalog's recorded size, used to build the
 ///   `ObjectMeta` the cache validates against, so no `head()` call is needed.
+///   `None` (a delete file with no recorded size) costs one `head()`.
 /// - `footer_size`: the recorded footer size, when known. It becomes the
 ///   metadata size hint ([`metadata_size_hint`]), so a cold read is one ranged
 ///   read.
@@ -1474,8 +1475,9 @@ pub(crate) fn cached_parquet_reader_factory(
 /// while the scan still reports a pruning predicate. (`pushdown_filters` is
 /// read from the session by the source itself.)
 ///
-/// Only the `global` section is taken: an explicit decryption property in the
-/// embedder's `crypto` or `column_specific_options` sections would override the
+/// Only the `global` section is taken: the `crypto` and
+/// `column_specific_options` sections come from the embedder's `TableOptions`,
+/// and an explicit decryption property in `crypto` would override the
 /// encryption factory this crate attaches per file.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn session_parquet_source(
@@ -2655,9 +2657,9 @@ impl DuckLakeTable {
     ///   catalog's bounds are never tightened when rows are removed, so the
     ///   extreme may name a row that is gone. This mirrors official's
     ///   `min_max_exact` gate.
-    /// - **`num_rows`** comes from [`file_summary_row_count`], which subtracts
-    ///   deletes and refuses the `value_count` fallback, so it stays exact
-    ///   through a DELETE exactly as official's `count(*)` does.
+    /// - **`num_rows`** comes from [`file_summary_row_count`], which is
+    ///   `Absent` for a file with deletes and refuses the `value_count`
+    ///   fallback, so it is never an overcount after a DELETE.
     fn page_files_with_both_statistics(
         &self,
         metadata: Vec<DuckLakeFileMetadata>,

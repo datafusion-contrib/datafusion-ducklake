@@ -189,10 +189,10 @@ pub enum WriteMode {
 /// - `parquet_version`: stored as `V1` or `V2`.
 /// - `parquet_compression_level`, `parquet_row_group_size`,
 ///   `data_inlining_row_limit`: cast to `UBIGINT` (`'1.5'` is `2`; a negative
-///   value fails).
+///   value fails). `parquet_row_group_size` also refuses `0`.
 /// - `target_file_size`, `parquet_row_group_size_bytes`: parsed as DuckDB
 ///   memory limits (`'512MB'`; a bare number has no unit and fails), stored in
-///   bytes.
+///   bytes. `parquet_row_group_size_bytes` also refuses `0`.
 /// - `rewrite_delete_threshold`: cast to `DOUBLE`, checked to lie in `[0, 1]`,
 ///   stored as C++'s `std::to_string` prints it (`0.500000`).
 /// - `delete_older_than`, `expire_older_than`: checked to be empty or an
@@ -3298,11 +3298,11 @@ pub struct WriteSetupResult {
     /// `Replace` conflict detection), threaded back to the commit step. If a
     /// concurrent writer committed a newer generation of the table since this base
     /// — i.e. any data file or column with `begin_snapshot`/`end_snapshot > base`
-    /// — the commit aborts with [`crate::DuckLakeError::Conflict`]. Both backends
-    /// now share this model: snapshot ids are assigned at *commit* (single-catalog
-    /// SQLite `MAX(snapshot_id)+1`; multicatalog Postgres a plain `IDENTITY`
-    /// insert), so per-catalog id order == commit order and the scalar
-    /// `> base` test is exact.
+    /// — the commit aborts with [`crate::DuckLakeError::Conflict`]. Every
+    /// backend assigns snapshot ids at *commit* (`MAX(snapshot_id)+1` or a
+    /// counter on a single catalog, a plain `IDENTITY` insert on a multicatalog
+    /// store), so per-catalog id order == commit order and the scalar `> base`
+    /// test is exact.
     pub base_snapshot_id: i64,
     /// Schema ID (may be newly created)
     pub schema_id: i64,

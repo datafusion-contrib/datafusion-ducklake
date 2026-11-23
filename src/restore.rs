@@ -14,7 +14,9 @@
 //! # What changes
 //!
 //! The restore compares where the table's rows live at the mark and at the
-//! snapshot the table was opened at (its *head*):
+//! snapshot the table was opened at (its *head*). Only the mark must survive:
+//! snapshots between the two can be expired, and the files only they reach
+//! cleaned up.
 //!
 //! - **Removed**: rows live at the head but not at the mark (rows of files
 //!   added since, rows a partial file live at both holds from after the mark,

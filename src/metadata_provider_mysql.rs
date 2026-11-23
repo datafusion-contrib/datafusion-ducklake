@@ -246,8 +246,10 @@ fn quote_ident(name: &str) -> String {
 ///   is `0` with a warning, so a malformed bound would compare as zero and
 ///   could prune a matching file. Every numeric cast is gated on a `REGEXP`
 ///   for that number shape and yields `NULL` otherwise, which
-///   [`StatsSqlDialect::keep_when_unknown`] turns into "keep the file". Temporal
-///   casts need no gate: MySQL returns `NULL` for an unparseable datetime.
+///   [`StatsSqlDialect::keep_when_unknown`] turns into "keep the file". A
+///   `DATE` stat is also checked for its canonical shape before the cast, since
+///   MySQL reads `2020/01/01` and `20200101` as dates. Timestamps are compared
+///   as canonical text, not cast.
 /// - **Case- and accent-insensitive default collation**
 ///   (`utf8mb4_0900_ai_ci`): `'Apple' = 'apple'` and `'cafe' = 'café'` are
 ///   true, while DataFusion compares `Utf8` byte-wise, so a raw bound could

@@ -15,10 +15,10 @@
 //! - a column over the limit, or with no values, gets no dictionary and no
 //!   bloom filter;
 //! - any other column keeps its dictionary and gets a bloom filter at DuckDB's
-//!   rate. Its dictionary byte limit is sized for a full row group, so a later
-//!   row group that outgrows it falls back as DuckDB would; pages written
-//!   before the fallback stay dictionary-encoded, and the bloom filter stays
-//!   on.
+//!   rate. Its dictionary byte limit is sized for the dictionary limit of a
+//!   full row group (a fifth of its rows), so a later row group that outgrows
+//!   it falls back as DuckDB would; pages written before the fallback stay
+//!   dictionary-encoded, and the bloom filter stays on.
 //!
 //! A file encoded on several threads ([`crate::parallel_encode`]) instead
 //! decides each row group from its own rows, as DuckDB decides each chunk,
@@ -28,10 +28,10 @@
 //! dictionary-typed arrays, and fixed-length byte arrays under Parquet V1 keep
 //! arrow-rs's defaults. A column whose dictionary the caller set
 //! ([`DataFileProperties::dictionary_set`]) keeps that setting and gets no
-//! bloom filter. A column whose bloom filter the caller set
-//! ([`DataFileProperties::bloom_filter_set`]) keeps that setting, sized for a
-//! full row group and folded down by arrow-rs; its dictionary is still decided
-//! as above.
+//! bloom filter unless the caller set one. A column whose bloom filter the
+//! caller set ([`DataFileProperties::bloom_filter_set`]) keeps that setting,
+//! sized for a full row group and folded down by arrow-rs; its dictionary is
+//! still decided as above unless the caller set it too.
 
 use std::collections::HashSet;
 use std::io::Write;

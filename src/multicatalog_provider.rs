@@ -1186,7 +1186,7 @@ impl MulticatalogProvider {
 ///
 /// Statistics are read by a `LATERAL` subquery per page row, one probe of
 /// `idx_file_column_stats_table_file_column` per listed file. A join against a
-/// per-file aggregate is not safe here: under a generic plan the server
+/// per-file aggregate costs too much here: under a generic plan the server
 /// estimates the page at one row and reruns the aggregate per row (13 s for a
 /// 4,000-file page on PostgreSQL 18, against 46 ms).
 ///

@@ -11,13 +11,13 @@
 //! ## Coverage
 //!
 //! Encoded exactly: signed and unsigned integers, `BOOLEAN`, `FLOAT`/`DOUBLE`,
-//! `DECIMAL(p,s)` (128-bit), `DATE`, and `TIMESTAMP` with or without a time
-//! zone (all units). Time-zoned timestamps are normalized to UTC, independent
-//! of the DuckDB session time zone.
+//! `DECIMAL(p,s)` (128-bit), `DATE`, `TIMESTAMP` with or without a time zone
+//! (all units), and strings up to [`MAX_STRING_STAT_BYTES`]. Time-zoned
+//! timestamps are normalized to UTC, independent of the DuckDB session time
+//! zone.
 //!
-//! Not encoded by [`encode_scalar`], which returns `None` so the stat is stored
-//! as `NULL` and the column never prunes (DuckLake keeps files with NULL
-//! stats):
+//! Not encoded by [`encode_scalar`], which returns `None`, so no constant of
+//! these types is compared. Each bullet says which stats are still stored:
 //!
 //! - `TIME`, `BLOB`/`BINARY`, `UUID`, `INTERVAL`, `DECIMAL256` and nested
 //!   types. File statistics ([`encode_file_stat`]) and inlined-row bounds

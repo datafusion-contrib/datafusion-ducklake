@@ -3,21 +3,27 @@
 //!
 //! These port official DuckLake's three maintenance commands:
 //!
-//! 1. **expire**
-//! ([`crate::metadata_writer_sqlite::SqliteMetadataWriter::expire_snapshots`],
-//! [`crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog`])
-//! deletes the chosen snapshots, removes every table, data file and delete file
-//! no surviving snapshot reaches, and records their paths in
-//! `ducklake_files_scheduled_for_deletion`. It touches no object storage; a
-//! dead table's inlined data and inlined delete tables are dropped from the
-//! metadata database. 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`],
-//! [`cleanup_old_files_in_catalog`]) deletes the scheduled objects from the
-//! object store and removes their rows. 3. **delete_orphaned_files**
-//! ([`delete_orphaned_files_sqlite`], [`delete_orphaned_files_in_catalog`],
-//! [`delete_orphaned_files_multicatalog`]) lists a data path, subtracts every
-//! referenced or still-scheduled file, and deletes the rest, such as files left
-//! by aborted writes. The global form also reclaims dropped catalogs' files
-//! from retained data-path tombstones.
+//! 1. **expire** (`expire_snapshots` on
+//!    [`crate::metadata_writer_sqlite::SqliteMetadataWriter`],
+//!    [`crate::metadata_writer_duckdb::DuckdbMetadataWriter`] and
+//!    [`crate::metadata_writer_mysql::MySqlMetadataWriter`];
+//!    [`crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog`])
+//!    deletes the chosen snapshots, removes every table, data file and delete
+//!    file no surviving snapshot reaches, and records their paths in
+//!    `ducklake_files_scheduled_for_deletion`. It touches no object storage; a
+//!    dead table's inlined data and inlined delete tables are dropped from the
+//!    metadata database.
+//! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`],
+//!    [`cleanup_old_files_duckdb`], [`cleanup_old_files_mysql`],
+//!    [`cleanup_old_files_in_catalog`]) deletes the scheduled objects from the
+//!    object store and removes their rows.
+//! 3. **delete_orphaned_files** ([`delete_orphaned_files_sqlite`],
+//!    [`delete_orphaned_files_duckdb`], [`delete_orphaned_files_mysql`],
+//!    [`delete_orphaned_files_in_catalog`],
+//!    [`delete_orphaned_files_multicatalog`]) lists a data path, subtracts
+//!    every referenced or still-scheduled file, and deletes the rest, such as
+//!    files left by aborted writes. The global form also reclaims dropped
+//!    catalogs' files from retained data-path tombstones.
 //!
 //! [`CatalogMaintenance`] dispatches the three per backend; a writer exposes it
 //! through
@@ -215,7 +221,7 @@ struct DataPathGroup {
     data_paths: Vec<String>,
 }
 
-/// Render a UTC timestamp as a SQL literal both backends parse and compare correctly.
+/// Render a UTC timestamp as a SQL literal every backend parses and compares correctly.
 ///
 /// SQLite stores `CURRENT_TIMESTAMP` as `'YYYY-MM-DD HH:MM:SS'` text — lexicographic
 /// comparison with this format works because the components are zero-padded and in
@@ -580,7 +586,7 @@ pub struct ScheduledFile {
 
 /// Resolve scheduled rows against `data_path`, delete the objects (unless `dry_run`),
 /// and return the resolved absolute paths that were (or would be) deleted. Shared
-/// by both backends; the row listing / row removal is backend-specific and passed in.
+/// by every backend; the row listing / row removal is backend-specific and passed in.
 async fn run_cleanup<RemoveFut>(
     data_path: &str,
     files: Vec<ScheduledFile>,

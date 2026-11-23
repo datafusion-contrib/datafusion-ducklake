@@ -18,7 +18,8 @@
 //!   keys, then `(row_id, begin_snapshot)`, with each row's `rowid` and insert
 //!   snapshot embedded, split by partition or rolled over at the target file
 //!   size. They are registered as a flush registers them, except that
-//!   `begin_snapshot` is the fork's snapshot, the earliest its catalog has.
+//!   `begin_snapshot` is the fork's snapshot: the source's snapshots are not
+//!   snapshots of the fork's catalog.
 //!   `row_id_start` is the smallest row id (NULL when a deleted inlined row's
 //!   id falls in the range) and `partial_max` the largest insert snapshot.
 //!
@@ -28,10 +29,11 @@
 //!
 //! The fork's columns copy the source's catalog rows: ids, exact types (`json`,
 //! `geometry`, `timetz`, ...), nullability and defaults, nested fields
-//! included. A list column in the legacy shape (no `element` row) is migrated
-//! to upstream's shape with a fresh `element` id, which a re-fork into the same
-//! table keeps. Tags and comments of the table and its columns are copied in
-//! the same commit.
+//! included. A list column in the legacy shape (no `element` row) takes
+//! upstream's shape in the fork, with a fresh `element` id that a re-fork into
+//! the same table keeps. The source is not changed. The table's tags and
+//! comments, and its columns' comments, are copied in the same commit (a
+//! column tag other than `comment` is refused).
 //!
 //! Row ids are preserved: each file keeps its `row_id_start` (or embedded row
 //! ids), and the fork's allocator starts past the source's, so a row has the

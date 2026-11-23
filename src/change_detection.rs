@@ -22,11 +22,12 @@
 //!   official's flush of inlined deletions of Parquet rows records
 //!   `deleted_from_table`, while the feed reports nothing;
 //! - only `altered_table`: unchanged, since an alteration writes no data;
-//! - only flushes and compactions: the feed is read over them, stopping at its
-//!   first row (a `DELETE` committed with a flush records only `inline_flush`).
-//!   A rewrite or a merge of adjacent files reports nothing on its own; this
-//!   follows official's main branch, ahead of the pinned extension (see
-//!   COMPATIBILITY.md).
+//! - otherwise, flushes and compactions (with or without `altered_table`): the
+//!   feed is read over them, stopping at its first row. A `DELETE` committed
+//!   with official's flush records only `inline_flush`, and the feed reports
+//!   it. A rewrite or a merge of adjacent files reports nothing on its own. For
+//!   a rewrite this follows official's main branch: the pinned extension's
+//!   feed reports a rewrite's rows as `UPDATE` pairs (see COMPATIBILITY.md).
 //!
 //! [`TableDataChanges::layout_changed`] also counts every flush and compaction,
 //! from the tokens alone. A cache keyed by row content needs `rows_changed`;
