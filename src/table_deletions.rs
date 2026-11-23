@@ -201,7 +201,7 @@ pub(crate) struct WindowDeletions {
 
 impl WindowDeletions {
     /// Read the window's delete records of `table_id`, given the window's
-    /// rewrite snapshots ([`rewrite_snapshots`](crate::table_changes::rewrite_snapshots)).
+    /// rewrite snapshots ([`rewrite_snapshots`]).
     pub(crate) fn read(
         provider: &dyn MetadataProvider,
         table_id: i64,

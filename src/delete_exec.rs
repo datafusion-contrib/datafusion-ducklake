@@ -2,33 +2,25 @@
 //!
 //! Backs [`crate::table::DuckLakeTable`]'s `TableProvider::delete_from`. When
 //! executed, it performs the delete and yields a single `count: UInt64` row
-//! (rows affected), mirroring the count contract of
-//! [`DuckLakeInsertExec`](crate::insert_exec::DuckLakeInsertExec).
+//! (rows affected), as
+//! [`DuckLakeInsertExec`](crate::insert_exec::DuckLakeInsertExec) does.
 //!
-//! Two paths:
-//! - **Filtered delete** (a `WHERE` clause): for each live data file, resolve the
-//!   physical row positions matching the predicate and record them as official
-//!   DuckLake's `DuckLakeDelete::FlushDelete` does: at most the scoped
-//!   `data_inlining_row_limit` go to
-//!   `ducklake_inlined_delete_<table_id>`, even when they empty the file;
-//!   above it, a file they empty is dropped, a file with a live delete file
-//!   gets a new one carrying each position's snapshot in its place, and any
-//!   other gets a delete file of its new positions. Matching
-//!   inlined rows are ended. Everything commits in a SINGLE snapshot (atomic
-//!   multi-file delete). The read path is already delete-aware, so a subsequent
-//!   `SELECT` excludes the deleted rows automatically.
-//! - **Delete-all** (no `WHERE`): every live row of every file is recorded the
-//!   same way — a file without inlined deletions over the limit is dropped
-//!   without reading its delete file — and every inlined row is ended, in one
-//!   snapshot. On a writer without staged row mutations it is a metadata-only
-//!   truncate that ends every live data file.
+//! - **Filtered delete** (a `WHERE` clause): for each live data file, resolve
+//!   the physical row positions matching the predicate and record them as
+//!   official DuckLake's `DuckLakeDelete::FlushDelete` does: within the scoped
+//!   `data_inlining_row_limit` they go to `ducklake_inlined_delete_<table_id>`;
+//!   above it, a file they empty is dropped and any other gets a new delete
+//!   file. Matching inlined rows are ended. Everything commits in one snapshot.
+//! - **Delete-all** (no `WHERE`): every live row is recorded the same way (a
+//!   file without inlined deletions over the limit is dropped without reading
+//!   its delete file) and every inlined row is ended, in one snapshot. On a
+//!   writer without staged row mutations it is a metadata-only truncate that
+//!   ends every live data file.
 //!
-//! A file rewritten by an UPDATE or by compaction is handled like any other. A
-//! delete file's `pos` is a row's physical index in the data file, which a
-//! rewrite leaves meaningful: the rewritten rows sit at `0..n-1`. What a rewrite
-//! disturbs is the rowid *sequence* — the surviving rowids carry holes where the
-//! applied deletes were, and the catalog records no `row_id_start` — and rowids
-//! are not what position resolution uses.
+//! A file rewritten by an UPDATE or by compaction is handled like any other: a
+//! delete file's `pos` is a physical row index, which a rewrite leaves
+//! meaningful. A rewrite only leaves holes in the rowid sequence, and position
+//! resolution does not use rowids.
 //!
 //! # Session lifecycle
 //!
