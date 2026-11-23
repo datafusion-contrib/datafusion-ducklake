@@ -1559,6 +1559,7 @@ mod sqlite {
     /// official's flush; this crate writes none, so it refuses to flush there,
     /// before writing anything, and `checkpoint` skips the flush.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(not(feature = "encryption"))]
     async fn encrypted_catalog_refuses_flush_and_checkpoint() {
         let dir = TempDir::new().unwrap();
         let backend = backend(&dir).await;

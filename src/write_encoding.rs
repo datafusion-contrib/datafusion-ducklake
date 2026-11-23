@@ -174,6 +174,7 @@ fn distinct_up_to(arrays: &[&ArrayRef], limit: usize) -> Result<usize> {
 /// leaves alone, and the pool that encodes the file's row groups.
 #[derive(Clone, Debug)]
 pub(crate) struct DataFileProperties {
+    pub(crate) encrypted: bool,
     pub(crate) props: WriterProperties,
     pub(crate) dictionary_set: Arc<HashSet<String>>,
     /// The top-level columns whose bloom filter the caller turned on or off in
@@ -189,10 +190,25 @@ impl From<WriterProperties> for DataFileProperties {
     fn from(props: WriterProperties) -> Self {
         Self {
             props,
+            encrypted: false,
             dictionary_set: Arc::default(),
             bloom_filter_set: Arc::default(),
             pool: None,
         }
+    }
+}
+
+impl DataFileProperties {
+    pub(crate) fn for_file(&self) -> Result<(Self, Option<String>)> {
+        let (props, key) =
+            crate::encryption::configure_file_encryption(self.props.clone(), self.encrypted)?;
+        Ok((
+            Self {
+                props,
+                ..self.clone()
+            },
+            key,
+        ))
     }
 }
 
@@ -615,6 +631,7 @@ mod tests {
         }
         DataFileProperties {
             props: builder.build(),
+            encrypted: false,
             dictionary_set: Arc::default(),
             bloom_filter_set: Arc::new(on.iter().chain(off).map(|c| c.to_string()).collect()),
             pool: None,

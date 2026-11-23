@@ -1237,9 +1237,16 @@ impl DuckLakeTableWriter {
     /// Without column settings, exactly the base properties.
     fn build_writer_props(&self, schema: &Schema) -> Result<DataFileProperties> {
         let base = self.base_writer_props();
+        let encrypted = self.metadata.catalog_encrypted()?;
+        let pool = if encrypted {
+            None
+        } else {
+            self.data_file_pool()
+        };
         if self.column_options.is_empty() {
             return Ok(DataFileProperties {
-                pool: self.data_file_pool(),
+                pool,
+                encrypted,
                 ..base.into()
             });
         }
@@ -1295,7 +1302,8 @@ impl DuckLakeTableWriter {
             props: builder.build(),
             dictionary_set: Arc::new(dictionary_set),
             bloom_filter_set: Arc::new(bloom_filter_set),
-            pool: self.data_file_pool(),
+            pool,
+            encrypted,
         })
     }
 
@@ -1649,7 +1657,7 @@ impl DuckLakeTableWriter {
         roll: bool,
         inline: bool,
     ) -> Result<TableWriteSession> {
-        self.refuse_encrypted_parquet("write a data file")?;
+        crate::inlined_flush::check_encrypted_write(self.metadata.as_ref(), "write a data file")?;
         let validation_schema =
             Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
@@ -1709,10 +1717,11 @@ impl DuckLakeTableWriter {
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
+        let (file_props, encryption_key) = props.for_file()?;
         let writer = DataFileWriter::try_new(
             staging,
             schema_with_ids.clone(),
-            props,
+            file_props,
             schema_with_ids.fields().len(),
         )?;
 
@@ -1802,6 +1811,7 @@ impl DuckLakeTableWriter {
             validation_schema,
             writer: Some(writer),
             temp: Some(temp),
+            encryption_key: encryption_key.map(StagedEncryptionKey),
             catalog_path,
             path_is_relative,
             mode,
@@ -2037,15 +2047,6 @@ impl DuckLakeTableWriter {
         session.finish().await
     }
 
-    /// Refuse to write a Parquet file for `operation` into an encrypted catalog
-    /// (see [`MetadataWriter::catalog_encrypted`]).
-    pub(crate) fn refuse_encrypted_parquet(&self, operation: &str) -> Result<()> {
-        if self.metadata.catalog_encrypted()? {
-            return Err(crate::inlined_flush::encrypted_catalog_error(operation));
-        }
-        Ok(())
-    }
-
     fn validation_schema(
         &self,
         schema_name: &str,
@@ -2203,7 +2204,6 @@ impl DuckLakeTableWriter {
         positions: &[i64],
         snapshots: Option<(&[i64], &mut Vec<ObjectPath>)>,
     ) -> Result<DeleteFileInfo> {
-        self.refuse_encrypted_parquet("write a delete file")?;
         use arrow::array::{Int64Array, StringArray};
 
         let table_key = self.table_key(schema_name, table_name)?;
@@ -2242,6 +2242,10 @@ impl DuckLakeTableWriter {
                 false,
             )
             .build();
+        let (props, encryption_key) = crate::encryption::configure_file_encryption(
+            props,
+            self.metadata.catalog_encrypted()?,
+        )?;
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = ArrowWriter::try_new(staging, schema, Some(props))?;
@@ -2263,6 +2267,7 @@ impl DuckLakeTableWriter {
         Ok(
             DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
                 .with_footer_size(footer_size)
+                .with_encryption_key(encryption_key)
                 .with_deleted_positions(positions),
         )
     }
@@ -2293,7 +2298,6 @@ impl DuckLakeTableWriter {
         roll_over: bool,
         written: &mut Vec<ObjectPath>,
     ) -> Result<Vec<DataFileInfo>> {
-        self.refuse_encrypted_parquet("write a data file")?;
         let table_key = self.table_key(schema_name, table_name)?;
         let schema_with_ids = {
             let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
@@ -2414,7 +2418,6 @@ impl DuckLakeTableWriter {
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
-        self.refuse_encrypted_parquet("write a compacted data file")?;
         let table_key = self.table_key(schema_name, table_name)?;
         // A compacted file of a partitioned table lands in its partition's Hive
         // directory, like every other write of that partition; the returned
@@ -2441,7 +2444,7 @@ impl DuckLakeTableWriter {
             Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
         };
 
-        let props = self.build_writer_props(&schema_with_ids)?;
+        let (props, encryption_key) = self.build_writer_props(&schema_with_ids)?.for_file()?;
 
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
@@ -2488,10 +2491,12 @@ impl DuckLakeTableWriter {
             stats_column_ids,
             row_count,
             &leaf_stats,
+            encryption_key.as_deref(),
         );
 
         Ok(DataFileInfo::new(file_name, file_size, row_count)
             .with_footer_size(footer_size)
+            .with_encryption_key(encryption_key)
             .with_column_stats(column_stats))
     }
 
@@ -2640,7 +2645,10 @@ impl DuckLakeTableWriter {
         )?;
         let inline = decision.inline;
         if !inline {
-            self.refuse_encrypted_parquet("write a data file")?;
+            crate::inlined_flush::check_encrypted_write(
+                self.metadata.as_ref(),
+                "write a data file",
+            )?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
@@ -2890,7 +2898,10 @@ impl DuckLakeTableWriter {
         )?;
         let inline = decision.inline;
         if !inline {
-            self.refuse_encrypted_parquet("write a data file")?;
+            crate::inlined_flush::check_encrypted_write(
+                self.metadata.as_ref(),
+                "write a data file",
+            )?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
@@ -3050,7 +3061,10 @@ impl DuckLakeTableWriter {
         )?;
         let inline = decision.inline;
         if records_written > 0 && !inline {
-            self.refuse_encrypted_parquet("write a data file")?;
+            crate::inlined_flush::check_encrypted_write(
+                self.metadata.as_ref(),
+                "write a data file",
+            )?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
@@ -3614,7 +3628,6 @@ impl DuckLakeTableWriter {
         column_ids: &[i64],
         batches: &[RecordBatch],
     ) -> Result<Vec<DataFileInfo>> {
-        self.refuse_encrypted_parquet("write a data file")?;
         let data_column_count = schema_with_ids.fields().len();
         let props = self.build_writer_props(&schema_with_ids)?;
         let mut roller = RollingFileWriter::new(
@@ -4622,6 +4635,15 @@ impl OpenWriter {
     }
 }
 
+#[derive(Clone)]
+struct StagedEncryptionKey(String);
+
+impl std::fmt::Debug for StagedEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 /// One parquet file being written to local staging.
 #[derive(Debug)]
 struct OpenFile {
@@ -4629,6 +4651,7 @@ struct OpenFile {
     temp: NamedTempFile,
     /// Path relative to the table directory (includes any Hive subpath).
     catalog_path: String,
+    encryption_key: Option<StagedEncryptionKey>,
     object_path: ObjectPath,
     row_count: i64,
     leaf_stats: crate::stats_collect::WrittenLeafStats,
@@ -4645,6 +4668,7 @@ struct OpenFile {
 struct StagedFile {
     temp: tempfile::TempPath,
     catalog_path: String,
+    encryption_key: Option<StagedEncryptionKey>,
     object_path: ObjectPath,
     row_count: i64,
     leaf_stats: crate::stats_collect::WrittenLeafStats,
@@ -4851,23 +4875,25 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
+        let (props, encryption_key) = self.props.for_file()?;
         let writer = if row_groups {
             OpenWriter::RowGroups(Box::new(RowGroupAppender::try_new(
                 staging,
                 self.schema_with_ids.clone(),
-                &self.props.props,
+                &props.props,
             )?))
         } else {
             OpenWriter::Sampled(Box::new(RowGroupSampledWriter::new(
                 staging,
                 self.schema_with_ids.clone(),
-                self.props.clone(),
+                props,
             )))
         };
         Ok(OpenFile {
             writer,
             temp,
             catalog_path,
+            encryption_key: encryption_key.map(StagedEncryptionKey),
             object_path,
             row_count: 0,
             leaf_stats: Default::default(),
@@ -4888,6 +4914,7 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
     Ok(StagedFile {
         temp: file.temp.into_temp_path(),
         catalog_path: file.catalog_path,
+        encryption_key: file.encryption_key,
         object_path: file.object_path,
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
@@ -4919,15 +4946,18 @@ async fn upload_staged_file(
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
 
+    let encryption_key = staged.encryption_key.map(|key| key.0);
     let column_stats = crate::stats_collect::collect_own_written_column_stats(
         &staged.temp,
         column_ids,
         staged.row_count,
         &staged.leaf_stats,
+        encryption_key.as_deref(),
     );
     Ok(
         DataFileInfo::new(&staged.catalog_path, file_size, staged.row_count)
             .with_footer_size(footer_size)
+            .with_encryption_key(encryption_key)
             .with_column_stats(column_stats),
     )
 }
@@ -5748,6 +5778,7 @@ pub struct TableWriteSession {
     temp: Option<NamedTempFile>,
     /// Path to register in catalog (may be relative filename or absolute path)
     catalog_path: String,
+    encryption_key: Option<StagedEncryptionKey>,
     /// Whether the catalog_path is relative to table path
     path_is_relative: bool,
     /// Replace vs Append; passed to `register_data_file` so the head advance and
@@ -6805,15 +6836,18 @@ impl TableWriteSession {
         // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
         // attach them for the catalog commit. Best-effort: on failure the file
         // is registered without stats, which is spec-safe.
+        let encryption_key = self.encryption_key.take().map(|key| key.0);
         let column_stats = crate::stats_collect::collect_own_written_column_stats(
             temp.path(),
             &self.column_ids,
             self.row_count,
             &leaf_stats,
+            encryption_key.as_deref(),
         );
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size)
+            .with_encryption_key(encryption_key)
             .with_column_stats(column_stats);
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
@@ -6995,9 +7029,9 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 
     let footer_bytes = &buffer[buffer.len() - 8..];
 
-    if &footer_bytes[4..8] != b"PAR1" {
+    if !matches!(&footer_bytes[4..8], b"PAR1" | b"PARE") {
         return Err(crate::error::DuckLakeError::Internal(
-            "Invalid Parquet file: missing PAR1 magic".to_string(),
+            "Invalid Parquet file: missing trailer magic".to_string(),
         ));
     }
 

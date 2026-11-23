@@ -1030,8 +1030,8 @@ impl DuckdbMetadataWriter {
             tx.execute(
                 "INSERT INTO ducklake_data_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -1042,6 +1042,7 @@ impl DuckdbMetadataWriter {
                     file.record_count,
                     row_ids.stored,
                     snapshot_id,
+                    file.encryption_key.as_deref(),
                 ],
             )?;
             insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
@@ -1719,8 +1720,8 @@ fn insert_flush_delete_file(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
               file_size_bytes, footer_size, delete_count, begin_snapshot, partial_max,
-              end_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              end_snapshot, encryption_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             delete_file_id,
             data_file_id,
@@ -1733,6 +1734,7 @@ fn insert_flush_delete_file(
             delete.begin_snapshot,
             delete.partial_max,
             delete.end_snapshot,
+            delete.delete.encryption_key.as_deref(),
         ],
     )?;
     Ok(())
@@ -2517,8 +2519,8 @@ fn apply_delete_entry(
     tx.execute(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
-              file_size_bytes, footer_size, delete_count, begin_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              file_size_bytes, footer_size, delete_count, begin_snapshot, encryption_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             delete_file_id,
             entry.data_file_id,
@@ -2528,7 +2530,8 @@ fn apply_delete_entry(
             entry.delete.file_size_bytes,
             entry.delete.footer_size,
             entry.delete.delete_count,
-            snapshot_id
+            snapshot_id,
+            entry.delete.encryption_key.as_deref(),
         ],
     )?;
     Ok(())
@@ -3022,8 +3025,8 @@ fn commit_staged_files(
         tx.execute(
             "INSERT INTO ducklake_data_file
                  (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 data_file_id,
                 write.table_id,
@@ -3033,7 +3036,8 @@ fn commit_staged_files(
                 file.footer_size,
                 file.record_count,
                 row_ids.stored,
-                snapshot_id
+                snapshot_id,
+                file.encryption_key.as_deref(),
             ],
         )?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats)?;
@@ -4256,8 +4260,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         tx.execute(
             "INSERT INTO ducklake_data_file
                  (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 data_file_id,
                 table_id,
@@ -4267,7 +4271,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 file.footer_size,
                 file.record_count,
                 row_ids.stored,
-                snapshot_id
+                snapshot_id,
+                file.encryption_key.as_deref(),
             ],
         )?;
 
@@ -4411,8 +4416,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             tx.execute(
                 "INSERT INTO ducklake_data_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -4422,7 +4427,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     file.footer_size,
                     file.record_count,
                     row_ids.stored,
-                    snapshot_id
+                    snapshot_id,
+                    file.encryption_key.as_deref(),
                 ],
             )?;
             insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
@@ -5266,8 +5272,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             tx.execute(
                 "INSERT INTO ducklake_data_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      footer_size, record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -5279,7 +5285,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     crate::metadata_writer::carried_row_id_start(&output.file),
                     begin_snapshot,
                     output.partial_max,
-                ],
+output.file.encryption_key.as_deref(),
+],
             )?;
             insert_file_column_stats(&tx, table_id, data_file_id, &output.file.column_stats)?;
             insert_partition_metadata(&tx, table_id, data_file_id, &output.file)?;
@@ -5352,8 +5359,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 tx.execute(
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         data_file_id,
                         table.table_id,
@@ -5365,7 +5372,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                         carried_row_id_start(&out.file),
                         out.begin_snapshot,
                         out.partial_max,
-                    ],
+out.file.encryption_key.as_deref(),
+],
                 )?;
                 insert_file_column_stats(
                     &tx,

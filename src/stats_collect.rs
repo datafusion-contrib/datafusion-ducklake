@@ -559,6 +559,7 @@ pub fn collect_column_stats(
         contains_nan_flags,
         None,
         NestedLeafIds::Skip,
+        None,
     )
 }
 
@@ -578,6 +579,7 @@ pub fn collect_written_column_stats(
         &leaves.nan_flags,
         Some(&leaves.bounds),
         NestedLeafIds::Skip,
+        None,
     )
 }
 
@@ -590,6 +592,7 @@ pub(crate) fn collect_own_written_column_stats(
     column_ids: &[i64],
     row_count: i64,
     leaves: &WrittenLeafStats,
+    encryption_key: Option<&str>,
 ) -> Vec<ColumnStat> {
     collect(
         path,
@@ -598,6 +601,7 @@ pub(crate) fn collect_own_written_column_stats(
         &leaves.nan_flags,
         Some(&leaves.bounds),
         NestedLeafIds::FileFieldIds,
+        encryption_key,
     )
 }
 
@@ -608,6 +612,7 @@ fn collect(
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
     nested: NestedLeafIds<'_>,
+    encryption_key: Option<&str>,
 ) -> Vec<ColumnStat> {
     match try_collect(
         path,
@@ -616,6 +621,7 @@ fn collect(
         contains_nan_flags,
         bounds,
         nested,
+        encryption_key,
     ) {
         Ok(stats) => stats,
         Err(e) => {
@@ -636,10 +642,12 @@ fn try_collect(
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
     nested: NestedLeafIds<'_>,
+    encryption_key: Option<&str>,
 ) -> crate::Result<Vec<ColumnStat>> {
     let file = std::fs::File::open(path)?;
     // Parses only the footer (no data pages are read).
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+    let options = crate::encryption::parquet_reader_options(encryption_key)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)
         .map_err(|e| crate::error::DuckLakeError::Internal(format!("parquet metadata: {e}")))?;
     // Use the reader's own reconstructed Arrow schema + parquet schema so
     // `StatisticsConverter`'s name/type match check always agrees (avoids the

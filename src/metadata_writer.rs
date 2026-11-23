@@ -1682,8 +1682,10 @@ pub enum RowIdStart {
 /// Information about a data file to register in the catalog.
 ///
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataFileInfo {
+    /// Base64-encoded Parquet encryption key recorded with this file.
+    pub(crate) encryption_key: Option<String>,
     /// Path to the file (relative to table path or absolute)
     pub path: String,
     /// Whether the path is relative to the table's path
@@ -1737,6 +1739,25 @@ pub struct DataFileInfo {
     pub row_id_floor: Option<i64>,
 }
 
+impl std::fmt::Debug for DataFileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataFileInfo")
+            .field("path", &self.path)
+            .field("path_is_relative", &self.path_is_relative)
+            .field("file_size_bytes", &self.file_size_bytes)
+            .field("footer_size", &self.footer_size)
+            .field("record_count", &self.record_count)
+            .field("encrypted", &self.encryption_key.is_some())
+            .field("column_stats", &self.column_stats)
+            .field("partition_id", &self.partition_id)
+            .field("partition_values", &self.partition_values)
+            .field("owner_catalog_id", &self.owner_catalog_id)
+            .field("row_id_start", &self.row_id_start)
+            .field("row_id_floor", &self.row_id_floor)
+            .finish()
+    }
+}
+
 impl DataFileInfo {
     /// Create a new data file info with relative path.
     ///
@@ -1752,6 +1773,7 @@ impl DataFileInfo {
             record_count
         );
         Self {
+            encryption_key: None,
             path: path.into(),
             path_is_relative: true,
             file_size_bytes,
@@ -1764,6 +1786,11 @@ impl DataFileInfo {
             row_id_start: RowIdStart::Assign,
             row_id_floor: None,
         }
+    }
+
+    pub(crate) fn with_encryption_key(mut self, key: Option<String>) -> Self {
+        self.encryption_key = key;
+        self
     }
 
     /// Set the footer size for read optimization.
@@ -2057,6 +2084,8 @@ pub(crate) fn validate_promoted_partition_values(
 /// Build it with [`DeleteFileInfo::new`].
 #[derive(Clone)]
 pub struct DeleteFileInfo {
+    /// Base64-encoded Parquet encryption key recorded with this file.
+    pub(crate) encryption_key: Option<String>,
     /// Path to the delete file (relative to the table path, or absolute).
     pub path: String,
     /// Whether the path is relative to the table's path.
@@ -2085,6 +2114,7 @@ impl std::fmt::Debug for DeleteFileInfo {
             .field("file_size_bytes", &self.file_size_bytes)
             .field("footer_size", &self.footer_size)
             .field("delete_count", &self.delete_count)
+            .field("encrypted", &self.encryption_key.is_some())
             .field("owner_catalog_id", &self.owner_catalog_id)
             .field(
                 "deleted_positions",
@@ -2108,6 +2138,7 @@ impl DeleteFileInfo {
             "delete_count must be non-negative, got {delete_count}"
         );
         Self {
+            encryption_key: None,
             path: path.into(),
             path_is_relative: true,
             file_size_bytes,
@@ -2116,6 +2147,11 @@ impl DeleteFileInfo {
             owner_catalog_id: None,
             deleted_positions: None,
         }
+    }
+
+    pub(crate) fn with_encryption_key(mut self, key: Option<String>) -> Self {
+        self.encryption_key = key;
+        self
     }
 
     /// Record the positions the file holds. A `DELETE` committing it then
@@ -3447,8 +3483,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn create_snapshot(&self) -> Result<i64>;
 
     /// Whether the catalog's `encrypted` option is `true`. Official DuckLake
-    /// writes such a catalog's Parquet files with Parquet Modular Encryption;
-    /// this crate refuses to write Parquet there.
+    /// writes such a catalog's Parquet files with Parquet Modular Encryption.
     fn catalog_encrypted(&self) -> Result<bool> {
         Ok(false)
     }

@@ -598,3 +598,155 @@ async fn test_memoized_scans_of_pme_encrypted_parquet() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_writes_flush_delete_and_rewrite() -> anyhow::Result<()> {
+    use datafusion_ducklake::compaction::RewriteOptions;
+    use datafusion_ducklake::{
+        DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    };
+    use object_store::local::LocalFileSystem;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let temp = TempDir::new()?;
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data)?;
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp.path().join("metadata.sqlite").display()
+    );
+    let writer = Arc::new(SqliteMetadataWriter::new_with_init(&connection).await?);
+    writer.set_data_path(data.to_str().unwrap())?;
+    writer.set_global_setting("data_inlining_row_limit", "10")?;
+    let pool = sqlx::SqlitePool::connect(&connection).await?;
+    sqlx::query("INSERT INTO ducklake_metadata (key, value) VALUES ('encrypted', 'true')")
+        .execute(&pool)
+        .await?;
+
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))?;
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7, 11, 13]))])?;
+    let written = table_writer.write_table("main", "t", &[batch]).await?;
+    assert_eq!(written.files_written, 0);
+
+    let ctx = SessionContext::new();
+    let provider = Arc::new(SqliteMetadataProvider::new(&connection).await?);
+    let catalog = DuckLakeCatalog::with_writer(provider, writer.clone())?;
+    let flushed = catalog
+        .flush_inlined_data(&ctx.state(), Some("main"), Some("t"))
+        .await?;
+    assert_eq!(flushed.len(), 1);
+    let (first_path, first_key): (String, String) = sqlx::query_as(
+        "SELECT path, encryption_key FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(File::open(data.join("main/t").join(first_path))?)
+            .is_err()
+    );
+
+    writer.set_global_setting("data_inlining_row_limit", "0")?;
+    DuckLakeCatalog::register(&ctx, "lake", catalog);
+    ctx.sql("DELETE FROM lake.main.t WHERE id = 11")
+        .await?
+        .collect()
+        .await?;
+    let (delete_path, delete_key): (String, String) = sqlx::query_as(
+        "SELECT path, encryption_key FROM ducklake_delete_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(first_key != delete_key);
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(File::open(
+            data.join("main/t").join(delete_path)
+        )?)
+        .is_err()
+    );
+
+    let table = ctx
+        .catalog("lake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await?
+        .unwrap();
+    let table = table.downcast_ref::<DuckLakeTable>().unwrap();
+    let rewrite = table
+        .rewrite_data_files(
+            &ctx.state(),
+            RewriteOptions {
+                delete_threshold: 0.01,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        (
+            rewrite.files_processed,
+            rewrite.files_created,
+            rewrite.rows_written
+        ),
+        (1, 1, 2)
+    );
+    let (rewritten_path, rewritten_key): (String, String) = sqlx::query_as(
+        "SELECT path, encryption_key FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(rewritten_key != first_key && rewritten_key != delete_key);
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(File::open(
+            data.join("main/t").join(rewritten_path)
+        )?)
+        .is_err()
+    );
+
+    let read = SessionContext::new();
+    read.register_catalog(
+        "lake",
+        Arc::new(DuckLakeCatalog::new(
+            SqliteMetadataProvider::new(&connection).await?,
+        )?),
+    );
+    let batches = read
+        .sql("SELECT id FROM lake.main.t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![7, 13]);
+    if let Some(duckdb) = std::env::var_os("DUCKDB_ENCRYPTION_ORACLE") {
+        writer.migrate_to_official_layout()?;
+        let sql = format!(
+            "INSTALL sqlite; LOAD sqlite; INSTALL ducklake; LOAD ducklake; \
+             ATTACH 'ducklake:sqlite:{}' AS lake; \
+             SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM lake.main.t;",
+            temp.path().join("metadata.sqlite").display(),
+        );
+        let result = std::process::Command::new(duckdb)
+            .args(["-no-agent", "-list", "-noheader", "-c", &sql])
+            .output()?;
+        assert!(
+            result.status.success(),
+            "DuckDB encrypted catalog read failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8(result.stdout)?.trim(), "7,13");
+    }
+    Ok(())
+}

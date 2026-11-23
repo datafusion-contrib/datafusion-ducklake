@@ -2041,6 +2041,7 @@ dependencies = [
  "datafusion-datasource-parquet",
  "duckdb",
  "futures",
+ "getrandom 0.3.3",
  "hex",
  "hyper-util",
  "object_store",

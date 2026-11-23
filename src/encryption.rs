@@ -1,4 +1,4 @@
-//! Encryption support for reading encrypted Parquet files in DuckLake.
+//! Encryption support for reading and writing encrypted Parquet files in DuckLake.
 //!
 //! This module provides integration with Parquet Modular Encryption (PME) using
 //! encryption keys stored in the DuckLake catalog.
@@ -72,6 +72,74 @@ use object_store::path::Path;
 use parquet::encryption::decrypt::FileDecryptionProperties;
 #[cfg(feature = "encryption")]
 use parquet::encryption::encrypt::FileEncryptionProperties;
+
+#[cfg(all(feature = "encryption", feature = "write"))]
+struct GeneratedFileEncryption {
+    pub(crate) catalog_key: String,
+    pub(crate) properties: Arc<FileEncryptionProperties>,
+}
+
+#[cfg(all(feature = "encryption", feature = "write"))]
+fn generate_file_encryption() -> crate::Result<GeneratedFileEncryption> {
+    use base64::Engine;
+
+    let mut key = [0_u8; 16];
+    getrandom::fill(&mut key).map_err(|e| {
+        crate::DuckLakeError::Internal(format!("failed to generate a Parquet encryption key: {e}"))
+    })?;
+    let properties = FileEncryptionProperties::builder(key.to_vec()).build()?;
+    let catalog_key = base64::engine::general_purpose::STANDARD.encode(key);
+    Ok(GeneratedFileEncryption {
+        catalog_key,
+        properties,
+    })
+}
+
+#[cfg(feature = "write")]
+pub(crate) fn configure_file_encryption(
+    props: parquet::file::properties::WriterProperties,
+    encrypted: bool,
+) -> crate::Result<(parquet::file::properties::WriterProperties, Option<String>)> {
+    if !encrypted {
+        return Ok((props, None));
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let encryption = generate_file_encryption()?;
+        let props = props
+            .into_builder()
+            .with_file_encryption_properties(encryption.properties)
+            .build();
+        Ok((props, Some(encryption.catalog_key)))
+    }
+    #[cfg(not(feature = "encryption"))]
+    Err(crate::inlined_flush::encrypted_catalog_error(
+        "write a Parquet file",
+    ))
+}
+
+#[cfg(feature = "write")]
+pub(crate) fn parquet_reader_options(
+    key: Option<&str>,
+) -> crate::Result<parquet::arrow::arrow_reader::ArrowReaderOptions> {
+    let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new();
+    let Some(key) = key else {
+        return Ok(options);
+    };
+    #[cfg(feature = "encryption")]
+    {
+        let bytes = DuckLakeEncryptionFactory::decode_key(key)?;
+        let properties = FileDecryptionProperties::builder(bytes).build()?;
+        Ok(options.with_file_decryption_properties(properties))
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = key;
+        Err(crate::inlined_flush::encrypted_catalog_error(
+            "read Parquet metadata",
+        ))
+    }
+}
 
 /// DuckLake encryption factory that provides decryption keys from the catalog.
 ///
@@ -220,7 +288,6 @@ impl EncryptionFactory for DuckLakeEncryptionFactory {
         _schema: &SchemaRef,
         _file_path: &Path,
     ) -> Result<Option<Arc<FileEncryptionProperties>>> {
-        // DuckLake is read-only for now, so we don't support writing encrypted files
         Ok(None)
     }
 
