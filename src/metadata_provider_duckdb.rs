@@ -865,6 +865,8 @@ struct SchemaCapabilities {
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// `ducklake_delete_file.format` exists.
+    delete_file_format: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
@@ -887,6 +889,7 @@ impl SchemaCapabilities {
     fn all(&self) -> bool {
         self.data_file_partial_max
             && self.delete_file_partial_max
+            && self.delete_file_format
             && self.inlined_data_tables
             && self.views
             && self.column_initial_default
@@ -1200,6 +1203,7 @@ impl DuckdbMetadataProvider {
         let (
             data_file_partial_max,
             delete_file_partial_max,
+            delete_file_format,
             inlined_data_tables,
             views,
             column_initial_default,
@@ -1208,12 +1212,26 @@ impl DuckdbMetadataProvider {
             column_default_value_dialect,
             schema_versions,
             data_file_partition_id,
-        ): (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) = conn.query_row(
+        ): (
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
                 WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
+                WHERE name = 'format') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
                 WHERE table_name = 'ducklake_inlined_data_tables') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
@@ -1243,12 +1261,14 @@ impl DuckdbMetadataProvider {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
+            delete_file_format,
             inlined_data_tables,
             views,
             column_initial_default,
@@ -3068,7 +3088,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
     ) -> crate::Result<Vec<DeleteFileChange>> {
         let conn = self.connection()?;
 
-        let mut stmt = conn.prepare(SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
+        let legacy_sql;
+        let sql = if self.schema_capabilities(&conn)?.delete_file_format {
+            SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS
+        } else {
+            legacy_sql =
+                SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.replace("df.format", "NULL AS format");
+            &legacy_sql
+        };
+        let mut stmt = conn.prepare(sql)?;
 
         let files = stmt
             .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
@@ -3191,6 +3219,7 @@ mod tests {
     const LEGACY_CAPABILITIES: SchemaCapabilities = SchemaCapabilities {
         data_file_partial_max: false,
         delete_file_partial_max: false,
+        delete_file_format: false,
         inlined_data_tables: false,
         views: false,
         column_initial_default: false,
@@ -3608,6 +3637,7 @@ mod tests {
         let capabilities = SchemaCapabilities {
             data_file_partial_max: false,
             delete_file_partial_max: false,
+            delete_file_format: false,
             inlined_data_tables: false,
             views: false,
             column_initial_default: false,
