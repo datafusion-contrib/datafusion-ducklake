@@ -233,6 +233,9 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
+    /// Retry policy for staged commits that can re-date a rewritten delete file
+    /// or accept a concurrent deletion of disjoint positions.
+    pub conflict_retry: Option<ConflictRetryConfig>,
     /// How many threads encode a write's data files, row group by row group;
     /// `None` leaves the writer default (1: the thread that writes, one batch
     /// at a time). Clamped to at least 1. Above 1, each row group is encoded
@@ -497,6 +500,7 @@ impl DuckLakeWriteOptions {
             )?,
             max_open_partitions: None,
             upload_concurrency: None,
+            conflict_retry: None,
             encode_parallelism: None,
             encode_pool: None,
             // Official sorts only while the option reads exactly `true`.
@@ -550,6 +554,13 @@ impl DuckLakeWriteOptions {
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Sets the policy for retryable staged commits.
+    #[must_use]
+    pub fn with_conflict_retry(mut self, config: ConflictRetryConfig) -> Self {
+        self.conflict_retry = Some(config);
         self
     }
 
@@ -612,6 +623,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.upload_concurrency.is_some() {
             self.upload_concurrency = overrides.upload_concurrency;
+        }
+        if overrides.conflict_retry.is_some() {
+            self.conflict_retry = overrides.conflict_retry;
         }
         if overrides.encode_parallelism.is_some() {
             self.encode_parallelism = overrides.encode_parallelism;
@@ -866,25 +880,38 @@ pub(crate) struct RewrittenDelete {
     pub(crate) source: RewrittenDeleteSource,
 }
 
-/// Attempts of a staged commit whose rewritten delete files must be re-dated
-/// because other snapshots landed first: official DuckLake's default
-/// `ducklake_max_retry_count`, which bounds its attempts, the first included.
-const MAX_COMMIT_ATTEMPTS: u32 = 10;
+/// Retry limits for a staged commit whose changes can still commute with the catalog head.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConflictRetryConfig {
+    /// Retries after the first commit attempt. A value of 0 disables retries.
+    pub max_count: u32,
+    /// Delay before the first retry, before jitter. Each delay is capped at 60 seconds.
+    pub wait: std::time::Duration,
+    /// Finite, positive multiplier for successive retry delays.
+    pub backoff: f64,
+}
 
-/// Official DuckLake's default `ducklake_retry_wait_ms`.
-const RETRY_WAIT_MS: f64 = 100.0;
+impl Default for ConflictRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_count: 10,
+            wait: std::time::Duration::from_millis(100),
+            backoff: 1.5,
+        }
+    }
+}
 
-/// Official DuckLake's default `ducklake_retry_backoff`.
-const RETRY_BACKOFF: f64 = 1.5;
-
-/// The wait before the attempt after failed attempt `attempt` (0-based), as
-/// official waits: `retry_wait_ms * [0.5, 1.0) * retry_backoff ^ attempt`.
-fn retry_wait(attempt: u32) -> std::time::Duration {
-    let random = (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64;
-    let multiplier = (random + 1.0) / 2.0;
-    std::time::Duration::from_secs_f64(
-        RETRY_WAIT_MS * multiplier * RETRY_BACKOFF.powi(attempt as i32) / 1_000.0,
-    )
+impl ConflictRetryConfig {
+    fn delay(self, attempt: u32) -> std::time::Duration {
+        if self.wait.is_zero() {
+            return self.wait;
+        }
+        let random = (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64;
+        let seconds = self.wait.as_secs_f64()
+            * ((random + 1.0) / 2.0)
+            * self.backoff.powf(f64::from(attempt));
+        std::time::Duration::from_secs_f64(seconds.min(60.0))
+    }
 }
 
 /// A set of table changes committed in one DuckLake snapshot.
@@ -967,6 +994,7 @@ pub struct DuckLakeTableWriter {
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
     upload_concurrency: usize,
+    conflict_retry: ConflictRetryConfig,
     /// Threads that encode a write's row groups. Defaults to 1; override via
     /// [`DuckLakeTableWriter::with_encode_parallelism`].
     encode_parallelism: usize,
@@ -1038,6 +1066,7 @@ impl DuckLakeTableWriter {
             write_batch_size: None,
             column_options: HashMap::new(),
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            conflict_retry: ConflictRetryConfig::default(),
             encode_parallelism: 1,
             encode_pool: None,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
@@ -1178,6 +1207,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
+        }
+        if let Some(config) = options.conflict_retry {
+            self.conflict_retry = config;
         }
         if let Some(threads) = options.encode_parallelism {
             self.encode_parallelism = threads.max(1);
@@ -4189,8 +4221,9 @@ impl DuckLakeWriteTransaction<'_> {
     /// snapshots first, the commit is refused; the deletions are then re-dated
     /// to the snapshot after the catalog's latest, the delete files written
     /// again (removing those of the refused attempt), and the commit retried
-    /// after official DuckLake's backoff, for at most 10 attempts as its
-    /// default `ducklake_max_retry_count` allows; then it fails with
+    /// with the configured backoff, for up to [`ConflictRetryConfig::max_count`]
+    /// retries after the initial attempt. DuckLake defaults to ten retries.
+    /// Once the commit exhausts its retries, it fails with
     /// official's "Exceeded the maximum retry count" error.
     /// An inlined deletion of rows of a data file that got a delete file since
     /// the statement read it is retried, within the same attempts, when that
@@ -4200,6 +4233,14 @@ impl DuckLakeWriteTransaction<'_> {
     pub async fn commit(mut self) -> Result<Vec<WriteResult>> {
         if self.writes.is_empty() {
             return Ok(Vec::new());
+        }
+        let retry = self.writer.conflict_retry;
+        if !retry.backoff.is_finite() || retry.backoff <= 0.0 {
+            return Err(self
+                .fail_cleaned(crate::DuckLakeError::InvalidConfig(
+                    "conflict retry backoff must be finite and positive".to_string(),
+                ))
+                .await);
         }
         let mut attempt = 0;
         let committed = loop {
@@ -4223,7 +4264,8 @@ impl DuckLakeWriteTransaction<'_> {
             // read is retried when that delete file deletes none of its rows,
             // as official commits both.
             if let Some(data_file_id) = crate::metadata_writer::changed_delete_file_of(&e)
-                && attempt + 1 < MAX_COMMIT_ATTEMPTS
+                && self.expected_base_snapshot_id.is_none()
+                && attempt < retry.max_count
                 && self.accept_disjoint_delete_file(data_file_id).await
             {
                 attempt += 1;
@@ -4232,7 +4274,9 @@ impl DuckLakeWriteTransaction<'_> {
             // Only the refusal of a rewritten delete file's date is retried, as
             // official retries only a commit that lost the race for its
             // snapshot id and passes the conflict check.
-            let redate = if crate::metadata_writer::is_rewritten_delete_conflict(&e) {
+            let redate = if self.expected_base_snapshot_id.is_none()
+                && crate::metadata_writer::is_rewritten_delete_conflict(&e)
+            {
                 match self.redate_target() {
                     Ok(date) => date,
                     Err(target) => return Err(self.fail_cleaned(target).await),
@@ -4241,19 +4285,23 @@ impl DuckLakeWriteTransaction<'_> {
                 None
             };
             if let Some(date) = redate {
-                attempt += 1;
-                if attempt >= MAX_COMMIT_ATTEMPTS {
+                if attempt >= retry.max_count {
                     return Err(self
                         .fail_cleaned(crate::error::DuckLakeError::Conflict(format!(
                             "Failed to commit DuckLake transaction.\nExceeded the maximum retry \
-                             count of {MAX_COMMIT_ATTEMPTS} set by the ducklake_max_retry_count \
+                             count of {} set by the ducklake_max_retry_count \
                              setting.\n. Consider increasing the value with: e.g., \"SET \
                              ducklake_max_retry_count = {};\"\n{e}",
-                            MAX_COMMIT_ATTEMPTS * 10
+                            retry.max_count,
+                            retry.max_count.saturating_mul(10).max(10)
                         )))
                         .await);
                 }
-                tokio::time::sleep(retry_wait(attempt - 1)).await;
+                let delay = retry.delay(attempt);
+                attempt += 1;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 if let Err(redate) = self.redate(date).await {
                     return Err(self.fail_cleaned(redate).await);
                 }

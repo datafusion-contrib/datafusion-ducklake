@@ -2686,9 +2686,13 @@ pub(crate) mod redate {
     }
 
     /// A statement whose every commit attempt loses to a commit to another
-    /// table re-dates and retries for official's 10 attempts, then fails with
+    /// table re-dates and retries for DuckLake's 10 retries, then fails with
     /// official's error, leaving no object behind.
-    pub(crate) async fn retries_stop_after_ten_attempts(side: &CrateSide) {
+    pub(crate) async fn retries_stop_after_ten_retries(side: &CrateSide) {
+        retries_stop_at_limit(side, None).await;
+    }
+
+    async fn retries_stop_at_limit(side: &CrateSide, limit: Option<u32>) {
         setup(side).await;
         let other = CrateSide {
             writer: Arc::clone(&side.writer),
@@ -2724,6 +2728,19 @@ pub(crate) mod redate {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::clone(&side.provider), Arc::clone(&side.writer))
                 .unwrap();
+        let catalog = match limit {
+            Some(max_count) => {
+                catalog.with_write_options(DuckLakeWriteOptions::default().with_conflict_retry(
+                    datafusion_ducklake::ConflictRetryConfig {
+                        max_count,
+                        wait: std::time::Duration::ZERO,
+                        ..Default::default()
+                    },
+                ))
+            },
+            None => catalog,
+        };
+        let max_count = limit.unwrap_or(10);
         DuckLakeCatalog::register(&ctx, "lake", catalog);
         let error = ctx
             .sql("DELETE FROM lake.main.t WHERE id BETWEEN 20 AND 26")
@@ -2738,15 +2755,15 @@ pub(crate) mod redate {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(
             error.contains(
-                "Failed to commit DuckLake transaction.\nExceeded the maximum retry count of 10 \
+                &format!("Failed to commit DuckLake transaction.\nExceeded the maximum retry count of {max_count} \
                  set by the ducklake_max_retry_count setting.\n. Consider increasing the value \
-                 with: e.g., \"SET ducklake_max_retry_count = 100;\"\n"
+                 with: e.g., \"SET ducklake_max_retry_count = {};\"\n", max_count * 10)
             ),
             "{error}"
         );
         assert_eq!(
             store.puts.load(std::sync::atomic::Ordering::SeqCst),
-            10,
+            max_count as usize + 1,
             "one delete file per attempt"
         );
         assert_eq!(live_delete_files(side), 1);
@@ -2949,8 +2966,13 @@ pub(crate) mod redate {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn retries_stop_after_ten_attempts() {
-            run(|side| Box::pin(super::retries_stop_after_ten_attempts(side))).await;
+        async fn retries_stop_after_ten_retries() {
+            run(|side| Box::pin(super::retries_stop_after_ten_retries(side))).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn retries_stop_at_configured_limit() {
+            run(|side| Box::pin(super::retries_stop_at_limit(side, Some(2)))).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -3147,8 +3169,8 @@ pub(crate) mod redate {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn retries_stop_after_ten_attempts() {
-            run(|side| Box::pin(super::retries_stop_after_ten_attempts(side))).await;
+        async fn retries_stop_after_ten_retries() {
+            run(|side| Box::pin(super::retries_stop_after_ten_retries(side))).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]

@@ -807,7 +807,9 @@ value), where official dates them to the snapshot after the one it read
 refused, the deletions are re-dated to the snapshot after the catalog's latest, the
 delete file is written again (the refused attempt's file is removed), and the commit
 retried after official's backoff (`100 ms × [0.5, 1) × 1.5^attempt`), for at most
-official's default `ducklake_max_retry_count` of 10 attempts, after which it fails
+DuckLake's default `ducklake_max_retry_count` of ten retries after the first attempt. Set
+`DuckLakeWriteOptions::conflict_retry` to override the limit and backoff. When
+the commit exhausts its attempts, it fails
 with official's "Exceeded the maximum retry count" error. Commits to other tables or
 other files do not abort it; a concurrent rewrite of the same delete file,
 or the data file ended or dropped, aborts it with a conflict. On PostgreSQL,
