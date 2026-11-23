@@ -91,6 +91,7 @@ pub mod table_functions;
 #[cfg(test)]
 mod test_alloc;
 pub mod types;
+pub(crate) mod variant;
 pub(crate) mod view;
 
 // Metadata providers (feature-gated)

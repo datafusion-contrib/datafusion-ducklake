@@ -591,7 +591,8 @@ pub(crate) fn coerce_column(
     col: &arrow::array::ArrayRef,
     target: &arrow::datatypes::DataType,
 ) -> DataFusionResult<arrow::array::ArrayRef> {
-    use arrow::array::Array;
+    use arrow::array::{Array, StructArray};
+    use arrow::datatypes::DataType;
 
     let is_nested = matches!(
         target,
@@ -603,6 +604,28 @@ pub(crate) fn coerce_column(
     );
     if col.data_type() == target && !is_nested {
         return Ok(Arc::clone(col));
+    }
+
+    if target == &crate::types::variant_data_type()
+        && matches!(col.data_type(), DataType::Struct(_))
+    {
+        let col = variant_metadata_as_unsorted(col)?;
+        let variant = parquet::variant::VariantArray::try_new(col.as_ref())
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let variant = parquet::variant::unshred_variant(&variant)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let metadata = arrow::compute::cast(variant.metadata_column(), &DataType::BinaryView)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let value = arrow::compute::cast(variant.value_column(), &DataType::BinaryView)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        return Ok(Arc::new(StructArray::new(
+            match target {
+                DataType::Struct(fields) => fields.clone(),
+                _ => unreachable!(),
+            },
+            vec![metadata, value],
+            variant.inner().nulls().cloned(),
+        )));
     }
 
     let casted = if col.data_type() == target {
@@ -698,6 +721,52 @@ pub(crate) fn record_batch_with_schema(
         .collect::<Vec<_>>();
     let actual_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
     RecordBatch::try_new(actual_schema, columns)?.with_schema(schema)
+}
+
+fn variant_metadata_as_unsorted(
+    col: &arrow::array::ArrayRef,
+) -> DataFusionResult<arrow::array::ArrayRef> {
+    use arrow::array::{Array, ArrayRef, BinaryViewArray, BinaryViewBuilder, StructArray};
+    use arrow::datatypes::{DataType, Field};
+
+    let input = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        DataFusionError::Execution("VARIANT storage must be a struct array".to_string())
+    })?;
+    let metadata_index = input
+        .fields()
+        .iter()
+        .position(|field| field.name() == "metadata")
+        .ok_or_else(|| {
+            DataFusionError::Execution("VARIANT storage has no metadata field".to_string())
+        })?;
+    let metadata = arrow::compute::cast(input.column(metadata_index), &DataType::BinaryView)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let metadata = metadata.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+    let mut builder = BinaryViewBuilder::with_capacity(metadata.len());
+    for row in 0..metadata.len() {
+        if metadata.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let mut value = metadata.value(row).to_vec();
+        if let Some(header) = value.first_mut() {
+            // DuckDB 1.5.5 can set the sorted-dictionary optimization bit while
+            // retaining insertion order. The offsets and strings remain valid;
+            // clearing the bit selects the specification's linear lookup path.
+            *header &= !0x10;
+        }
+        builder.append_value(value);
+    }
+
+    let mut fields = input.fields().iter().cloned().collect::<Vec<_>>();
+    fields[metadata_index] = Arc::new(Field::new("metadata", DataType::BinaryView, false));
+    let mut columns = input.columns().to_vec();
+    columns[metadata_index] = Arc::new(builder.finish()) as ArrayRef;
+    Ok(Arc::new(StructArray::new(
+        fields.into(),
+        columns,
+        input.nulls().cloned(),
+    )))
 }
 
 #[cfg(test)]

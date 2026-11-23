@@ -45,6 +45,7 @@ use crate::types::{
     build_read_schema_with_name_mapping, ducklake_to_arrow_type, extract_parquet_field_ids,
     normalize_list_element_names, parse_ducklake_default_scalar, parse_ducklake_scalar,
 };
+use crate::variant::VariantInt64Predicate;
 
 #[cfg(feature = "write")]
 use crate::delete_exec::DuckLakeDeleteExec;
@@ -2286,6 +2287,7 @@ impl DuckLakeTable {
         inlined_filter: Option<&InlinedFilter>,
         stats_filter: Option<&StatsFilter>,
         pruning: &[PruningPredicate],
+        variant_pruning: &[VariantInt64Predicate],
     ) -> DataFusionResult<ScanCatalogReads> {
         let inlined_deletes = self.inlined_deletes_by_file()?;
         'read: for _ in 0..SCAN_READ_ATTEMPTS {
@@ -2301,6 +2303,7 @@ impl DuckLakeTable {
                 if written_since(&metadata, next_file_id) {
                     continue 'read;
                 }
+                let metadata = self.prune_variant_files(metadata, variant_pruning)?;
                 let (table_files, mut file_statistics, mut summary_statistics) =
                     self.page_files_with_both_statistics(metadata);
                 #[cfg(feature = "encryption")]
@@ -2332,6 +2335,44 @@ impl DuckLakeTable {
         Err(DataFusionError::External(Box::new(
             inlined_rows_kept_moving(&self.table_name),
         )))
+    }
+
+    fn prune_variant_files(
+        &self,
+        mut metadata: Vec<DuckLakeFileMetadata>,
+        predicates: &[VariantInt64Predicate],
+    ) -> DataFusionResult<Vec<DuckLakeFileMetadata>> {
+        if predicates.is_empty() || metadata.is_empty() {
+            return Ok(metadata);
+        }
+        let mut ids = metadata.iter().map(|entry| entry.file.data_file_id);
+        let first = ids.next().expect("nonempty page");
+        let (low, high) = ids.fold((first, first), |(low, high), id| {
+            (low.min(id), high.max(id))
+        });
+        let statistics = self
+            .provider
+            .get_file_variant_statistics(
+                self.table_id,
+                self.snapshot_id,
+                low.saturating_sub(1),
+                high,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut by_file = HashMap::<_, Vec<_>>::new();
+        for stat in statistics {
+            by_file.entry(stat.data_file_id).or_default().push(stat);
+        }
+        metadata.retain(|entry| {
+            let stats = by_file
+                .get(&entry.file.data_file_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            predicates
+                .iter()
+                .all(|predicate| predicate.may_match(stats))
+        });
+        Ok(metadata)
     }
 
     /// Page the catalog's file metadata, optionally handing the provider a
@@ -6710,6 +6751,11 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
+        let variant_pruning: Vec<_> = filters
+            .iter()
+            .flat_map(datafusion::logical_expr::utils::split_conjunction)
+            .filter_map(|expr| VariantInt64Predicate::from_expr(expr, &self.columns))
+            .collect();
         // The inlined deletions, the inlined rows and every page of the
         // listing, read in one consistent read of the catalog and pruned page
         // by page (`Self::scan_catalog_reads`). Building the scans below reads
@@ -6724,6 +6770,7 @@ impl TableProvider for DuckLakeTable {
                 inlined_filter.as_ref(),
                 stats_filter.as_ref(),
                 &pruning,
+                &variant_pruning,
             )
         })?;
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();

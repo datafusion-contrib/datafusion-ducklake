@@ -2015,6 +2015,60 @@ impl MetadataProvider for DuckdbMetadataProvider {
         })
     }
 
+    fn get_file_variant_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: i64,
+        last_data_file_id: i64,
+    ) -> crate::Result<Vec<crate::metadata_provider::DuckLakeFileVariantStatistics>> {
+        let conn = self.connection()?;
+        Ok(
+            match conn.prepare(
+                "SELECT stats.data_file_id, stats.column_id, stats.variant_path,
+                    stats.shredded_type, stats.value_count, stats.null_count,
+                    stats.min_value, stats.max_value, stats.contains_nan
+             FROM ducklake_file_variant_stats AS stats
+             INNER JOIN ducklake_data_file AS data
+               ON data.data_file_id = stats.data_file_id
+              AND data.table_id = stats.table_id
+             WHERE stats.table_id = ?
+               AND ? >= data.begin_snapshot
+               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+               AND stats.data_file_id > ?
+               AND stats.data_file_id <= ?
+             ORDER BY stats.data_file_id, stats.column_id, stats.variant_path",
+            ) {
+                Ok(mut statement) => statement
+                    .query_map(
+                        params![
+                            table_id,
+                            snapshot_id,
+                            snapshot_id,
+                            after_data_file_id,
+                            last_data_file_id
+                        ],
+                        |row| {
+                            Ok(crate::metadata_provider::DuckLakeFileVariantStatistics {
+                                data_file_id: row.get(0)?,
+                                column_id: row.get(1)?,
+                                variant_path: row.get(2)?,
+                                shredded_type: row.get(3)?,
+                                value_count: row.get(4)?,
+                                null_count: row.get(5)?,
+                                min_value: row.get(6)?,
+                                max_value: row.get(7)?,
+                                contains_nan: row.get(8)?,
+                            })
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?,
+                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            },
+        )
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

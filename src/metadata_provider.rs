@@ -2373,7 +2373,8 @@ pub fn reconstruct_columns(
 
 fn reconstructed_column_type(catalog_type: &str, data_type: &DataType) -> Result<String> {
     let normalized = catalog_type.trim().to_ascii_lowercase();
-    let preserves_logical_name = matches!(data_type, DataType::Binary)
+    let preserves_logical_name = normalized == "variant"
+        || matches!(data_type, DataType::Binary)
         || matches!(data_type, DataType::Utf8View)
             && !matches!(normalized.as_str(), "varchar" | "text" | "string");
     if preserves_logical_name {
@@ -2570,6 +2571,20 @@ pub struct DuckLakeFileColumnStatistics {
     pub min_value: Option<String>,
     pub max_value: Option<String>,
     /// Tri-state NaN flag; see [`DuckLakeTableColumnStatistics::contains_nan`].
+    pub contains_nan: Option<bool>,
+}
+
+/// A row from `ducklake_file_variant_stats` for one fully shredded path.
+#[derive(Debug, Clone)]
+pub struct DuckLakeFileVariantStatistics {
+    pub data_file_id: i64,
+    pub column_id: i64,
+    pub variant_path: String,
+    pub shredded_type: String,
+    pub value_count: Option<i64>,
+    pub null_count: Option<i64>,
+    pub min_value: Option<String>,
+    pub max_value: Option<String>,
     pub contains_nan: Option<bool>,
 }
 
@@ -2965,6 +2980,17 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// `after_data_file_id` is exclusive. Implementations must return records
     /// ordered by `data_file_id` and no more than `limit` records. Built-in SQL
     /// providers override this with bounded catalog queries; the default keeps
+    /// Read shredded VARIANT statistics for a range of visible data file IDs.
+    fn get_file_variant_statistics(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _after_data_file_id: i64,
+        _last_data_file_id: i64,
+    ) -> Result<Vec<DuckLakeFileVariantStatistics>> {
+        Ok(Vec::new())
+    }
+
     /// external providers source-compatible, although it is not memory-bounded.
     fn get_table_file_metadata_page(
         &self,

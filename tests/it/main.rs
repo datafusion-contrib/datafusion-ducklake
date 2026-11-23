@@ -141,6 +141,7 @@ mod test_alloc;
 mod time_travel_tests;
 mod topn_file_pruning_tests;
 mod type_promotion_tests;
+mod variant_tests;
 mod view_tests;
 mod write_encoding_tests;
 mod write_inlining_tests;
