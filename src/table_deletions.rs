@@ -422,18 +422,30 @@ impl FeedFiles<'_> {
                 Some(p) => {
                     let resolved =
                         self.resolve(p, dfc.current_delete_path_is_relative.unwrap_or(true))?;
-                    let snapshot_name = self
-                        .delete_file_snapshot_name(
-                            state,
-                            &resolved,
-                            dfc.current_delete_file_size_bytes,
-                            dfc.current_delete_footer_size,
-                        )
-                        .await?;
+                    let snapshot_name =
+                        if dfc.current_delete_format == crate::DuckLakeDeleteFileFormat::Puffin {
+                            let store = state.runtime_env().object_store(self.object_store_url)?;
+                            crate::deletion_vector::deletion_vector_has_snapshots(
+                                store.as_ref(),
+                                &resolved,
+                                dfc.current_delete_file_size_bytes.unwrap_or(0),
+                            )
+                            .await?
+                            .then(|| crate::table::DELETE_SNAPSHOT_COL.to_string())
+                        } else {
+                            self.delete_file_snapshot_name(
+                                state,
+                                &resolved,
+                                dfc.current_delete_file_size_bytes,
+                                dfc.current_delete_footer_size,
+                            )
+                            .await?
+                        };
                     Some(DeleteFileRef {
                         path: resolved,
                         size_bytes: dfc.current_delete_file_size_bytes.unwrap_or(0),
                         footer_size: dfc.current_delete_footer_size.unwrap_or(0),
+                        format: dfc.current_delete_format,
                         snapshot_name,
                     })
                 },
@@ -456,6 +468,7 @@ impl FeedFiles<'_> {
                     path: self.resolve(p, dfc.previous_delete_path_is_relative.unwrap_or(true))?,
                     size_bytes: dfc.previous_delete_file_size_bytes.unwrap_or(0),
                     footer_size: dfc.previous_delete_footer_size.unwrap_or(0),
+                    format: dfc.previous_delete_format,
                     snapshot_name: None,
                 }),
                 _ => None,
@@ -620,6 +633,12 @@ impl FeedFiles<'_> {
         state: &dyn Session,
         file: &DeleteFileRef,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if file.format == crate::DuckLakeDeleteFileFormat::Puffin {
+            return Ok(crate::deletion_vector::DeletionVectorExec::new(
+                file.path.clone(),
+                self.object_store_url.clone(),
+            ));
+        }
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url)?;
         let mut pf = PartitionedFile::new(
             &file.path,
@@ -949,6 +968,7 @@ pub(crate) fn file_scan_bytes(plan: &Arc<dyn ExecutionPlan>) -> u64 {
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileRef {
     path: String,
+    format: crate::DuckLakeDeleteFileFormat,
     size_bytes: i64,
     footer_size: i64,
     /// The physical name of the file's per-row snapshot column, when it is

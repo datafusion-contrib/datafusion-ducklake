@@ -2057,6 +2057,8 @@ pub(crate) fn validate_promoted_partition_values(
 /// Build it with [`DeleteFileInfo::new`].
 #[derive(Clone)]
 pub struct DeleteFileInfo {
+    /// The physical encoding of this delete file.
+    pub format: crate::DuckLakeDeleteFileFormat,
     /// Path to the delete file (relative to the table path, or absolute).
     pub path: String,
     /// Whether the path is relative to the table's path.
@@ -2108,6 +2110,7 @@ impl DeleteFileInfo {
             "delete_count must be non-negative, got {delete_count}"
         );
         Self {
+            format: crate::DuckLakeDeleteFileFormat::Parquet,
             path: path.into(),
             path_is_relative: true,
             file_size_bytes,
@@ -2116,6 +2119,12 @@ impl DeleteFileInfo {
             owner_catalog_id: None,
             deleted_positions: None,
         }
+    }
+
+    /// Set the file's physical encoding.
+    pub fn with_format(mut self, format: crate::DuckLakeDeleteFileFormat) -> Self {
+        self.format = format;
+        self
     }
 
     /// Record the positions the file holds. A `DELETE` committing it then

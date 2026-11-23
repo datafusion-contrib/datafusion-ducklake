@@ -887,7 +887,7 @@ pub fn delete_file_schema() -> SchemaRef {
 
 /// [`delete_file_schema`] with the per-deletion snapshot column a delete file may
 /// carry; a file without it reads the column as NULL.
-fn delete_file_read_schema() -> SchemaRef {
+pub(crate) fn delete_file_read_schema() -> SchemaRef {
     let mut fields: Vec<Field> = delete_file_schema()
         .fields()
         .iter()
@@ -3372,6 +3372,13 @@ impl DuckLakeTable {
         selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
     ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
+        if delete_file.delete_format == crate::DuckLakeDeleteFileFormat::Puffin {
+            let scan = crate::deletion_vector::DeletionVectorExec::new(
+                resolved_delete_path.clone(),
+                self.object_store_url.as_ref().clone(),
+            );
+            return Ok((scan, resolved_delete_path));
+        }
         let mut pf = PartitionedFile::new(
             &resolved_delete_path,
             validated_file_size(delete_file.file_size_bytes, &resolved_delete_path)?,
@@ -3566,6 +3573,17 @@ impl DuckLakeTable {
         let Some(delete_file) = &table_file.delete_file else {
             return Ok(deleted);
         };
+        if delete_file.delete_format == crate::DuckLakeDeleteFileFormat::Puffin {
+            let positions = self
+                .read_visible_delete_file_positions(state, delete_file)
+                .await?;
+            deleted.extend(
+                candidates
+                    .iter()
+                    .filter(|position| positions.contains(position)),
+            );
+            return Ok(deleted);
+        }
         let read_snapshot = Some(self.snapshot_id);
         let resolved_path = self.resolve_file_path(delete_file)?;
         let context = state.task_ctx();

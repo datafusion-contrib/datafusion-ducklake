@@ -432,6 +432,19 @@ fn query_data_file_page(
                 let (delete_file, delete_count) = if delete_file_id.is_some() {
                     (
                         Some(DuckLakeFileData {
+                            delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                row.get::<_, Option<String>>("format")
+                                    .ok()
+                                    .flatten()
+                                    .as_deref(),
+                            )
+                            .map_err(|e| {
+                                duckdb::Error::FromSqlConversionFailure(
+                                    0,
+                                    duckdb::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?,
                             path: row.get(9)?,
                             path_is_relative: row.get(10)?,
                             file_size_bytes: row.get(11)?,
@@ -447,6 +460,7 @@ fn query_data_file_page(
                 Ok(DuckLakeTableFile {
                     data_file_id: row.get(0)?,
                     file: DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
                         file_size_bytes: row.get(3)?,
@@ -851,6 +865,8 @@ struct SchemaCapabilities {
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// `ducklake_delete_file.format` exists.
+    delete_file_format: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
@@ -873,6 +889,7 @@ impl SchemaCapabilities {
     fn all(&self) -> bool {
         self.data_file_partial_max
             && self.delete_file_partial_max
+            && self.delete_file_format
             && self.inlined_data_tables
             && self.views
             && self.column_initial_default
@@ -1186,6 +1203,7 @@ impl DuckdbMetadataProvider {
         let (
             data_file_partial_max,
             delete_file_partial_max,
+            delete_file_format,
             inlined_data_tables,
             views,
             column_initial_default,
@@ -1194,12 +1212,26 @@ impl DuckdbMetadataProvider {
             column_default_value_dialect,
             schema_versions,
             data_file_partition_id,
-        ): (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) = conn.query_row(
+        ): (
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
                 WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
+                WHERE name = 'format') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
                 WHERE table_name = 'ducklake_inlined_data_tables') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
@@ -1229,12 +1261,14 @@ impl DuckdbMetadataProvider {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
+            delete_file_format,
             inlined_data_tables,
             views,
             column_initial_default,
@@ -1812,6 +1846,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     // Parse data file (columns 0-7)
                     let data_file_id: i64 = row.get(0)?;
                     let data_file = DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
                         file_size_bytes: row.get(3)?,
@@ -1827,6 +1862,19 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
                             (
                                 Some(DuckLakeFileData {
+                                    delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                        row.get::<_, Option<String>>("format")
+                                            .ok()
+                                            .flatten()
+                                            .as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        duckdb::Error::FromSqlConversionFailure(
+                                            0,
+                                            duckdb::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
                                     path: row.get(9)?,
                                     path_is_relative: row.get(10)?,
                                     file_size_bytes: row.get(11)?,
@@ -2884,6 +2932,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     // Column 2 is data_file_id; columns 3-7 are the data file.
                     let data_file_id: i64 = row.get(2)?;
                     let data_file = DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(3)?,
                         path_is_relative: row.get(4)?,
                         file_size_bytes: row.get(5)?,
@@ -2897,6 +2946,19 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
                             (
                                 Some(DuckLakeFileData {
+                                    delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                        row.get::<_, Option<String>>("format")
+                                            .ok()
+                                            .flatten()
+                                            .as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        duckdb::Error::FromSqlConversionFailure(
+                                            0,
+                                            duckdb::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
                                     path: row.get(9)?,
                                     path_is_relative: row.get(10)?,
                                     file_size_bytes: row.get(11)?,
@@ -3026,7 +3088,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
     ) -> crate::Result<Vec<DeleteFileChange>> {
         let conn = self.connection()?;
 
-        let mut stmt = conn.prepare(SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
+        let legacy_sql;
+        let sql = if self.schema_capabilities(&conn)?.delete_file_format {
+            SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS
+        } else {
+            legacy_sql =
+                SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.replace("df.format", "NULL AS format");
+            &legacy_sql
+        };
+        let mut stmt = conn.prepare(sql)?;
 
         let files = stmt
             .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
@@ -3046,12 +3116,32 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     current_delete_path_is_relative: row.get(8)?,
                     current_delete_file_size_bytes: row.get(9)?,
                     current_delete_footer_size: row.get(10)?,
+                    current_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                        row.get::<_, Option<String>>(17)?.as_deref(),
+                    )
+                    .map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(
+                            17,
+                            duckdb::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
 
                     // previous delete
                     previous_delete_path: row.get(11)?,
                     previous_delete_path_is_relative: row.get(12)?,
                     previous_delete_file_size_bytes: row.get(13)?,
                     previous_delete_footer_size: row.get(14)?,
+                    previous_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                        row.get::<_, Option<String>>(18)?.as_deref(),
+                    )
+                    .map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(
+                            18,
+                            duckdb::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
 
                     // snapshot
                     snapshot_id: row.get(15)?,
@@ -3093,7 +3183,7 @@ fn file_provenance_sql(sql: &str, capabilities: SchemaCapabilities) -> String {
     sql.replacen(
         "\n    FROM ",
         &format!(
-            ",\n        data.begin_snapshot,\n        {schema_version},\n        {partial_max},\n        {partition_id}\n    FROM "
+            ",\n        data.begin_snapshot,\n        {schema_version},\n        {partial_max},\n        {partition_id},\n        to_json(del)->>'format' AS format\n    FROM "
         ),
         1,
     )
@@ -3129,6 +3219,7 @@ mod tests {
     const LEGACY_CAPABILITIES: SchemaCapabilities = SchemaCapabilities {
         data_file_partial_max: false,
         delete_file_partial_max: false,
+        delete_file_format: false,
         inlined_data_tables: false,
         views: false,
         column_initial_default: false,
@@ -3546,6 +3637,7 @@ mod tests {
         let capabilities = SchemaCapabilities {
             data_file_partial_max: false,
             delete_file_partial_max: false,
+            delete_file_format: false,
             inlined_data_tables: false,
             views: false,
             column_initial_default: false,

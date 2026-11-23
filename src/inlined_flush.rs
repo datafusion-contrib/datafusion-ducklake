@@ -1138,7 +1138,8 @@ async fn plan_file_deletes(
                 if merge || retired_with_deletes {
                     let path = resolve_path(table.table_path(), &file.path, file.path_is_relative)?;
                     for (position, snapshot) in
-                        read_delete_file(object_store, &path, *begin_snapshot).await?
+                        read_delete_file(object_store, &path, *begin_snapshot, file.delete_format)
+                            .await?
                     {
                         deletions
                             .entry(position)
@@ -1211,7 +1212,17 @@ async fn read_delete_file(
     object_store: &dyn ObjectStore,
     path: &str,
     begin_snapshot: i64,
+    format: crate::DuckLakeDeleteFileFormat,
 ) -> Result<Vec<(i64, i64)>> {
+    if format == crate::DuckLakeDeleteFileFormat::Puffin {
+        return Ok(
+            crate::deletion_vector::read_deletion_entries(object_store, path)
+                .await?
+                .into_iter()
+                .map(|(position, snapshot)| (position, snapshot.unwrap_or(begin_snapshot)))
+                .collect(),
+        );
+    }
     let bytes = object_store
         .get(&ObjectPath::from(path.trim_start_matches('/')))
         .await?

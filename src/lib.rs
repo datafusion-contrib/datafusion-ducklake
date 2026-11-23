@@ -60,6 +60,7 @@ pub mod change_detection;
 pub mod column_rename;
 pub mod delete_filter;
 mod delete_memo;
+mod deletion_vector;
 pub mod encryption;
 pub mod error;
 mod feed_charge;
@@ -178,9 +179,9 @@ pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
-    ColumnTag, ConsistentRead, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush,
-    DuckLakeInlinedFlushData, DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag,
-    SnapshotChangeMetadata, TagObjectType, TagTarget,
+    ColumnTag, ConsistentRead, DuckLakeDeleteFileFormat, DuckLakeFileData,
+    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeTableFile, DuckLakeTag,
+    MetadataProvider, ObjectTag, SnapshotChangeMetadata, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use partition_counts::{PartitionCountUnknown, PartitionRowCount};

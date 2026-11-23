@@ -42,10 +42,9 @@ pub const MULTICATALOG_LAYOUT_VERSION_KEY: &str = "datafusion_ducklake_multicata
 /// so [`MIN_VERSION`] stays 1.
 pub const LAYOUT_VERSION: u64 = 2;
 
-/// The multicatalog layout version this release writes. Version 2 adds the
-/// `(table_id, column_id)` file-statistics index (#403); older releases ignore
-/// it, so [`MULTICATALOG_MIN_VERSION`] stays 1.
-pub const MULTICATALOG_LAYOUT_VERSION: u64 = 2;
+/// The multicatalog layout version this release writes. Version 3 records
+/// which physical format each delete file uses.
+pub const MULTICATALOG_LAYOUT_VERSION: u64 = 3;
 
 /// The `ducklake_metadata` key holding the oldest single-catalog layout
 /// version whose release may still read and write the catalog.
@@ -73,7 +72,7 @@ pub const MIN_VERSION: u64 = 1;
 
 /// The oldest multicatalog layout version whose release may write a store at
 /// [`MULTICATALOG_LAYOUT_VERSION`]; see [`MIN_VERSION`].
-pub const MULTICATALOG_MIN_VERSION: u64 = 1;
+pub const MULTICATALOG_MIN_VERSION: u64 = 3;
 
 /// A layout this crate writes, and the one a database might hold instead.
 #[derive(Debug, Clone, Copy)]

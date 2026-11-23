@@ -38,6 +38,7 @@ mod ctas_tests;
 mod data_page_write_options_tests;
 mod delete_conflict_tests;
 mod delete_filter_tests;
+mod deletion_vector_tests;
 mod duckdb_attach_reads_written_files_tests;
 mod early_upload_tests;
 mod empty_data_file_tests;
