@@ -176,26 +176,30 @@ pub enum WriteMode {
 
 /// `value` as official's `ducklake_set_option` stores option `key`
 /// (`ducklake_set_option.cpp`), or official's error for a value it refuses.
+/// Every value arrives as text and is cast as official casts the literal:
 ///
-/// This crate takes every value as text, and casts it as official casts the
-/// string literal it spells: `sort_on_insert`, `auto_compact`,
-/// `per_thread_output` and `write_deletion_vectors` are cast to `BOOLEAN`
-/// (`'T'`, `'yes'`, `'1'` are `true`) and stored as `true` or `false`;
-/// `hive_file_pattern` and `require_commit_message`, which official reads with
-/// `Value::GetValue<bool>()`, are cast to `TINYINT` and stored as `true` when
-/// not zero (`'2'` and `'0.5'` are `true`, `'0.4'` is `false`, and `'true'`
-/// or `'128'` fail to cast); `parquet_compression` is checked
-/// against official's codecs and lowercased; `parquet_version` is stored as
-/// `V1` or `V2`; `parquet_compression_level`, `parquet_row_group_size` and
-/// `data_inlining_row_limit` are cast to `UBIGINT` (`'1.5'` is `2`, a
-/// negative value fails); `target_file_size` and
-/// `parquet_row_group_size_bytes` are parsed as DuckDB's memory limits
-/// (`'512MB'`; a bare number has no unit and fails, as in official) and
-/// stored in bytes; `rewrite_delete_threshold` is cast to `DOUBLE`, checked
-/// to lie in `[0, 1]` and stored as C++'s `std::to_string` prints it
-/// (`0.500000`); `delete_older_than` and `expire_older_than` are checked to be
-/// empty or an interval. A key official does not know is refused, as
-/// official refuses it ("Unsupported option <key>").
+/// - `sort_on_insert`, `auto_compact`, `per_thread_output`,
+///   `write_deletion_vectors`: cast to `BOOLEAN` (`'T'`, `'yes'`, `'1'` are
+///   true), stored as `true` or `false`.
+/// - `hive_file_pattern`, `require_commit_message` (read by official with
+///   `Value::GetValue<bool>()`): cast to `TINYINT`, stored as `true` when not
+///   zero (`'2'` and `'0.5'` are true, `'0.4'` is false; `'true'` and `'128'`
+///   fail to cast).
+/// - `parquet_compression`: checked against official's codecs, lowercased.
+/// - `parquet_version`: stored as `V1` or `V2`.
+/// - `parquet_compression_level`, `parquet_row_group_size`,
+///   `data_inlining_row_limit`: cast to `UBIGINT` (`'1.5'` is `2`; a negative
+///   value fails).
+/// - `target_file_size`, `parquet_row_group_size_bytes`: parsed as DuckDB
+///   memory limits (`'512MB'`; a bare number has no unit and fails), stored in
+///   bytes.
+/// - `rewrite_delete_threshold`: cast to `DOUBLE`, checked to lie in `[0, 1]`,
+///   stored as C++'s `std::to_string` prints it (`0.500000`).
+/// - `delete_older_than`, `expire_older_than`: checked to be empty or an
+///   interval.
+///
+/// A key official does not know is refused, as official refuses it
+/// (`Unsupported option <key>`).
 pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> {
     use crate::duckdb_cast::{
         double_to_std_string, parse_memory_limit, varchar_to_boolean, varchar_to_double,

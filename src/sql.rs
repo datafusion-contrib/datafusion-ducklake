@@ -1,23 +1,17 @@
-//! SQL entry point for DuckLake metadata and data-layout DDL,
-//! `CREATE TABLE … AS SELECT`, and `MERGE INTO`.
+//! SQL entry point for DuckLake metadata and data-layout DDL, `CREATE TABLE …
+//! AS SELECT`, and `MERGE INTO`.
 //!
-//! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
-//! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
-//! any `LogicalPlan` exists, so a custom `QueryPlanner`/analyzer can never
-//! intercept it. Instead, [`execute_ducklake_sql`] is a transparent wrapper the
-//! caller uses in place of [`SessionContext::sql`]: it recognizes these DDL forms
-//! and `COMMENT ON`, using DataFusion's bundled sqlparser with no new dependency,
-//! then dispatches them to the programmatic
-//! [`MetadataWriter`] API on the given
-//! [`DuckLakeCatalog`], handles DuckLake `MERGE INTO`, and delegates everything
-//! else to `ctx.sql(sql)` unchanged.
+//! DataFusion's SQL parser rejects `ALTER TABLE … SET PARTITIONED BY (…)` and
+//! `… SET SORTED BY (…)` before any `LogicalPlan` exists, so no planner hook
+//! can intercept them. [`execute_ducklake_sql`] is a drop-in replacement for
+//! [`SessionContext::sql`]: it handles these forms, `COMMENT ON`, `MERGE INTO`
+//! and CTAS through the [`MetadataWriter`] API on the given
+//! [`DuckLakeCatalog`], and passes everything else to `ctx.sql(sql)` unchanged.
 //!
-//! `CREATE TABLE … AS SELECT` (CTAS) also runs here. DataFusion executes a CTAS
-//! by materializing the query into a `MemTable` and handing it to the schema's
-//! synchronous `register_table`, which has neither the session's object stores
-//! nor a runtime to write data files. The wrapper instead plans the query on
-//! `ctx`, derives the table columns from its schema, and writes the rows and the
-//! table metadata in one DuckLake snapshot through the session's object store.
+//! CTAS runs here because DataFusion's own CTAS hands a `MemTable` to the
+//! schema's synchronous `register_table`, which has no object store or runtime
+//! to write data files. The wrapper plans the query on `ctx` and writes the
+//! rows and the table metadata in one DuckLake snapshot.
 //!
 //! ```no_run
 //! # async fn run(ctx: &datafusion::prelude::SessionContext,

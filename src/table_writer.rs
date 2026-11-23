@@ -3313,7 +3313,7 @@ impl DuckLakeTableWriter {
 
     /// The id the catalog's next snapshot is expected to take, or `None` when
     /// the backend does not say
-    /// ([`MetadataWriter::next_snapshot_id`](crate::metadata_writer::MetadataWriter::next_snapshot_id)).
+    /// ([`MetadataWriter::next_snapshot_id`]).
     pub(crate) fn next_snapshot_id(&self) -> Result<Option<i64>> {
         self.metadata.next_snapshot_id()
     }

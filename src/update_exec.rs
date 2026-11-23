@@ -1,43 +1,32 @@
 //! DuckLake `UPDATE` execution plan.
 //!
-//! [`DuckLakeUpdateExec`] is the physical operator DataFusion's planner lowers
-//! `UPDATE t SET col = expr ... [WHERE p]` onto (via
+//! [`DuckLakeUpdateExec`] is the physical operator DataFusion lowers `UPDATE t
+//! SET col = expr ... [WHERE p]` onto (via
 //! [`TableProvider::update`](datafusion::catalog::TableProvider::update)). All
-//! work is deferred to execute time so planning / `EXPLAIN` never mutate data:
+//! work happens at execute time, so planning and `EXPLAIN` never mutate data:
 //!
-//! 1. For each source data file that may hold matching rows, collect its
-//!    pre-built positional scan, select the rows matching the predicate, apply
-//!    the assignments, and produce rewritten row versions that RETAIN each row's
-//!    original rowid (written into NEW data file(s) that embed the rowid column,
-//!    so lineage survives the rewrite). On a partitioned table each rewritten row
-//!    is routed by its OWN post-assignment key values, so an assignment that
-//!    changes a partition key MOVES the row to its new partition; the rewrite then
-//!    spans one file per output partition.
-//! 2. Delete the superseded row versions from each source file.
-//! 3. Commit ATOMICALLY: the new row versions and every deletion land in ONE
-//!    snapshot.
-//! 4. Yield a single row `count: UInt64` = rows updated.
+//! 1. For each source file that may hold matching rows, select the matching
+//! rows from its positional scan, apply the assignments, and write the new row
+//! versions to new data files that embed each row's original rowid. On a
+//! partitioned table each row is routed by its post-assignment key, so changing
+//! a partition key moves the row. 2. Delete the superseded row versions from
+//! each source file. 3. Commit the new versions and every deletion in one
+//! snapshot. 4. Yield a single row `count: UInt64`, the rows updated.
 //!
-//! On a writer that [stages row mutations](MetadataWriter::supports_inlined_row_mutations)
-//! the statement follows official DuckLake's UPDATE, a delete of the old row
-//! versions plus an insert of the new ones that keep their row ids
-//! (`ducklake_update.cpp`): visible inlined rows are updated too, their old
-//! versions ended; each source file's superseded rows are deleted as a `DELETE`
-//! deletes them, so at most the scoped `data_inlining_row_limit` are recorded in
-//! `ducklake_inlined_delete_<table_id>`, a file the statement empties is
-//! dropped, and a live delete file is replaced by one carrying each position's
-//! snapshot; and when the statement writes at most the limit's rows, the new
-//! versions are inlined with their row ids rather than written to Parquet. A
-//! statement needing any of these commits as one staged write
-//! ([`MetadataWriter::commit_multi_table`]); otherwise the rewritten files and
-//! new delete files commit through
+//! On a writer that [stages row
+//! mutations](MetadataWriter::supports_inlined_row_mutations) the statement
+//! follows official DuckLake's UPDATE (`ducklake_update.cpp`): visible inlined
+//! rows are updated too, superseded rows are deleted as a `DELETE` deletes
+//! them, and new versions are inlined with their row ids when the statement
+//! writes at most the scoped `data_inlining_row_limit`. Such a statement
+//! commits as one staged write ([`MetadataWriter::commit_multi_table`]);
+//! otherwise rewritten files and delete files commit through
 //! [`MetadataWriter::register_data_files_with_deletes`], driven by
-//! `TableWriteSession::finish_with_deletes`. Any other writer gets each source
-//! file's cumulative delete file (superseded rows unioned with the already
-//! deleted ones).
+//! `TableWriteSession::finish_with_deletes`. Other writers get each source
+//! file's cumulative delete file.
 //!
-//! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
-//! collects matched rows into memory before writing; runs in a single DataFusion
+//! Limitations, shared with [`DuckLakeInsertExec`](crate::insert_exec): matched
+//! rows are collected in memory before writing, and the plan runs in a single
 //! output partition.
 //!
 //! # Session lifecycle
