@@ -2,34 +2,29 @@
 //! reader may do with the catalog it opens.
 //!
 //! A catalog this crate creates records its layout version in
-//! `ducklake_metadata` under [`LAYOUT_VERSION_KEY`] (or
-//! [`MULTICATALOG_LAYOUT_VERSION_KEY`] for the PostgreSQL multicatalog layout).
-//! Opening a writer reads those rows and official DuckDB's `version` row, and
-//! nothing else: a current catalog runs no DDL. The rows are catalog-wide, and
-//! the read names no other column, so it also works on a catalog from before
-//! `ducklake_metadata` had a `scope` column.
+//! `ducklake_metadata` under [`LAYOUT_VERSION_KEY`]
+//! ([`MULTICATALOG_LAYOUT_VERSION_KEY`] for the PostgreSQL multicatalog
+//! layout). Opening a writer reads those rows and official DuckDB's `version`
+//! row, and runs no DDL on a current catalog. The read names no other column,
+//! so it works on catalogs from before `ducklake_metadata` had a `scope`
+//! column.
 //!
-//! A catalog at an older layout version, or one an earlier release created
-//! without recording a version, is refused until the caller runs the writer's
-//! `migrate` function. Migration is never automatic, as in official DuckDB,
-//! which migrates only when attached with `AUTOMATIC_MIGRATION`.
+//! - **Older or unrecorded layout version:** refused until the caller runs the
+//!   writer's `migrate` function. Migration is never automatic, as in official
+//!   DuckDB without `AUTOMATIC_MIGRATION`.
+//! - **Newer layout version:** read and written as it is when its minimum
+//!   version ([`MIN_VERSION_KEY`], or [`MULTICATALOG_MIN_VERSION_KEY`]) is at
+//!   most this release's layout version, refused otherwise. `migrate` leaves it
+//!   alone.
+//! - **Created by official DuckDB** (a `version` row and no crate layout
+//!   version): refused by writers, and never changed. The crate's layout
+//!   version is its own, not official's `version`.
 //!
-//! A catalog at a newer layout version is read and written as it is when its
-//! minimum version ([`MIN_VERSION_KEY`], or [`MULTICATALOG_MIN_VERSION_KEY`])
-//! is at most this release's layout version, and refused otherwise. `migrate`
-//! leaves it alone.
-//!
-//! A read provider checks the version once, before its first catalog read, as
-//! official DuckDB checks once per `ATTACH`. It refuses only a catalog whose
-//! minimum version is above this release's; a catalog at an older or no
-//! layout version, or one official DuckDB created, reads as it is. A provider
-//! or writer already open is not checked again, so a release that raises the
-//! minimum version needs the older releases stopped before it migrates.
-//!
-//! The crate's layout version is its own, not official's `version`, and the
-//! crate writes and migrates only catalogs it created: a catalog official
-//! DuckDB created (it has `version` and no crate layout version) is refused,
-//! and nothing here changes it.
+//! A read provider checks once, before its first catalog read, as official
+//! checks once per `ATTACH`, and refuses only a catalog whose minimum version
+//! is above this release's. An open provider or writer is not checked again, so
+//! a release that raises the minimum version needs older releases stopped
+//! before it migrates.
 
 use crate::{DuckLakeError, Result};
 

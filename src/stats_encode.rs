@@ -1,35 +1,31 @@
 //! DuckDB-canonical value → `VARCHAR` encoding for DuckLake column statistics.
 //!
-//! DuckLake stores per-file column `min_value` / `max_value` as `VARCHAR` in
-//! `ducklake_file_column_stats`, using the exact text DuckDB's `Value::ToString()`
-//! produces (see the official extension: `DuckLakeUtil::StatsToString` /
-//! `ColumnStatsUnifier::StatsToString`). For a catalog written here to be prunable
-//! by DuckDB — and for round-trip pruning to agree — these strings must be
-//! **byte-identical** to what DuckDB writes for the same logical value.
-//!
-//! This module is the single source of truth for that encoding. Every rule below
-//! was verified against a real `duckdb` CLI (`CAST(<value> AS VARCHAR)`); the
-//! `tests` module pins those golden outputs.
+//! DuckLake stores per-file `min_value` / `max_value` as `VARCHAR` in
+//! `ducklake_file_column_stats`, using the exact text DuckDB's
+//! `Value::ToString()` produces (official: `DuckLakeUtil::StatsToString`). For
+//! DuckDB to prune a catalog written here, and for pruning to agree both ways,
+//! these strings must be **byte-identical** to DuckDB's. This module is the
+//! single source of truth for that encoding; the `tests` module pins golden
+//! outputs verified against the `duckdb` CLI.
 //!
 //! ## Coverage
 //!
-//! Encoded exactly (min/max emitted): signed/unsigned integers, `BOOLEAN`,
-//! `FLOAT`/`DOUBLE`, `DECIMAL(p,s)` (128-bit), `DATE`, and `TIMESTAMP` with or
-//! without a time zone (all Arrow time units). Timezone-bearing timestamps are
-//! normalized to UTC so their encoding is independent of the DuckDB session
-//! time zone.
+//! Encoded exactly: signed and unsigned integers, `BOOLEAN`, `FLOAT`/`DOUBLE`,
+//! `DECIMAL(p,s)` (128-bit), `DATE`, and `TIMESTAMP` with or without a time
+//! zone (all units). Time-zoned timestamps are normalized to UTC, independent
+//! of the DuckDB session time zone.
 //!
-//! Deliberately **not** encoded yet — [`encode_scalar`] returns `None`, so the
-//! caller stores `min_value`/`max_value` as `NULL` and the file is never pruned on
-//! that column (spec-safe: DuckLake keeps files whose stats are NULL). Deferred:
-//! - `TIME`, `BLOB`/`BINARY` (DuckLake never prunes on blobs anyway), `UUID`,
-//!   `INTERVAL`, `DECIMAL256`, and all nested types (`STRUCT`/`LIST`/`MAP`).
-//!   File statistics ([`encode_file_stat`]) and the bounds of inlined rows
+//! Not encoded by [`encode_scalar`], which returns `None` so the stat is stored
+//! as `NULL` and the column never prunes (DuckLake keeps files with NULL
+//! stats):
+//!
+//! - `TIME`, `BLOB`/`BINARY`, `UUID`, `INTERVAL`, `DECIMAL256` and nested
+//!   types. File statistics ([`encode_file_stat`]) and inlined-row bounds
 //!   ([`inline_stat_text`]) write `TIME` and `BLOB` as official does.
-//! - Over-long strings (see [`MAX_STRING_STAT_BYTES`]) in [`encode_scalar`].
-//!   File statistics arrive already truncated as DuckDB's Parquet writer
-//!   truncates them (see [`crate::stats_collect::StringBounds`]), and the
-//!   bounds of inlined rows keep the whole value, as official's do.
+//! - Strings longer than [`MAX_STRING_STAT_BYTES`]. File statistics arrive
+//!   truncated as DuckDB's Parquet writer truncates them
+//!   ([`crate::stats_collect::StringBounds`]), and inlined-row bounds keep the
+//!   whole value, as official's do.
 
 use datafusion::common::ScalarValue;
 
