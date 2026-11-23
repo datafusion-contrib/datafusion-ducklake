@@ -120,6 +120,8 @@ pub(crate) mod duckdb_cast;
 #[cfg(feature = "write-postgres")]
 pub mod fork;
 #[cfg(feature = "write")]
+mod geometry_stats;
+#[cfg(feature = "write")]
 pub mod inlined_flush;
 #[cfg(any(
     feature = "write-sqlite",

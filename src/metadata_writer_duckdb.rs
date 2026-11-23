@@ -2192,7 +2192,7 @@ fn insert_file_column_stats(
             "INSERT INTO ducklake_file_column_stats
                  (data_file_id, table_id, column_id, column_size_bytes,
                   value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 data_file_id,
                 table_id,
@@ -2203,6 +2203,7 @@ fn insert_file_column_stats(
                 stat.min_value.as_deref(),
                 stat.max_value.as_deref(),
                 stat.contains_nan,
+                stat.extra_stats.as_deref(),
             ],
         )?;
     }
@@ -2288,7 +2289,7 @@ fn load_table_column_stats(
     table_id: i64,
 ) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
     let mut statement = tx.prepare(
-        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
+        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value, s.extra_stats
          FROM ducklake_table_column_stats s
          WHERE s.table_id = ?
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
@@ -2312,6 +2313,7 @@ fn load_table_column_stats(
                 contains_nan: row.get(2)?,
                 min_value: row.get(3)?,
                 max_value: row.get(4)?,
+                extra_stats: row.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -2323,17 +2325,6 @@ fn store_table_column_stats(
     table_id: i64,
     globals: Vec<crate::stats_encode::GlobalColumnStat>,
 ) -> Result<()> {
-    // A kept row keeps its `extra_stats` (a `GEOMETRY` column's bounds), which
-    // this crate does not compute.
-    let mut statement = tx.prepare(
-        "SELECT column_id, extra_stats FROM ducklake_table_column_stats
-         WHERE table_id = ? AND extra_stats IS NOT NULL",
-    )?;
-    let extra = statement
-        .query_map(params![table_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
     tx.execute(
         "DELETE FROM ducklake_table_column_stats WHERE table_id = ?",
         params![table_id],
@@ -2350,7 +2341,7 @@ fn store_table_column_stats(
                 g.contains_nan,
                 g.min_value,
                 g.max_value,
-                extra.get(&g.column_id),
+                g.extra_stats.as_ref(),
             ],
         )?;
     }

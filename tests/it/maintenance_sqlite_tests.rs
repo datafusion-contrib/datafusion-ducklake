@@ -1232,6 +1232,7 @@ async fn expire_leaves_no_stats_behind_for_a_retired_file_id() {
     let stats = |ids: &[i64]| -> Vec<ColumnStat> {
         ids.iter()
             .map(|&column_id| ColumnStat {
+                extra_stats: None,
                 column_id,
                 min_value: Some("1".to_string()),
                 max_value: Some("9".to_string()),

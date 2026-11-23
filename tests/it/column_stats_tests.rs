@@ -10,15 +10,20 @@
 // 3.14 etc. below are deliberate float test data, not approximations of π.
 #![allow(clippy::approx_constant)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::geometry_stats_fixture::EXTRA_STATS;
 use arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "metadata-duckdb")]
+use datafusion_ducklake::DuckdbMetadataProvider;
+use datafusion_ducklake::MetadataProvider;
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
     SqliteMetadataWriter,
@@ -1148,6 +1153,7 @@ async fn register_refuses_duplicate_column_stats() {
         .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
         .unwrap();
     let stat = |min: &str, max: &str| ColumnStat {
+        extra_stats: None,
         column_id: setup.column_ids[0],
         min_value: Some(min.to_string()),
         max_value: Some(max.to_string()),
@@ -1180,4 +1186,144 @@ async fn register_refuses_duplicate_column_stats() {
         .await
         .unwrap();
     assert_eq!(stored, 0);
+}
+
+fn geometry_schema() -> Arc<Schema> {
+    let metadata = HashMap::from([
+        (
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkb".to_string(),
+        ),
+        ("ARROW:extension:metadata".to_string(), "{}".to_string()),
+    ]);
+    Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Binary, false).with_metadata(metadata),
+    ]))
+}
+
+fn geometry_batch() -> RecordBatch {
+    let mut point = vec![1];
+    point.extend_from_slice(&1_u32.to_le_bytes());
+    point.extend_from_slice(&1.0_f64.to_le_bytes());
+    point.extend_from_slice(&2.0_f64.to_le_bytes());
+
+    let mut line = vec![1];
+    line.extend_from_slice(&1002_u32.to_le_bytes());
+    line.extend_from_slice(&2_u32.to_le_bytes());
+    for value in [5.0_f64, 5.0, 5.0, 10.0, 10.0, 10.0] {
+        line.extend_from_slice(&value.to_le_bytes());
+    }
+
+    RecordBatch::try_new(
+        geometry_schema(),
+        vec![Arc::new(BinaryArray::from(vec![
+            Some(point.as_slice()),
+            Some(line.as_slice()),
+        ]))],
+    )
+    .unwrap()
+}
+
+fn table_geometry_stats(provider: &dyn MetadataProvider) -> (Option<String>, Option<String>) {
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .list_schemas(snapshot)
+        .unwrap()
+        .into_iter()
+        .find(|schema| schema.schema_name == "main")
+        .unwrap();
+    let table = provider
+        .list_tables(schema.schema_id, snapshot)
+        .unwrap()
+        .into_iter()
+        .find(|table| table.table_name == "t")
+        .unwrap();
+    let stats = provider
+        .get_table_statistics(table.table_id, snapshot)
+        .unwrap();
+    let summary = provider
+        .get_table_summary_statistics(table.table_id, snapshot)
+        .unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table.table_id, snapshot, None, 10)
+        .unwrap();
+    assert_eq!(stats.columns.len(), 1);
+    assert_eq!(stats.files.len(), 1);
+    assert_eq!(summary.columns.len(), 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].column_statistics.len(), 1);
+    assert_eq!(summary.columns[0].extra_stats, stats.columns[0].extra_stats);
+    assert_eq!(
+        page[0].column_statistics[0].extra_stats,
+        stats.files[0].extra_stats
+    );
+    (
+        stats.files[0].extra_stats.clone(),
+        stats.columns[0].extra_stats.clone(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn geometry_stats_roundtrip_sqlite() {
+    let temp = TempDir::new().unwrap();
+
+    let sqlite_path = temp.path().join("crate.sqlite");
+    let sqlite_data = temp.path().join("crate-data");
+    std::fs::create_dir_all(&sqlite_data).unwrap();
+    let sqlite_url = format!("sqlite:{}?mode=rwc", sqlite_path.display());
+    let sqlite_writer = SqliteMetadataWriter::new_with_init(&sqlite_url)
+        .await
+        .unwrap();
+    sqlite_writer
+        .set_data_path(sqlite_data.to_str().unwrap())
+        .unwrap();
+    DuckLakeTableWriter::new(Arc::new(sqlite_writer), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("main", "t", &[geometry_batch()])
+        .await
+        .unwrap();
+
+    let sqlite_provider = SqliteMetadataProvider::new(&format!("sqlite:{}", sqlite_path.display()))
+        .await
+        .unwrap();
+    assert_eq!(
+        table_geometry_stats(&sqlite_provider),
+        (Some(EXTRA_STATS.to_string()), Some(EXTRA_STATS.to_string()))
+    );
+}
+
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn geometry_stats_match_duckdb() {
+    let temp = TempDir::new().unwrap();
+    let duckdb_path = temp.path().join("official.duckdb");
+    let duckdb_data = temp.path().join("official-data");
+    std::fs::create_dir_all(&duckdb_data).unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute("INSTALL spatial", []).unwrap();
+    conn.execute("LOAD spatial", []).unwrap();
+    conn.execute("INSTALL ducklake", []).unwrap();
+    conn.execute("LOAD ducklake", []).unwrap();
+    conn.execute(
+        &format!(
+            "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}')",
+            duckdb_path.display(),
+            duckdb_data.display()
+        ),
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE lake.t(g GEOMETRY)", []).unwrap();
+    conn.execute(
+        "INSERT INTO lake.t VALUES (ST_POINT(1, 2)), ('LINESTRING Z (5 5 5, 10 10 10)'::GEOMETRY)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let duckdb_provider = DuckdbMetadataProvider::new(duckdb_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        table_geometry_stats(&duckdb_provider),
+        (Some(EXTRA_STATS.to_string()), Some(EXTRA_STATS.to_string()))
+    );
 }

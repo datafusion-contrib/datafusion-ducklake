@@ -1,0 +1,1 @@
+pub const EXTRA_STATS: &str = r#"{"bbox": {"xmin": 1.000000, "xmax": 10.000000, "ymin": 2.000000, "ymax": 10.000000, "zmin": 5.000000, "zmax": 10.000000, "mmin": null, "mmax": null}, "types": ["linestring_z", "point"]}"#;

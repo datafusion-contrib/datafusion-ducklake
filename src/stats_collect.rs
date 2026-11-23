@@ -905,6 +905,11 @@ fn compute(
             value_count,
             contains_nan,
             column_size_bytes,
+            extra_stats: crate::geometry_stats::collect_geometry_stats(
+                row_groups,
+                parquet_schema,
+                leaf,
+            ),
         });
     }
 

@@ -1461,7 +1461,7 @@ async fn insert_file_column_stats(
             "INSERT INTO ducklake_file_column_stats
                  (data_file_id, table_id, column_id, column_size_bytes,
                   value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(data_file_id)
         .bind(table_id)
@@ -1481,6 +1481,7 @@ async fn insert_file_column_stats(
                 .filter(|text| !text.contains('\0')),
         )
         .bind(stat.contains_nan)
+        .bind(stat.extra_stats.as_deref())
         .execute(&mut **tx)
         .await?;
     }

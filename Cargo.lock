@@ -151,6 +151,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1135,7 +1144,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_urlencoded",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "tower-service",
@@ -2050,12 +2059,14 @@ dependencies = [
  "rstest",
  "s3s",
  "s3s-fs",
+ "serde",
+ "serde_json",
  "sqllogictest",
  "sqlx",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "url",
@@ -2476,7 +2487,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -3005,6 +3016,27 @@ dependencies = [
  "typenum",
  "version_check",
  "zeroize",
+]
+
+[[package]]
+name = "geo-traits"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e7c353d12a704ccfab1ba8bfb1a7fe6cb18b665bf89d37f4f7890edcd260206"
+dependencies = [
+ "geo-types",
+]
+
+[[package]]
+name = "geo-types"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777d18aa0f12f8b285331cd867133ee14422b3f023f6d388034c47d43e28786a"
+dependencies = [
+ "approx",
+ "num-traits",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -4116,6 +4148,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "numeric_cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4159,7 +4213,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "url",
@@ -4303,6 +4357,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "object_store",
+ "parquet-geospatial",
  "ring",
  "seq-macro",
  "simdutf8",
@@ -4310,6 +4365,19 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-geospatial"
+version = "59.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3383d7e5a8e846863f12dc78a292e62510fd216a70023f5c327f1d833bf690"
+dependencies = [
+ "arrow-schema 59.2.0",
+ "geo-traits",
+ "serde",
+ "serde_json",
+ "wkb",
 ]
 
 [[package]]
@@ -4612,7 +4680,7 @@ dependencies = [
  "rustc-hash",
  "rustls 0.23.37",
  "socket2 0.6.4",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "web-time",
@@ -4633,7 +4701,7 @@ dependencies = [
  "rustls 0.23.37",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.19",
  "tinyvec",
  "tracing",
  "web-time",
@@ -5128,7 +5196,7 @@ dependencies = [
  "std-next",
  "subtle",
  "sync_wrapper",
- "thiserror",
+ "thiserror 2.0.19",
  "time",
  "tokio",
  "tower",
@@ -5161,7 +5229,7 @@ dependencies = [
  "serde",
  "serde_json",
  "std-next",
- "thiserror",
+ "thiserror 2.0.19",
  "time",
  "tokio",
  "tokio-util",
@@ -5182,7 +5250,7 @@ dependencies = [
  "futures-core",
  "httparse",
  "memchr",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5192,7 +5260,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "918b207c39474baef4774355100e712dfea46020e3289ddd5b4bc6e21927b826"
 dependencies = [
  "base64-simd",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5206,7 +5274,7 @@ dependencies = [
  "jiff",
  "sha1",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5225,7 +5293,7 @@ dependencies = [
  "sha2 0.11.0",
  "smallvec",
  "std-next",
- "thiserror",
+ "thiserror 2.0.19",
  "zeroize",
 ]
 
@@ -5674,7 +5742,7 @@ dependencies = [
  "similar",
  "subst",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -5743,7 +5811,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -5785,7 +5853,7 @@ dependencies = [
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.117",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "url",
 ]
@@ -5815,7 +5883,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.0",
  "sqlx-core",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -5850,7 +5918,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
  "whoami",
 ]
@@ -5875,7 +5943,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sqlx-core",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
  "url",
 ]
@@ -5906,7 +5974,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04082e93ed1a06debd9148c928234b46d2cf260bc65f44e1d1d3fa594c5beebc"
 dependencies = [
  "simdutf8",
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -6092,7 +6160,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "thiserror",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "tokio-tar",
@@ -6111,11 +6179,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.19",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7244,6 +7332,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wkb"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04ab2f2845abe967a213998446345a1a6fc9a8f318cd88f668a8e507861d13bc"
+dependencies = [
+ "byteorder",
+ "geo-traits",
+ "num_enum",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

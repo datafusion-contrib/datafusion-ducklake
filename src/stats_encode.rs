@@ -449,6 +449,7 @@ pub fn is_numeric_ducklake_type(ducklake_type: &str) -> bool {
 /// One `ducklake_file_column_stats` row's fields relevant to the global roll-up.
 #[derive(Debug, Clone)]
 pub struct FileColumnStat {
+    pub extra_stats: Option<String>,
     pub column_id: i64,
     pub min_value: Option<String>,
     pub max_value: Option<String>,
@@ -470,6 +471,7 @@ impl FileColumnStat {
 /// A `None` field is stored as SQL `NULL` (unknown).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobalColumnStat {
+    pub extra_stats: Option<String>,
     pub column_id: i64,
     pub min_value: Option<String>,
     pub max_value: Option<String>,
@@ -564,6 +566,7 @@ pub fn aggregate_global_column_stats(
     let mut out: Vec<GlobalColumnStat> = aggs
         .into_iter()
         .map(|(column_id, a)| GlobalColumnStat {
+            extra_stats: None,
             column_id,
             min_value: (a.min_present == live_file_count)
                 .then_some(a.min)
@@ -590,6 +593,7 @@ pub fn aggregate_global_column_stats(
 /// `None` field is one the statistics do not know.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStats {
+    extra_stats: Option<String>,
     /// The smallest non-NULL value's text.
     pub min_value: Option<String>,
     /// The largest non-NULL value's text.
@@ -611,12 +615,15 @@ impl ColumnStats {
     /// value.
     pub fn from_global(stat: &GlobalColumnStat) -> Self {
         Self {
+            extra_stats: stat.extra_stats.clone(),
             min_value: stat.min_value.clone(),
             max_value: stat.max_value.clone(),
             null_count: stat.contains_null.map(u64::from),
             num_values: None,
             contains_nan: stat.contains_nan,
-            any_valid: stat.min_value.is_some() || stat.max_value.is_some(),
+            any_valid: stat.min_value.is_some()
+                || stat.max_value.is_some()
+                || stat.extra_stats.is_some(),
         }
     }
 
@@ -628,6 +635,7 @@ impl ColumnStats {
             _ => None,
         };
         Self {
+            extra_stats: stat.extra_stats.clone(),
             min_value: stat.min_value.clone(),
             max_value: stat.max_value.clone(),
             null_count,
@@ -641,6 +649,7 @@ impl ColumnStats {
     /// NULL count but no value count or NaN flag.
     pub fn from_inlined(stat: &InlinedColumnStat) -> Self {
         Self {
+            extra_stats: None,
             min_value: stat.min_value.clone(),
             max_value: stat.max_value.clone(),
             null_count: Some(u64::from(stat.contains_null)),
@@ -687,10 +696,28 @@ impl ColumnStats {
             return;
         }
         if !had_valid {
+            self.extra_stats.clone_from(&new.extra_stats);
             self.min_value = new.min_value.clone();
             self.max_value = new.max_value.clone();
             self.any_valid = true;
             return;
+        }
+        #[cfg(feature = "write")]
+        if self.extra_stats.is_some() || new.extra_stats.is_some() {
+            use crate::geometry_stats::GeometryStats;
+            self.extra_stats = self
+                .extra_stats
+                .as_deref()
+                .and_then(GeometryStats::from_json)
+                .zip(
+                    new.extra_stats
+                        .as_deref()
+                        .and_then(GeometryStats::from_json),
+                )
+                .map(|(mut current, new)| {
+                    current.merge(&new);
+                    current.to_json()
+                });
         }
         let widen = |stored: &mut Option<String>, value: &Option<String>, keep: Ordering| {
             *stored = match (stored.take(), value) {
@@ -715,6 +742,7 @@ impl ColumnStats {
     pub fn to_global(&self, column_id: i64) -> GlobalColumnStat {
         let stored = |bound: &Option<String>| bound.clone().filter(|text| !text.contains('\0'));
         GlobalColumnStat {
+            extra_stats: self.extra_stats.clone(),
             column_id,
             min_value: stored(&self.min_value),
             max_value: stored(&self.max_value),
@@ -763,6 +791,7 @@ pub fn merge_table_column_stats(
         if stats.has_valid()
             && (stats.min_value.is_none() || stats.max_value.is_none())
             && stats.contains_nan != Some(true)
+            && stats.extra_stats.is_none()
         {
             unknown.insert(column_id);
         }
@@ -796,7 +825,8 @@ pub fn merge_table_column_stats(
             !(touched.contains(column_id)
                 && stats.has_valid()
                 && stats.min_value.is_none()
-                && stats.max_value.is_none())
+                && stats.max_value.is_none()
+                && stats.extra_stats.is_none())
         })
         .map(|(column_id, stats)| stats.to_global(column_id))
         .collect()
@@ -1829,6 +1859,7 @@ mod tests {
         null_count: Option<i64>,
     ) -> FileColumnStat {
         FileColumnStat {
+            extra_stats: None,
             column_id,
             min_value: min.map(str::to_string),
             max_value: max.map(str::to_string),
@@ -1840,6 +1871,7 @@ mod tests {
 
     fn fcs_nan(contains_nan: Option<bool>) -> FileColumnStat {
         FileColumnStat {
+            extra_stats: None,
             contains_nan,
             ..fcs(1, Some("1.0"), Some("2.0"), Some(0))
         }
@@ -1884,6 +1916,7 @@ mod tests {
         assert_eq!(
             out,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: Some("9".to_string()),
                 max_value: Some("10".to_string()),
@@ -1904,6 +1937,7 @@ mod tests {
         assert_eq!(
             out,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: None,
                 max_value: None,
@@ -1933,6 +1967,7 @@ mod tests {
         bounds: Option<(&str, &str)>,
     ) -> GlobalColumnStat {
         GlobalColumnStat {
+            extra_stats: None,
             column_id,
             min_value: bounds.map(|b| b.0.to_string()),
             max_value: bounds.map(|b| b.1.to_string()),
@@ -1966,6 +2001,7 @@ mod tests {
         assert_eq!(
             merged,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: Some("-2".to_string()),
                 max_value: Some("10".to_string()),
@@ -2025,6 +2061,7 @@ mod tests {
         assert_eq!(
             merged,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: Some("3".to_string()),
                 max_value: Some("3".to_string()),
@@ -2160,6 +2197,7 @@ mod tests {
     fn file_stats_merge_as_official() {
         let file = |column_id: i64, bounds: Option<(&str, &str)>, values: i64, nulls: i64| {
             FileColumnStat {
+                extra_stats: None,
                 column_id,
                 min_value: bounds.map(|b| b.0.to_string()),
                 max_value: bounds.map(|b| b.1.to_string()),
@@ -2392,6 +2430,7 @@ mod merge_regression_tests {
     fn a_null_file_before_values_keeps_their_bounds() {
         let file = |min: Option<&str>, nulls: i64, values: i64| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 2,
                 min_value: min.map(str::to_string),
                 max_value: min.map(str::to_string),
@@ -2418,6 +2457,7 @@ mod merge_regression_tests {
     #[test]
     fn a_nan_only_write_beside_unflagged_stats_leaves_no_row() {
         let nan_only = ColumnStats {
+            extra_stats: None,
             min_value: None,
             max_value: None,
             null_count: Some(0),
@@ -2426,6 +2466,7 @@ mod merge_regression_tests {
             any_valid: true,
         };
         let inlined = ColumnStats {
+            extra_stats: None,
             min_value: None,
             max_value: None,
             null_count: Some(1),
@@ -2447,6 +2488,7 @@ mod merge_regression_tests {
     fn a_boundless_nan_file_leaves_no_row() {
         let file = |bounds: Option<(&str, &str)>, nan: bool| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 4,
                 min_value: bounds.map(|b| b.0.to_string()),
                 max_value: bounds.map(|b| b.1.to_string()),
@@ -2472,6 +2514,7 @@ mod merge_regression_tests {
     fn a_superseded_nul_bound_keeps_the_row() {
         let file = |min: &str, max: &str| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 3,
                 min_value: Some(min.to_string()),
                 max_value: Some(max.to_string()),

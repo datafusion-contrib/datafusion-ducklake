@@ -46,6 +46,7 @@ mod encryption_tests;
 mod files_matching_tests;
 mod float_special_values_tests;
 mod fork_table_tests;
+mod geometry_stats_fixture;
 mod hybrid_asyncdb;
 mod information_schema_test;
 mod inlined_data_backends_tests;

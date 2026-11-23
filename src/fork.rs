@@ -975,6 +975,7 @@ fn column_stats(
         .filter(|statistic| adopted.contains(&statistic.column_id))
     {
         by_column.entry(statistic.column_id).or_insert(ColumnStat {
+            extra_stats: None,
             column_id: statistic.column_id,
             min_value: statistic.min_value.clone(),
             max_value: statistic.max_value.clone(),
