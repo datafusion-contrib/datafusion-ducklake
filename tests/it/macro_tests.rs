@@ -6,9 +6,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "write-duckdb")]
+use datafusion_ducklake::DuckdbMetadataWriter;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataProvider,
-    register_ducklake_macros,
+    DuckLakeCatalog, DuckdbMetadataProvider, MetadataProvider, register_ducklake_macros,
 };
 #[cfg(feature = "write-sqlite")]
 use datafusion_ducklake::{SqliteMetadataProvider, SqliteMetadataWriter};
@@ -185,6 +186,7 @@ async fn duckdb_macros_match_scalar_and_table_oracles() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "write-duckdb")]
 #[tokio::test]
 async fn duckdb_writer_initializes_macro_tables() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
