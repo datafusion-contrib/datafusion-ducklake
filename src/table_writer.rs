@@ -1442,13 +1442,12 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1470,13 +1469,12 @@ impl DuckLakeTableWriter {
         table_name: &str,
         arrow_schema: &Schema,
     ) -> Result<TableWriteSession> {
-        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1506,13 +1504,12 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1584,13 +1581,12 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
-        let table_key = self.table_key(schema_name, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1619,7 +1615,7 @@ impl DuckLakeTableWriter {
             schema_name,
             table_name,
             arrow_schema,
-            file_dir.to_string(),
+            Some(file_dir.to_string()),
             file_name,
             full_path,
             false,
@@ -1639,7 +1635,7 @@ impl DuckLakeTableWriter {
         schema_name: &str,
         table_name: &str,
         arrow_schema: &Schema,
-        file_dir: String,
+        file_dir: Option<String>,
         file_name: String,
         catalog_path: String,
         path_is_relative: bool,
@@ -1693,7 +1689,12 @@ impl DuckLakeTableWriter {
             Arc::new(schema)
         };
 
-        let object_path_str = join_paths(&file_dir, &file_name)?;
+        let (table_key, directory_plan) = if file_dir.is_none() {
+            self.table_key_for_write(schema_name, table_name, None)?
+        } else {
+            (self.table_key(schema_name, table_name)?, None)
+        };
+        let object_path_str = join_paths(file_dir.as_deref().unwrap_or(&table_key), &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys)
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
@@ -1720,7 +1721,6 @@ impl DuckLakeTableWriter {
         // single-file writer above is still created: with zero rows the sink
         // produces no file, and a Replace then needs that 0-row marker to retire the
         // prior generation.
-        let table_key = self.table_key(schema_name, table_name)?;
         let partition_sink =
             match self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)? {
                 None => None,
@@ -1803,6 +1803,7 @@ impl DuckLakeTableWriter {
             writer: Some(writer),
             temp: Some(temp),
             catalog_path,
+            directory_plan,
             path_is_relative,
             mode,
             row_count: 0,
@@ -2714,7 +2715,8 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.table_key(schema_name, table_name)?;
+        let (table_key, directory_plan) =
+            self.table_key_for_write(schema_name, table_name, None)?;
 
         let groups = match &sort_spec {
             Some(spec) => groups
@@ -2723,7 +2725,7 @@ impl DuckLakeTableWriter {
                 .collect::<Result<Vec<_>>>()?,
             None => groups,
         };
-        let file_infos = self
+        let mut file_infos = self
             .write_partition_groups(
                 &table_key,
                 schema_with_ids,
@@ -2733,6 +2735,9 @@ impl DuckLakeTableWriter {
                 &groups,
             )
             .await?;
+        for file in &mut file_infos {
+            file.table_directory.clone_from(&directory_plan);
+        }
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
 
         if file_infos.is_empty() {
@@ -2951,7 +2956,8 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.table_key(schema_name, table_name)?;
+        let (table_key, directory_plan) =
+            self.table_key_for_write(schema_name, table_name, None)?;
 
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
@@ -2959,7 +2965,7 @@ impl DuckLakeTableWriter {
             None
         };
 
-        let file_infos = match partition.as_ref() {
+        let mut file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema: SchemaRef = Arc::new(arrow_schema.clone());
                 let groups =
@@ -2985,6 +2991,9 @@ impl DuckLakeTableWriter {
                 .await?
             },
         };
+        for file in &mut file_infos {
+            file.table_directory.clone_from(&directory_plan);
+        }
         if file_infos.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "write_rows: input produced no rows".to_string(),
@@ -3032,6 +3041,7 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
         columns: Option<&[ColumnDef]>,
+        schema_uuid: Option<&str>,
     ) -> Result<PreparedTableWrite> {
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
@@ -3115,13 +3125,14 @@ impl DuckLakeTableWriter {
 
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
-        let table_key = self.table_key(schema_name, table_name)?;
+        let (table_key, directory_plan) =
+            self.table_key_for_write(schema_name, table_name, schema_uuid)?;
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
             None
         };
-        let file_infos = match partition.as_ref() {
+        let mut file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema = Arc::new(arrow_schema.clone());
                 let groups =
@@ -3147,11 +3158,12 @@ impl DuckLakeTableWriter {
                 .await?
             },
         };
+        for file in &mut file_infos {
+            file.table_directory.clone_from(&directory_plan);
+        }
         let object_paths = file_infos
             .iter()
-            .map(|file| {
-                self.staged_object_path(schema_name, table_name, &file.path, file.path_is_relative)
-            })
+            .map(|file| self.data_file_object_path(schema_name, table_name, file))
             .collect::<Result<Vec<_>>>()?;
         let records_written = file_infos.iter().map(|file| file.record_count).sum();
         let files_written = file_infos.len();
@@ -3194,16 +3206,12 @@ impl DuckLakeTableWriter {
         error: crate::error::DuckLakeError,
         file_infos: &[DataFileInfo],
     ) -> crate::error::DuckLakeError {
-        let files = file_infos
-            .iter()
-            .map(|file| (file.path.as_str(), file.path_is_relative));
-        self.release_files_if(
-            schema_name,
-            table_name,
-            error,
-            files,
-            commit_definitely_rolled_back,
-        )
+        self.release_file_objects(error, commit_definitely_rolled_back, || {
+            file_infos
+                .iter()
+                .map(|file| self.data_file_object_path(schema_name, table_name, file))
+                .collect()
+        })
         .await
     }
 
@@ -3231,16 +3239,27 @@ impl DuckLakeTableWriter {
         files: impl IntoIterator<Item = (&'a str, bool)>,
         rolled_back: fn(&crate::error::DuckLakeError) -> bool,
     ) -> crate::error::DuckLakeError {
+        self.release_file_objects(error, rolled_back, || {
+            files
+                .into_iter()
+                .map(|(path, is_relative)| {
+                    self.staged_object_path(schema_name, table_name, path, is_relative)
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn release_file_objects(
+        &self,
+        error: crate::error::DuckLakeError,
+        rolled_back: fn(&crate::error::DuckLakeError) -> bool,
+        objects: impl FnOnce() -> Result<Vec<ObjectPath>>,
+    ) -> crate::error::DuckLakeError {
         if !rolled_back(&error) {
             return error;
         }
-        let objects = files
-            .into_iter()
-            .map(|(path, is_relative)| {
-                self.staged_object_path(schema_name, table_name, path, is_relative)
-            })
-            .collect::<Result<Vec<_>>>();
-        match objects {
+        match objects() {
             Ok(objects) => {
                 for failure in remove_objects(&self.object_store, objects).await {
                     tracing::warn!(error = %failure, "failed to remove a file of a rejected commit");
@@ -3286,6 +3305,46 @@ impl DuckLakeTableWriter {
             path,
             path_is_relative,
         )
+    }
+
+    fn table_key_for_write(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        schema_uuid: Option<&str>,
+    ) -> Result<(
+        String,
+        Option<Arc<crate::metadata_writer::TableDirectoryPlan>>,
+    )> {
+        use crate::metadata_writer::is_named_directory;
+
+        if (!is_named_directory(schema_name) || !is_named_directory(table_name))
+            && let Some(plan) =
+                self.metadata
+                    .plan_table_directory(schema_name, table_name, schema_uuid)?
+        {
+            return Ok((
+                parse_object_store_url(&plan.directory)?.1,
+                Some(Arc::new(plan)),
+            ));
+        }
+        Ok((self.table_key(schema_name, table_name)?, None))
+    }
+
+    fn data_file_object_path(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        file: &DataFileInfo,
+    ) -> Result<ObjectPath> {
+        if let Some(plan) = &file.table_directory {
+            return object_key(
+                &parse_object_store_url(&plan.directory)?.1,
+                &file.path,
+                file.path_is_relative,
+            );
+        }
+        self.staged_object_path(schema_name, table_name, &file.path, file.path_is_relative)
     }
 
     /// Object-store key of a table's directory: where its stored schema and
@@ -3666,6 +3725,23 @@ impl DuckLakeWriteTransaction<'_> {
         self
     }
 
+    fn planned_schema_uuid(&self, schema_name: &str) -> Result<Option<&str>> {
+        for stage in self
+            .writes
+            .iter()
+            .filter(|stage| stage.write.schema_name == schema_name)
+        {
+            if let Some(uuid) = stage
+                .write
+                .directory_plan()?
+                .and_then(|plan| plan.schema_uuid.as_deref())
+            {
+                return Ok(Some(uuid));
+            }
+        }
+        Ok(None)
+    }
+
     /// Stages one table write without committing catalog metadata.
     pub async fn stage_write(
         &mut self,
@@ -3689,6 +3765,7 @@ impl DuckLakeWriteTransaction<'_> {
                 batches,
                 true,
                 None,
+                self.planned_schema_uuid(schema_name)?,
             )
             .await?;
         self.writes.push(prepared);
@@ -3716,6 +3793,7 @@ impl DuckLakeWriteTransaction<'_> {
                 batches,
                 true,
                 Some(columns),
+                self.planned_schema_uuid(schema_name)?,
             )
             .await?;
         self.writes.push(prepared);
@@ -3746,6 +3824,7 @@ impl DuckLakeWriteTransaction<'_> {
                 batches,
                 true,
                 None,
+                self.planned_schema_uuid(schema_name)?,
             )
             .await?;
         self.writes.push(prepared);
@@ -3800,6 +3879,7 @@ impl DuckLakeWriteTransaction<'_> {
                 batches,
                 true,
                 None,
+                self.planned_schema_uuid(schema_name)?,
             )
             .await?;
         prepared.write.snapshot_id_columns = snapshot_id_columns
@@ -4122,11 +4202,10 @@ impl DuckLakeWriteTransaction<'_> {
         let (files_written, records_written) = match &data {
             StagedTableData::Files(files) => {
                 for file in files {
-                    object_paths.push(self.writer.staged_object_path(
+                    object_paths.push(self.writer.data_file_object_path(
                         schema_name,
                         table_name,
-                        &file.path,
-                        file.path_is_relative,
+                        file,
                     )?);
                 }
                 (
@@ -4140,12 +4219,10 @@ impl DuckLakeWriteTransaction<'_> {
             StagedTableData::None => (0, 0),
         };
         for file in &inserted_files {
-            object_paths.push(self.writer.staged_object_path(
-                schema_name,
-                table_name,
-                &file.path,
-                file.path_is_relative,
-            )?);
+            object_paths.push(
+                self.writer
+                    .data_file_object_path(schema_name, table_name, file)?,
+            );
         }
         let files_written = files_written + inserted_files.len();
         let records_written = records_written
@@ -5748,6 +5825,7 @@ pub struct TableWriteSession {
     temp: Option<NamedTempFile>,
     /// Path to register in catalog (may be relative filename or absolute path)
     catalog_path: String,
+    directory_plan: Option<Arc<crate::metadata_writer::TableDirectoryPlan>>,
     /// Whether the catalog_path is relative to table path
     path_is_relative: bool,
     /// Replace vs Append; passed to `register_data_file` so the head advance and
@@ -6222,24 +6300,26 @@ impl TableWriteSession {
             })
         };
         let mut out = own?;
-        let Some(split) = &mut self.split else {
-            return Ok(out);
-        };
-        for lane in &mut split.joined {
-            match lane.target.finish().await {
-                Ok(uploaded) => {
-                    out.infos.extend(uploaded.infos);
-                    out.objects.extend(uploaded.objects);
-                },
-                Err(e) => {
-                    for failure in remove_objects(&self.object_store, out.objects).await {
-                        tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
-                    }
-                    return Err(e);
-                },
+        if let Some(split) = &mut self.split {
+            for lane in &mut split.joined {
+                match lane.target.finish().await {
+                    Ok(uploaded) => {
+                        out.infos.extend(uploaded.infos);
+                        out.objects.extend(uploaded.objects);
+                    },
+                    Err(e) => {
+                        for failure in remove_objects(&self.object_store, out.objects).await {
+                            tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
+                        }
+                        return Err(e);
+                    },
+                }
             }
+            split.joined.clear();
         }
-        split.joined.clear();
+        for file in &mut out.infos {
+            file.table_directory.clone_from(&self.directory_plan);
+        }
         Ok(out)
     }
 
@@ -6696,44 +6776,12 @@ impl TableWriteSession {
     async fn finish_appended(&mut self) -> Result<(Vec<DataFileInfo>, Vec<ObjectPath>)> {
         self.check_lanes_joined()?;
         self.spill_held_rows()?;
-        if self.split.is_some() {
-            let uploaded = self.finish_file_uploads().await?;
-            if !uploaded.infos.is_empty() {
-                return Ok((uploaded.infos, uploaded.objects));
-            }
-            // No rows arrived: the 0-row marker carries a Replace truncation.
-            let (info, object) = self.upload_staged().await?;
-            return Ok((vec![info], vec![object]));
+        let uploaded = self.finish_file_uploads().await?;
+        if !uploaded.infos.is_empty() {
+            return Ok((uploaded.infos, uploaded.objects));
         }
-        Ok(if let Some(mut sink) = self.partition_sink.take() {
-            let uploaded = sink.finish_uploads().await?;
-            if uploaded.infos.is_empty() {
-                // No rows reached any partition. Fall through to the single-file
-                // path, whose 0-row marker is what carries a Replace truncation
-                // (and is exempt from the partition fence).
-                let (info, object) = self.upload_staged().await?;
-                (vec![info], vec![object])
-            } else {
-                (uploaded.infos, uploaded.objects)
-            }
-        } else if let Some(mut roller) = self.roller.take() {
-            // `finish` writes the last file's parquet footer locally.
-            stage_all(&mut self.rolled, roller.finish()?);
-            let uploaded = self.rolled.finish().await?;
-            if uploaded.infos.is_empty() {
-                // No rows arrived. Fall through to the single-file path, whose
-                // 0-row marker is what carries a Replace truncation (and is exempt
-                // from the partition fence) — same behaviour as a non-rolling
-                // session.
-                let (info, object) = self.upload_staged().await?;
-                (vec![info], vec![object])
-            } else {
-                (uploaded.infos, uploaded.objects)
-            }
-        } else {
-            let (info, object) = self.upload_staged().await?;
-            (vec![info], vec![object])
-        })
+        let (info, object) = self.upload_staged().await?;
+        Ok((vec![info], vec![object]))
     }
 
     /// The session's rows as one staged write's data, without committing
@@ -6818,6 +6866,7 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
+        file_info.table_directory.clone_from(&self.directory_plan);
         Ok((file_info, self.object_path.clone()))
     }
 }

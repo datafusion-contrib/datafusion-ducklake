@@ -2020,3 +2020,107 @@ async fn official_duckdb_reads_row_groups_encoded_on_several_threads() {
         6_667
     );
 }
+
+#[rstest::rstest]
+#[case(Kind::DuckDb)]
+#[cfg_attr(feature = "write-sqlite", case(Kind::Sqlite))]
+#[cfg_attr(feature = "write-postgres", case(Kind::Postgres))]
+#[cfg_attr(feature = "write-mysql", case(Kind::Mysql))]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn uuid_directories_for_staged_objects(#[case] kind: Kind) {
+    let lake = Lake::new(kind).await;
+    let metadata = lake.writer().await;
+    write_ids(metadata.clone(), "first", vec![1], WriteMode::Replace).await;
+    let writer = DuckLakeTableWriter::new(metadata.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![7, 13]))],
+    )
+    .unwrap();
+    let mut staged = writer.transaction();
+    for table in ["orders old", "orders.new"] {
+        staged
+            .stage_write(
+                "sales data",
+                table,
+                &schema,
+                WriteMode::Append,
+                std::slice::from_ref(&batch),
+            )
+            .await
+            .unwrap();
+    }
+    let results = staged.commit().await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    let first = metadata
+        .get_table_directory("sales data", "orders old")
+        .unwrap()
+        .unwrap();
+    let second = metadata
+        .get_table_directory("sales data", "orders.new")
+        .unwrap()
+        .unwrap();
+    let first = std::path::Path::new(&first);
+    let second = std::path::Path::new(&second);
+    assert_eq!(first.parent(), second.parent());
+    assert_ne!(first, second);
+    for path in [first.parent().unwrap(), first, second] {
+        let uuid = uuid::Uuid::parse_str(path.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(uuid.get_version_num(), 7);
+    }
+    for path in [first, second] {
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+    }
+    let oracle = lake.official();
+    let count: i64 = oracle
+        .query_row(
+            r#"SELECT SUM(id) FROM lake."sales data"."orders old""#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 20);
+}
+
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn uuid_directories_reject_a_concurrently_created_schema() {
+    let lake = Lake::new(Kind::Sqlite).await;
+    let metadata = lake.writer().await;
+    let writer = DuckLakeTableWriter::new(metadata.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+    let mut staged = writer
+        .begin_write_single_file("sales data", "orders new", &schema, WriteMode::Append)
+        .unwrap();
+    let planned_file = std::path::Path::new(staged.file_path());
+    let planned_table = planned_file.parent().unwrap();
+    let object = lake
+        .temp
+        .path()
+        .join("data")
+        .join(planned_table.parent().unwrap().file_name().unwrap())
+        .join(planned_table.file_name().unwrap())
+        .join(planned_file.file_name().unwrap());
+    staged
+        .write_batch(
+            &RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+    let snapshot = metadata.create_snapshot().unwrap();
+    metadata
+        .get_or_create_schema("sales data", None, snapshot)
+        .unwrap();
+    let error = staged.finish().await.unwrap_err();
+    assert!(
+        matches!(error, DuckLakeError::Conflict(message) if message.contains("storage directory")),
+    );
+    assert!(!object.exists());
+    assert_eq!(metadata.head_snapshot().unwrap(), Some(snapshot));
+}

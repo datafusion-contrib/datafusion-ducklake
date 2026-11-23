@@ -782,16 +782,17 @@ where
         let connection = duckdb_connection();
         attach_lake(&connection, official_metadata, &official_data, true);
         for (a, b) in change_windows(previous, head) {
-            expected_changes.push(relative_changes(
-                query_lines(
-                    &connection,
-                    &format!(
-                        "SELECT * FROM ducklake_table_changes('lake', 'main', 't', {a}, {b}) \
-                         ORDER BY snapshot_id, rowid, change_type"
-                    ),
+            let mut changes = query_lines(
+                &connection,
+                &format!(
+                    "SELECT * FROM ducklake_table_changes('lake', 'main', 't', {a}, {b}) \
+                     ORDER BY snapshot_id, rowid, change_type"
                 ),
-                official_setup_head,
-            ));
+            );
+            if scenario.name == "row_apis" && done == scenario.statements.len() {
+                date_flushed_oracle_deletes(&connection, &mut changes, a, b);
+            }
+            expected_changes.push(relative_changes(changes, official_setup_head));
         }
         previous = head;
     }
@@ -895,6 +896,55 @@ where
     Checked {
         expected,
         crate_snapshots: (crate_setup_head..=crate_head).collect(),
+    }
+}
+
+fn date_flushed_oracle_deletes(
+    connection: &duckdb::Connection,
+    changes: &mut [String],
+    start: i64,
+    end: i64,
+) {
+    let mut redated = false;
+    for change in changes.iter_mut() {
+        let (snapshot, rest) = change.split_once(',').unwrap();
+        let (row_id, fields) = rest.split_once(',').unwrap();
+        if snapshot.parse::<i64>().unwrap() >= start || !fields.starts_with("delete,") {
+            continue;
+        }
+        let row_id = row_id.parse::<i64>().unwrap();
+
+        // DuckLake 1.5.5 can report the insertion snapshot when deleting a
+        // flushed row. Time travel locates its first absence in the window.
+        let visible = |snapshot| {
+            !query_lines(
+                connection,
+                &format!(
+                    "SELECT rowid FROM lake.main.t AT (VERSION => {snapshot}) WHERE rowid = {row_id}"
+                ),
+            )
+            .is_empty()
+        };
+        assert!(
+            visible(start - 1),
+            "deleted row {row_id} must precede its window"
+        );
+        let deleted = (start..=end)
+            .find(|&snapshot| !visible(snapshot))
+            .expect("the oracle row must disappear during the change window");
+        *change = format!("{deleted},{rest}");
+        redated = true;
+    }
+
+    if redated {
+        changes.sort_by_cached_key(|line| {
+            let mut parts = line.splitn(4, ',');
+            (
+                parts.next().unwrap().parse::<i64>().unwrap(),
+                parts.next().unwrap().parse::<i64>().unwrap(),
+                parts.next().unwrap().to_owned(),
+            )
+        });
     }
 }
 
