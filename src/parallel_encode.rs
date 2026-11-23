@@ -31,17 +31,18 @@
 //! `encode_parallelism`) or shared across writes ([`EncodePool::try_new`]).
 //! Both charge each row group out (handed to the pool, not yet appended) to a
 //! byte budget: twice its rows' in-memory size until its job finishes, then
-//! the size of its column chunks until it is appended. At most `2 × threads`
-//! row groups are out at once.
+//! the size of its column chunks until it is appended.
 //!
-//! - A write's own pool admits loosely. When the budget is spent, a queue
-//!   appends its earliest row group before handing out another, but a queue
-//!   with nothing out hands one out regardless, so an oversized row group is
-//!   still written. A write has at most `2 × threads` row groups out, plus one
-//!   per other queue holding rows (each file sequence or lane, and each open
-//!   partition file up to `max_open_partitions`).
+//! - A write's own pool admits loosely, and also charges the rows of the row
+//!   group being assembled. When the budget is spent or `2 × threads` row
+//!   groups are out, a queue appends its earliest row group before handing out
+//!   another, but a queue with nothing out hands one out regardless, so an
+//!   oversized row group is still written. A write has at most `2 × threads`
+//!   row groups out, plus one per other queue holding rows (each file sequence
+//!   or lane, and each open partition file up to `max_open_partitions`).
 //! - A shared pool admits strictly ([`RowGroupQueue::dispatch_checked`]). A row
-//!   group is handed out only if its charge fits the remaining budget; if not,
+//!   group is handed out only if its charge fits the remaining budget and fewer
+//!   than `2 × threads` are out, so at most that many are out; if not,
 //!   its queue appends its own earliest row group and retries, and with nothing
 //!   out it encodes on its own thread. Charges never grow past the budget, so
 //!   across all writes sharing the pool they never exceed it. No write is

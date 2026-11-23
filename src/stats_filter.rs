@@ -337,8 +337,8 @@ pub struct StatsFilter {
 /// Official builds the same clause against the same table, for `BUCKET` keys
 /// only (`BuildBucketPartitionPruningClause`), because hashing destroys ordering
 /// so statistics cannot prune a bucket partition at all while for `identity`
-/// they suffice — in DuckDB. See the module docs for why they do not suffice
-/// here.
+/// they suffice — in DuckDB. See divergence 10 in `docs/stats-filter.md` for
+/// why they do not suffice here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionPrefilter {
     /// `ducklake_partition_column.partition_key_index`, which is what
@@ -440,7 +440,8 @@ pub trait StatsSqlDialect {
     /// type, which drops the comparison and prunes nothing.
     ///
     /// Returning something that *errors* on malformed input, or that coerces it
-    /// to a number, is a correctness bug — see the module docs.
+    /// to a number, is a correctness bug: see divergence 1 in
+    /// `docs/stats-filter.md`.
     ///
     /// `literal` is the constant this stat will be compared against, whose
     /// encoded text is [`StatsLiteral::text`]. A dialect that reproduces a
@@ -906,7 +907,8 @@ impl StatsFilter {
     /// The comparison is on the stored text, not on a converted value, and that
     /// is what makes it cheap: a conversion would run on every partition-value
     /// row the key has, where a `NOT IN` against a handful of strings is a hash
-    /// probe. On the module's synthetic fixture the cast lands at 117 ms against
+    /// probe. On the synthetic fixture of divergence 9 (`docs/stats-filter.md`)
+    /// the cast lands at 117 ms against
     /// 6.8 ms for this, on a listing that takes 127 ms with no pre-filter at all
     /// — the cast buys nothing over divergence 9 alone. Figures are fixture-bound
     /// (see divergence 9); the shape of the answer is not.
@@ -3269,7 +3271,8 @@ mod tests {
 
     #[test]
     fn float_gate_admits_exactly_the_same_files_as_official_for_gt_and_gt_eq() {
-        // The equivalence claim in the module docs, for the two operators where
+        // The equivalence claim of divergence 3 (`docs/stats-filter.md`), for the
+        // two operators where
         // official also guards on `contains_nan`.
         //
         // Official renders, for `f > C` on a DOUBLE column:
@@ -4075,12 +4078,10 @@ mod tests {
 
     #[test]
     fn float_gate_admits_exactly_official_set_for_not_eq_too() {
-        // The module docs list `<>` among the operators where this crate is
-        // "strictly more conservative" than official. It is not: official's
-        // `GenerateConstantFilterDouble` appends `OR contains_nan` for
-        // COMPARE_NOTEQUAL as well as for `>` and `>=`, so `<>` belongs in the
-        // same exact-equivalence class. Asserted here so the claim is checked
-        // rather than assumed.
+        // Divergence 3 (`docs/stats-filter.md`) puts `<>` with `>` and `>=`:
+        // official's `GenerateConstantFilterDouble` appends `OR contains_nan`
+        // for COMPARE_NOTEQUAL too, so the gate matches official exactly.
+        // Asserted here so the claim is checked rather than assumed.
         let constant = 5.0_f64;
         for (contains_nan, min_value, max_value) in float_stats_states() {
             // NOT (min = C AND max = C), three-valued.

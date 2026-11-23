@@ -12,8 +12,9 @@
 //! Matches are found in Parquet files and inlined rows alike, and recorded as
 //! official DuckLake's `DELETE` and `UPDATE` record them: a file's deletions
 //! within the table's `data_inlining_row_limit` go to
-//! `ducklake_inlined_delete_<table_id>`; above it, a file they empty is ended
-//! and any other gets a delete file. New rows are inlined when the statement
+//! `ducklake_inlined_delete_<table_id>`, even when they empty the file; above
+//! it, a file they empty is ended and any other gets a delete file. Matched
+//! inlined rows are ended. New rows are inlined when the statement
 //! writes at most the limit's rows, else written to Parquet. Everything commits
 //! in one snapshot, with the conflict checks and retries of a SQL `DELETE` or
 //! `UPDATE`

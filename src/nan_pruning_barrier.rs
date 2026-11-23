@@ -1,10 +1,11 @@
 //! Filter-pushdown barrier for NaN-unsafe float columns
 //!
-//! Parquet footer min/max for float columns exclude NaN, and NaN sorts above
-//! every value in DataFusion (IEEE 754 totalOrder, matching DuckDB). When a
-//! file's NaN state is unknown or positive, a predicate like `x > C` pushed
-//! into the parquet scan can row-group-prune a group whose footer max is below
-//! `C` while it still holds matching NaN rows — silently dropping them. The
+//! Parquet footer min/max for float columns exclude NaN. DataFusion orders
+//! floats by IEEE 754 totalOrder (arrow's `total_cmp`): a positive NaN sorts
+//! above every value and a negative NaN below. When a file's NaN state is
+//! unknown or positive, a predicate like `x > C` pushed into the parquet scan
+//! can row-group-prune a group whose footer max is below `C` while it still
+//! holds matching NaN rows (and `x < C` likewise for a negative NaN). The
 //! catalog-level gate (see `float_bound_is_usable` in `table.rs`) protects only
 //! plan-time file pruning; this node protects execution-time row-group/page/
 //! bloom pruning by refusing to push such predicates into the scan.

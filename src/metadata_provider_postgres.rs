@@ -1633,16 +1633,17 @@ pub(crate) async fn delete_file_begin_snapshot_on(
 /// to the same server, so the two readers cannot diverge.
 ///
 /// PostgreSQL has no `TRY_CAST`, and a `CAST` of an unparseable stat aborts the
-/// whole listing query. Two stand-ins, by server version:
+/// whole listing query. So a stat is cast only after it passes:
 ///
-/// - PostgreSQL 16+: `pg_input_is_valid(text, type)`, which runs the type's
-///   input function in soft-error mode and rejects everything a `CAST` would
-///   raise on, including dates like `2020-02-31`.
-/// - Older servers: a regex validity test ([`postgres_castable_pattern`]).
-///   Regexes cannot decide calendar dates, so temporal types are declined.
+/// - on every server, a shape test ([`postgres_castable_pattern`]) that admits
+///   only the text this crate and DuckDB write;
+/// - on PostgreSQL 16+, also `pg_input_is_valid(text, type)`, which rejects a
+///   value out of the type's range (an overflowing `numeric`).
 ///
 /// Both are wrapped in a `CASE`, evaluated lazily, so the `CAST` never runs on a
-/// rejected value.
+/// rejected value. Date and timestamp stats are never cast: they are compared
+/// as canonical text on every server
+/// ([`postgres_canonical_temporal_pattern`]).
 pub(crate) struct PostgresStatsDialect {
     /// `pg_input_is_valid` exists (PostgreSQL 16+).
     pub(crate) soft_input_validation: bool,
@@ -1818,7 +1819,7 @@ pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
 }
 
 /// A pattern that admits only text `CAST(... AS <target>)` is guaranteed to
-/// accept, for servers without `pg_input_is_valid`. `None` declines the type.
+/// accept. Every server version runs it. `None` declines the type.
 ///
 /// Each pattern admits exactly the shapes [`crate::stats_encode`] (and DuckDB)
 /// write, and rejects forms PostgreSQL would accept (`+5`, `nan`, hex
@@ -1836,8 +1837,8 @@ pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
 ///   [`crate::stats_filter`] never passes a non-finite constant.
 ///
 /// Temporal types have no pattern: no regex decides a calendar (`2020-02-31`
-/// matches and its `CAST` raises), so on these servers a date or timestamp
-/// comparison pushes down nothing.
+/// matches and its `CAST` raises). Dates and timestamps are compared as text
+/// instead ([`postgres_canonical_temporal_pattern`]).
 pub(crate) fn postgres_castable_pattern(target: &str) -> Option<&'static str> {
     Some(match target {
         "boolean" => r"^(true|false|1|0)$",

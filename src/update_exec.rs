@@ -6,21 +6,24 @@
 //! work happens at execute time, so planning and `EXPLAIN` never mutate data:
 //!
 //! 1. For each source file that may hold matching rows, select the matching
-//! rows from its positional scan, apply the assignments, and write the new row
-//! versions to new data files that embed each row's original rowid. On a
-//! partitioned table each row is routed by its post-assignment key, so changing
-//! a partition key moves the row. 2. Delete the superseded row versions from
-//! each source file. 3. Commit the new versions and every deletion in one
-//! snapshot. 4. Yield a single row `count: UInt64`, the rows updated.
+//!    rows from its positional scan, apply the assignments, and write the new
+//!    row versions to new data files that embed each row's original rowid. On
+//!    a partitioned table each row is routed by its post-assignment key, so
+//!    changing a partition key moves the row.
+//! 2. Delete the superseded row versions from each source file.
+//! 3. Commit the new versions and every deletion in one snapshot.
+//! 4. Yield a single row `count: UInt64`, the rows updated.
 //!
 //! On a writer that [stages row
 //! mutations](MetadataWriter::supports_inlined_row_mutations) the statement
 //! follows official DuckLake's UPDATE (`ducklake_update.cpp`): visible inlined
 //! rows are updated too, superseded rows are deleted as a `DELETE` deletes
 //! them, and new versions are inlined with their row ids when the statement
-//! writes at most the scoped `data_inlining_row_limit`. Such a statement
-//! commits as one staged write ([`MetadataWriter::commit_multi_table`]);
-//! otherwise rewritten files and delete files commit through
+//! writes at most the scoped `data_inlining_row_limit`. A statement that
+//! inlines its new versions, updates inlined rows, or has deletions that need a
+//! staged commit (`FileDeletions::needs_staged_commit`) commits as one staged
+//! write ([`MetadataWriter::commit_multi_table`]). Any other statement commits
+//! its rewritten files and delete files through
 //! [`MetadataWriter::register_data_files_with_deletes`], driven by
 //! `TableWriteSession::finish_with_deletes`. Other writers get each source
 //! file's cumulative delete file.
