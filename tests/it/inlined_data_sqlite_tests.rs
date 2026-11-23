@@ -1249,7 +1249,7 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
            SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 1000
          )
          INSERT INTO {physical}(row_id, begin_snapshot, end_snapshot, identifier, value)
-         SELECT value + 100, ?, NULL, 'A', printf('%020d', value) FROM seq"
+         SELECT value + 100, ?, NULL, 'filler-' || value, printf('%020d', value) FROM seq"
     )))
     .bind(snapshot)
     .execute(&pool)
