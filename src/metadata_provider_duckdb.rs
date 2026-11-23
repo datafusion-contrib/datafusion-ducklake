@@ -192,44 +192,17 @@ fn matches_shape(text: &str, shape: &str) -> bool {
             })
 }
 
-/// The DuckDB type name a statistic is cast to for comparison against a
-/// constant of `data_type`, or `None` when DuckDB has no type that holds that
-/// constant's values exactly.
-///
-/// Arrow's own `Display` is not SQL — `Timestamp(Microsecond, None)` and `Utf8`
-/// are not names DuckDB knows — so the mapping is written out rather than
-/// formatted from the type. Declining a type drops that one comparison, which
-/// costs pruning and never rows, so anything that would not round-trip is
-/// declined:
-///
-/// - `Float16` has no DuckDB type. Widening to `FLOAT` would compare a
-///   half-precision bound against a single-precision literal.
-/// - A nanosecond timestamp with a time zone has no DuckDB type either
-///   (`TIMESTAMP_TZ_NS` does not exist) and `TIMESTAMPTZ` is microseconds.
-///   Truncating a bound *toward* the constant would prune a file whose true
-///   bound still admits a matching row. Second and millisecond precision widen
-///   into `TIMESTAMPTZ` losslessly, so those are kept.
-/// - A `DECIMAL` outside DuckDB's `precision <= 38`, `0 <= scale <= precision`
-///   range is not a type DuckDB will cast to at all.
-///
-/// Everything else is absent because `stats_encode::encode_scalar` has no
-/// canonical text for it (`TIME`, `INTERVAL`, `Decimal256`, `UUID`, blobs,
-/// nested types), so no literal of that type ever reaches here.
 /// A pattern admitting only the text [`crate::stats_encode`] writes for this
 /// type, for use as a `regexp_full_match` gate on a stat value.
 ///
-/// `TRY_CAST` alone is not enough. It answers "can DuckDB read this", and DuckDB
-/// reads a good deal this crate never writes: `nan` and `NaN` become NaN, `epoch`
-/// becomes 1970-01-01, `infinity` becomes an infinite date, `0x10` becomes 16.
-/// Each casts to a *value*, which then prunes files — a `nan` bound makes
-/// `x = 5.0` false for a file whose other rows match, and the in-memory path
-/// would have kept that file. Official DuckLake carries the same shape and is
-/// safe only because DuckDB wrote every stat it reads; a catalog this crate opens
-/// may have been written by anything, including `ducklake_add_files` over a
-/// pre-1.11 parquet-mr file whose float min/max hold NaN.
-///
-/// `inf` and `-inf` stay admitted: this crate writes them and DuckDB orders them
-/// correctly.
+/// `TRY_CAST` alone is not enough: DuckDB also reads text this crate never
+/// writes (`nan`, `epoch`, `infinity`, `0x10`) into real values, which then
+/// prune files. A `nan` bound makes `x = 5.0` false for a file whose other rows
+/// match. Official DuckLake is safe only because DuckDB wrote every stat it
+/// reads; a catalog this crate opens may hold stats from anything, such as
+/// `ducklake_add_files` over a pre-1.11 parquet-mr file with NaN bounds.
+/// `inf` and `-inf` stay admitted: this crate writes them and DuckDB orders
+/// them correctly.
 fn duckdb_castable_pattern(data_type: &DataType) -> Option<&'static str> {
     Some(match data_type {
         DataType::Boolean => r"^(true|false|1|0)$",
@@ -260,6 +233,24 @@ fn duckdb_castable_pattern(data_type: &DataType) -> Option<&'static str> {
     })
 }
 
+/// The DuckDB type name a statistic is cast to for comparison against a
+/// constant of `data_type`, or `None` when DuckDB has no type that holds that
+/// constant's values exactly.
+///
+/// Arrow's `Display` is not SQL, so the mapping is written out. Declining a type
+/// drops that one comparison, which costs pruning and never rows, so anything
+/// that would not round-trip is declined:
+///
+/// - `Float16` has no DuckDB type, and widening to `FLOAT` would compare a
+///   half-precision bound against a single-precision literal.
+/// - A nanosecond timestamp with a time zone has no DuckDB type, and truncating
+///   a bound to `TIMESTAMPTZ` microseconds could prune a matching file. Second
+///   and millisecond precision widen losslessly and are kept.
+/// - A `DECIMAL` outside `precision <= 38`, `0 <= scale <= precision` is not a
+///   type DuckDB casts to.
+///
+/// Other types have no canonical text in `stats_encode::encode_scalar`, so no
+/// literal of them reaches here.
 fn duckdb_cast_type(data_type: &DataType) -> Option<String> {
     let name = match data_type {
         DataType::Boolean => "BOOLEAN",

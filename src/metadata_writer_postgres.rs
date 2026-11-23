@@ -1228,29 +1228,21 @@ const ORPHAN_PURGE_MAX_BATCHES: usize = 10;
 
 /// Delete metadata rows whose owning row is already gone.
 ///
-/// Expire used to drop `ducklake_data_file` and `ducklake_snapshot` rows without
-/// the per-file and per-commit rows hanging off them, so catalogs written by an
-/// earlier version carry rows that no query can reach — every read joins through
-/// the owner — and that nothing will ever collect: expire only cleans what it is
-/// retiring in that transaction, and these owners were retired long ago.
+/// Earlier versions' expire dropped `ducklake_data_file` and `ducklake_snapshot`
+/// rows without their per-file and per-commit rows. Those rows are unreachable
+/// (every read joins through the owner) and nothing else collects them. No
+/// current path produces them, so on a drained catalog every pass finds
+/// nothing; this stays in the maintenance sweep to repair older catalogs and to
+/// catch any future path that forgets its children.
 ///
-/// This repairs that history. It is a maintenance operation, not part of expire:
-/// expire keeps deleting exactly what official deletes, and this runs beside it on
-/// the same sweep. Deliberately not called from schema initialization -- callers
-/// bootstrap on startup, often behind a lock where one long statement is a failed
-/// boot, and a scan for orphans has no business on that path.
+/// It runs beside expire, not inside it (expire deletes exactly what official
+/// deletes), and never at schema initialization, where callers bootstrap behind
+/// a lock and a long scan would fail the boot.
 ///
-/// With expire and `drop_catalog` both reclaiming their children, no path left in
-/// this crate produces these orphans, so on a drained catalog every pass finds
-/// nothing. It stays in the sweep rather than being deleted after one run because
-/// it is the only thing that can reach rows an older version stranded, and because
-/// it is the check that would catch a future path that forgets its children again.
-///
-/// Safety rests on the anti-join, not on a guess about what looks stale. A row
-/// whose owner is absent is unreachable by construction, and owner and dependants
-/// are always written in one transaction, so no snapshot can observe a dependant
-/// whose owner has not landed yet. Batched by `ctid` so each statement touches a
-/// bounded number of rows.
+/// Safety rests on the anti-join: a row whose owner is absent is unreachable by
+/// construction, and owners and dependants are written in one transaction, so
+/// no snapshot sees a dependant before its owner. Batched by `ctid` so each
+/// statement touches a bounded number of rows.
 pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
     // (dependant table, owning table, shared key)
     const TARGETS: &[(&str, &str, &str)] = &[
@@ -1322,41 +1314,33 @@ pub type CommitGuardError = Box<dyn std::error::Error + Send + Sync>;
 /// A check a PostgreSQL metadata writer runs inside each metadata transaction it
 /// commits, after the transaction's last write and immediately before `COMMIT`.
 ///
-/// It lets a caller tie a commit to a condition held in the same database, such
-/// as a lease row in a table of its own that it reads with `SELECT ... FOR SHARE`:
-/// the check and the commit are one transaction, so the condition cannot change
-/// between them.
+/// It ties a commit to a condition in the same database, such as a lease row
+/// read with `SELECT ... FOR SHARE`: the check and the commit are one
+/// transaction, so the condition cannot change between them.
 ///
-/// `before_commit` receives the transaction's own connection and sees every row
-/// the transaction has written. It may read anything and write tables of its
-/// own, but must not write any `ducklake_*` table, and must neither commit nor
-/// roll back the transaction. Returning `Err` rolls the transaction back, so
-/// nothing it wrote is committed, and the writer returns
-/// [`DuckLakeError::CommitRefused`](crate::DuckLakeError::CommitRefused) carrying
-/// the error. A write session treats that like any commit that registered
-/// nothing, and removes the files it uploaded.
+/// `before_commit` gets the transaction's own connection and sees every row it
+/// wrote. It may read anything and write its own tables, but must not write any
+/// `ducklake_*` table, commit or roll back. Returning `Err` rolls back and the
+/// writer returns [`DuckLakeError::CommitRefused`](crate::DuckLakeError::CommitRefused);
+/// a write session then removes the files it uploaded.
 ///
-/// A guard must return `Err` if any statement it ran on `conn` failed. A failed
-/// statement aborts the transaction, and PostgreSQL then answers the writer's
-/// `COMMIT` with a rollback rather than an error, so a guard that swallows the
+/// A guard must return `Err` if any statement it ran on `conn` failed: an
+/// aborted transaction answers `COMMIT` with a silent rollback, so a swallowed
 /// failure makes the writer report a commit that never happened.
 ///
-/// The guard runs with whatever locks the transaction already holds. On
-/// [`PostgresMetadataWriter`], a transaction that locks its catalog row
-/// `FOR UPDATE` runs the guard with that lock held and under the writer's
-/// `SET LOCAL lock_timeout`, so the guard's time is added to every such commit
-/// on the catalog; [`PostgresMetadataWriter::create_snapshot`] and table
-/// settings take no catalog lock and set no `lock_timeout`. The single-catalog
-/// writer has no catalog lock and sets no `lock_timeout`. A `SET` the guard
-/// issues without `LOCAL` outlives the transaction on the pooled connection.
+/// The guard runs with the locks the transaction holds. On
+/// [`PostgresMetadataWriter`], a commit that locks its catalog row
+/// `FOR UPDATE` runs the guard under that lock and the writer's
+/// `SET LOCAL lock_timeout`, so the guard's time adds to every such commit;
+/// [`PostgresMetadataWriter::create_snapshot`], table settings and the
+/// single-catalog writer take no catalog lock and set no timeout. A `SET`
+/// without `LOCAL` outlives the transaction on the pooled connection.
 ///
-/// The guard runs once per metadata transaction the writer commits, including
-/// the ones that write nothing: the id reservation at the start of a write, and
-/// a lookup that finds its schema or table already exists. Unguarded are
-/// [`MetadataWriter::initialize_schema`] and the writers' `migrate` functions,
-/// which create and upgrade the catalog tables, and the idempotent `CREATE TABLE
-/// IF NOT EXISTS` of `ducklake_inlined_data_tables` a staged commit runs before
-/// its transaction.
+/// It runs once per committed metadata transaction, including ones that write
+/// nothing (the id reservation at the start of a write, a lookup that finds its
+/// schema or table). Unguarded: [`MetadataWriter::initialize_schema`], the
+/// writers' `migrate` functions, and the `CREATE TABLE IF NOT EXISTS` of
+/// `ducklake_inlined_data_tables` a staged commit runs first.
 #[async_trait::async_trait]
 pub trait PostgresCommitGuard: Send + Sync + std::fmt::Debug {
     /// Approve or refuse the commit of the transaction `conn` is running.
@@ -2925,36 +2909,13 @@ async fn schedule_compaction_files(
     Ok(())
 }
 
-/// The atomic commit point for a multicatalog Postgres write, shared by
-/// `register_data_file` (with a data file) and `publish_snapshot` (fileless).
-/// The CALLER already holds the catalog `FOR UPDATE` lock and an open tx.
-///
-/// All metadata — the snapshot row, the get-or-create schema/table rows, the
-/// column generation, the `schema_versions` row, and the Replace retirement — is
-/// written HERE so nothing is visible until `advance_catalog_head` maps the
-/// snapshot (the caller runs that LAST). The `snapshot_id` is a plain IDENTITY
-/// insert, so per-catalog id order == commit order, which is what makes the
-/// scalar [`detect_replace_conflict`] and the dense schema_version computation
-/// exact. The reserved schema/table/column ids from begin are inserted with
-/// `OVERRIDING SYSTEM VALUE`; the reused column ids keep parquet field-ids stable.
-///
-/// Returns `(committed_snapshot_id, table_id)`.
-///
-/// `table_id_hint` is the id reserved for the table at begin; it is used only
-/// when the table does not yet exist (first write). The schema id is re-derived
-/// here — looked up if the schema already exists, else a fresh id is reserved
-/// from the sequence — because the reserved schema id from begin is not threaded
-/// through the commit (it is never baked into anything; the parquet path encodes
-/// the catalog id, not the schema id).
 /// Persist the harvested per-column stats for a just-registered data file
 /// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
 ///
-/// Sent as one `UNNEST` insert rather than a statement per column: this runs on
-/// every commit, and against a networked Postgres the round trip dominates the
-/// work — a wide table otherwise pays one round trip per column. Passing the
-/// columns as arrays (rather than a generated `VALUES` list) keeps the bind
-/// count fixed at nine, so a table cannot approach Postgres's 65535-parameter
-/// ceiling however many columns it has.
+/// Sent as one `UNNEST` insert, not a statement per column, since this runs on
+/// every commit and the round trip dominates. Passing columns as arrays keeps
+/// the bind count at nine, far from Postgres's 65535-parameter limit however
+/// wide the table.
 async fn insert_file_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -3253,28 +3214,23 @@ pub(crate) async fn merge_file_table_column_stats(
 }
 
 /// The table's stored `ducklake_table_column_stats` rows, less those whose
-/// bounds are unknown. A row with neither bound reads as holding no valid value
-/// (see [`crate::stats_encode::ColumnStats::from_global`]). Official writes one
-/// while the column's live files hold only NULLs or only NaN (whose bounds no
-/// reader uses once `contains_nan` is set), after a rewrite recomputes the
-/// statistics from such files, and for a `GEOMETRY` column, whose bounds are in
-/// `extra_stats`; this crate keeps those rows, as official merges into them.
-/// Releases of this crate up to 0.9 also wrote one, without NaN, when a live
-/// file's bounds were missing: a row with neither bound, no NaN and no
-/// `extra_stats` over a live file of an earlier commit not known to hold only
-/// NULLs or only NaN is dropped here, so the merge leaves the field with no row
-/// (unknown) instead of narrowing it to the new values. The commit's own
-/// snapshot is the newest, so its new files are not counted.
+/// bounds are unknown.
 ///
-/// This runs on every commit, so it reads the table's live files and their
-/// statistics once each: per column, it counts the live files known to hold
-/// only NULLs or only NaN and compares that with the number of live files. A
-/// table with no row of neither bound reads no file or statistic at all. Both
-/// `live` and `known` test for such a row: Postgres can scan the statistics
-/// before `live`, and an empty `live` does not stop that scan.
-/// Checking each live file of each such column against the statistics instead
-/// costs files × statistics rows, which grows with the square of the table's
-/// file count (#297).
+/// A row with neither bound reads as holding no valid value (see
+/// [`crate::stats_encode::ColumnStats::from_global`]). Official writes one when
+/// the live files hold only NULLs or only NaN, after a rewrite recomputes stats
+/// from such files, and for `GEOMETRY` (bounds in `extra_stats`); those rows are
+/// kept. Releases up to 0.9 also wrote one when a live file's bounds were
+/// missing, so a row with neither bound, no NaN and no `extra_stats`, over a
+/// live file of an earlier commit not known to hold only NULLs or only NaN, is
+/// dropped here: the merge then leaves the field unknown instead of narrowing it
+/// to the new values. The commit's own new files are not counted.
+///
+/// This runs on every commit, so it reads live files and their statistics once
+/// each, counting per column the files known to hold only NULLs or NaN; a table
+/// with no such row reads neither. Both `live` and `known` test for such a row,
+/// because Postgres may scan the statistics first. A per-file check would cost
+/// files × statistics rows, quadratic in the file count (#297).
 async fn load_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -3432,6 +3388,23 @@ pub(crate) async fn merge_inlined_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
+/// The atomic commit point for a multicatalog Postgres write, shared by
+/// `register_data_file` (with a data file) and `publish_snapshot` (fileless).
+/// The caller already holds the catalog `FOR UPDATE` lock and an open tx.
+///
+/// All metadata (the snapshot row, get-or-create schema and table rows, the
+/// column generation, the `schema_versions` row, the Replace retirement) is
+/// written here, and nothing is visible until the caller's final
+/// `advance_catalog_head` maps the snapshot. `snapshot_id` is a plain IDENTITY
+/// insert, so per-catalog id order is commit order, which keeps
+/// [`detect_replace_conflict`] and the dense schema_version exact. Ids reserved
+/// at begin are inserted with `OVERRIDING SYSTEM VALUE`; reused column ids keep
+/// parquet field ids stable.
+///
+/// Returns `(committed_snapshot_id, table_id)`. `table_id_hint` is the id
+/// reserved at begin, used only on a table's first write. The schema id is
+/// looked up, or freshly reserved, here, since nothing depends on the one
+/// reserved at begin (the parquet path encodes the catalog id, not the schema).
 #[allow(clippy::too_many_arguments)]
 async fn finalize_snapshot(
     catalog_id: i64,

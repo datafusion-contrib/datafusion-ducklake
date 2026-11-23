@@ -244,35 +244,26 @@ impl SchemaCapabilities {
 
 /// One pooled connection for the catalog reads of one query.
 ///
-/// Take one with [`MulticatalogProvider::begin_read_session`], and bind a
-/// provider's catalog reads to it with [`MulticatalogProvider::with_read_session`].
-/// The query then reads the catalog on this connection alone, instead of taking
-/// one from the pool for every statement. One session serves every catalog in
-/// its database.
+/// Take one with [`MulticatalogProvider::begin_read_session`] and bind a
+/// provider to it with [`MulticatalogProvider::with_read_session`]; the query
+/// then reads the catalog on this one connection rather than one per
+/// statement. One session serves every catalog in its database.
 ///
-/// The connection runs each statement on its own, except while a consistent
-/// read ([`MetadataProvider::begin_consistent_read`]) of a provider bound to the
-/// session is open. A provider bound to the session begins its consistent reads
-/// on this connection, and while any of them is open the connection is inside
-/// one read-only `REPEATABLE READ` transaction, begun by the first and committed
-/// by the last to end. So the scans of a query that read the catalog at once
-/// read one snapshot of it, as official DuckLake reads all of a transaction's
-/// metadata in one metadata transaction. While no consistent read is open, each
-/// read sees the catalog as of its own statement: a writer commits on
-/// connections of its own, and a maintenance step that reads the head after
-/// its own commit sees it. While one is open, every read through a provider
-/// bound to the session, a maintenance step's included, sees that read's
-/// snapshot, so keep a session for the reads of one query. One
-/// transaction for all of a query's catalog reads and writes is tracked in
-/// #394.
+/// While a consistent read ([`MetadataProvider::begin_consistent_read`]) of a
+/// bound provider is open, the connection is inside one read-only
+/// `REPEATABLE READ` transaction, begun by the first such read and committed by
+/// the last, so concurrent scans of a query read one snapshot, as official
+/// DuckLake reads a transaction's metadata in one metadata transaction. Every
+/// read through a bound provider, maintenance included, then sees that
+/// snapshot, so keep a session to one query. Otherwise each statement sees the
+/// catalog as of itself. (One transaction for all of a query's catalog reads
+/// and writes is tracked in #394.)
 ///
-/// [`Self::end`] gives the connection back to the pool. A provider still bound
-/// to an ended session reads through the pool again, each statement on its own
-/// and each consistent read on a connection of its own, so a read that comes
-/// late still works. Dropping the last handle to an open session gives the
-/// connection back as well, rolling back the transaction of any read still
-/// open on it. A consistent read dropped without its end, while it is the only
-/// one open on a session no statement is using, ends the session the same way.
+/// [`Self::end`] returns the connection to the pool; a provider still bound to
+/// an ended session falls back to the pool. Dropping the last handle to an open
+/// session also returns the connection, rolling back any open read, as does
+/// dropping, without ending it, the only consistent read open on an otherwise
+/// idle session.
 #[derive(Debug, Clone)]
 pub struct MetadataReadSession {
     inner: Arc<ReadSessionInner>,
@@ -1193,29 +1184,23 @@ impl MulticatalogProvider {
 /// in its `LIMIT`), each listed file's column statistics, and whether the table
 /// has any partition values.
 ///
-/// The statistics are read by a `LATERAL` subquery bound to one page row's
-/// file, which probes `idx_file_column_stats_table_file_column` for that file
-/// alone. Its cost is one probe per listed file whatever the server estimates
-/// the page at. A join between the page and a per-file aggregate is not: once a
-/// prepared statement switches to a generic plan, the server estimates the
-/// page at one row, nests the aggregate under the page and runs it once per
-/// page row. That is page × page × columns rows: 13 s for a 4,000-file page on
-/// PostgreSQL 18, against 46 ms planned with the real table id.
+/// Statistics are read by a `LATERAL` subquery per page row, one probe of
+/// `idx_file_column_stats_table_file_column` per listed file. A join against a
+/// per-file aggregate is not safe here: under a generic plan the server
+/// estimates the page at one row and reruns the aggregate per row (13 s for a
+/// 4,000-file page on PostgreSQL 18, against 46 ms).
 ///
-/// Partition values are not read here. Their index is `(table_id,
-/// partition_key_index)`, not the file, so a read per file would visit the
-/// table's values once for every file on the page. The page carries only
-/// whether the table has any, and the caller reads them for the page's id range
-/// when it does (see [`MulticatalogProvider::read_page_partition_values`]).
+/// Partition values are not read here, since their index is
+/// `(table_id, partition_key_index)` and a per-file read would revisit the
+/// table's values once per file. The page reports only whether any exist, and
+/// the caller reads them for the page's id range
+/// ([`MulticatalogProvider::read_page_partition_values`]).
 ///
-/// Each array is sorted on every column of the row, not on its key alone, so
-/// the arrays of one file stay aligned even if two rows share a key.
-/// `statistics` false selects NULL arrays, and `partition_values` false selects
-/// false, for a catalog without that table. Either way the columns carry the
-/// same names, which the decoders read them by.
-///
-/// The parameters are the listing's own (`$4` is the table id), so the
-/// statement binds exactly what [`fetch_data_file_page`] binds.
+/// Each array is sorted on every column, so one file's arrays stay aligned even
+/// when rows share a key. `statistics` false selects NULL arrays and
+/// `partition_values` false selects false, for catalogs without those tables;
+/// column names stay the same for the decoders. The parameters are the
+/// listing's own (`$4` is the table id), as [`fetch_data_file_page`] binds them.
 fn listing_page_sql(listing: &str, statistics: bool, partition_values: bool) -> String {
     const STATISTICS_ORDER: &str = "s.column_id, s.column_size_bytes, s.value_count, \
         s.null_count, s.min_value, s.max_value, s.contains_nan";

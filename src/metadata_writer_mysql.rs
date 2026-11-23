@@ -1,17 +1,13 @@
 //! MySQL implementation of [`MetadataWriter`].
 //!
-//! Single-catalog only — the legacy DuckLake v1.0 layout, mirroring
-//! [`crate::metadata_writer_sqlite::SqliteMetadataWriter`] rather than the
-//! multicatalog Postgres writer. It supports the crate's write primitives,
-//! inlined data, positional deletes, updates, compaction, truncate, append
-//! restoration, type promotion, partition and sort metadata, and snapshot
-//! expiry. Multiple catalogs remain specific to PostgreSQL;
-//! [`MetadataWriter::catalog_id`] inherits the `None` default and keeps file
-//! paths in the `{data_path}/{schema}/{table}/…` layout.
+//! Single-catalog only (the DuckLake v1.0 layout), mirroring
+//! [`crate::metadata_writer_sqlite::SqliteMetadataWriter`] with the same write
+//! features. [`MetadataWriter::catalog_id`] returns `None`, and file paths use
+//! the `{data_path}/{schema}/{table}/…` layout.
 //!
-//! Requires a multi-threaded Tokio runtime (`#[tokio::test(flavor =
-//! "multi_thread")]`): the sync trait methods bridge async sqlx via
-//! `crate::metadata_provider::block_on`, exactly like the SQLite writer.
+//! Requires a multi-threaded Tokio runtime: the sync trait methods bridge async
+//! sqlx through `crate::metadata_provider::block_on`, as the SQLite writer
+//! does.
 //!
 //! ## MySQL dialect adaptations vs the SQLite template
 //!

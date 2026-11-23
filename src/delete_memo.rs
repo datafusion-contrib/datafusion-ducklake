@@ -18,27 +18,21 @@ use std::sync::{Arc, Mutex};
 
 /// How a [`DuckLakeTable`](crate::DuckLakeTable) reuses what its scans read.
 ///
-/// By default (`DuckLakeReadOptions::default()`) a table reads every delete file
-/// a scan reaches, on every scan. Give the delete memo a byte budget to keep
-/// those positions for the table's later scans instead; [`Self::memoized`]
-/// turns the memo on with the default budget. Apply the options with
-/// [`DuckLakeCatalog::with_read_options`](crate::DuckLakeCatalog::with_read_options)
+/// By default a table reads every delete file a scan reaches, on every scan.
+/// Give the delete memo a byte budget to keep those positions for later scans;
+/// [`Self::memoized`] turns it on with the default budget. Apply the options
+/// with [`DuckLakeCatalog::with_read_options`](crate::DuckLakeCatalog::with_read_options)
 /// or [`DuckLakeTable::with_read_options`](crate::DuckLakeTable::with_read_options).
-///
-/// The memo pays off for a caller that keeps a built table across queries, for
-/// example one that caches tables by catalog, name and snapshot. A table that a
-/// catalog lookup builds for one statement is seldom scanned twice.
+/// The memo pays off for a caller that keeps built tables across queries; a
+/// table built for one statement is seldom scanned twice.
 ///
 /// # Budget
 ///
-/// The budget holds per table, so a caller that keeps many tables keeps up to
-/// that many budgets. Byte counts are estimates of the heap memory held.
-///
-/// The memo keeps positions until they fill [`Self::delete_memo_bytes`]. It
-/// never evicts: once full, it keeps what it has, and other delete files are
-/// read on each scan. A merge or a rewrite can replace a data file that the memo
-/// holds positions for. The old file's entry stays in the memo, and counts
-/// against its budget, until the table is dropped.
+/// The budget is per table, and byte counts estimate heap memory held. The memo
+/// fills up to [`Self::delete_memo_bytes`] and never evicts: once full, other
+/// delete files are read on each scan. An entry for a data file that a merge or
+/// rewrite replaced stays, counting against the budget, until the table is
+/// dropped.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeReadOptions {

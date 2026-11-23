@@ -1,36 +1,28 @@
 //! The inlined row versions a change feed reads, in bounded pages.
 //!
 //! Planning reads the first page of a selection (the versions written, or
-//! deleted, in the window) inside the plan's consistent catalog read, and the
-//! plan holds it, charged to the session's memory pool. A window whose
-//! versions fit one page (the session's `batch_size` rows) is read whole
-//! there, as it always was. The rest of a larger one is read while the plan
-//! executes, a page at a time, by [`InlinedPagesExec`], so what a feed holds
-//! of the catalog's inlined rows is bounded by a page rather than by the
-//! window.
+//! deleted, in the window) inside the plan's consistent catalog read and holds
+//! it, charged to the session's memory pool. A window that fits one page (the
+//! session's `batch_size` rows) is read whole there. The rest of a larger one
+//! is read at execution, a page at a time, by [`InlinedPagesExec`], so a feed
+//! holds at most a page of inlined rows.
 //!
-//! Every page of a selection shows the catalog the plan read. The pages read
-//! at execution go through one consistent read pinned to the state of the
-//! plan's ([`MetadataProvider::pin_consistent_read`]), begun at planning and
-//! shared by the selections of the feed, so a flush that commits after
-//! planning moves no row out from under them: the feed answers as of the
-//! catalog it planned against, as official DuckLake reads a whole feed in
-//! one transaction. Inside that read the pages stream from one statement per
-//! physical inlined-data table (a server-side cursor on PostgreSQL, a
-//! temporary table on SQLite; see [`ConsistentRead`]'s cursor), since the
-//! inlined tables have no index a keyset query per page could seek with: each
-//! page would scan and sort the whole table again. A provider that cannot pin
-//! a read, including one whose pool has no connection free to pin it on, has
-//! the rest of a selection read at planning, one statement per physical
-//! inlined-data table, inside the plan's consistent read.
+//! Every page shows the catalog the plan read. Execution-time pages go through
+//! one consistent read pinned to the plan's state
+//! ([`MetadataProvider::pin_consistent_read`]) and shared by the feed's
+//! selections, so a flush that commits after planning moves no row under them,
+//! as official DuckLake reads a whole feed in one transaction. Pages stream
+//! from one statement per inlined-data table (a server-side cursor on
+//! PostgreSQL, a temporary table on SQLite; see [`ConsistentRead`]'s cursor),
+//! since those tables have no index a per-page keyset query could seek. A
+//! provider that cannot pin a read, including one with no free connection,
+//! reads the rest of the selection at planning instead.
 //!
-//! A selection's pages can be read by more than one node of the plan (an
-//! update pairing reads them as rows and as keys); each node holds its own
-//! handle to the pinned read and lets go of it when it has read its last
-//! page, fails, or its stream is dropped, and a node never executed lets go
-//! of it when the plan drops. The read ends with the last handle. Until then
-//! it holds one catalog connection, and the database keeps the row versions
-//! it shows: a feed read slowly holds it for as long as it reads.
+//! Several plan nodes can read one selection's pages (an update pairing reads
+//! them as rows and as keys). Each holds its own handle to the pinned read and
+//! releases it after its last page, on failure, or when dropped. The read ends
+//! with the last handle; until then it holds one catalog connection, and the
+//! database keeps the row versions it shows for as long as the feed reads.
 
 use std::sync::{Arc, Mutex};
 

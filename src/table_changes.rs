@@ -112,38 +112,27 @@ impl fmt::Display for ChangeType {
 }
 
 /// Present a per-file CDC scan under the catalog schema: `table_fields` resolved
-/// by field id and coerced to their catalog types, then whatever internal columns
-/// the scan appended (embedded rowid, embedded per-row snapshot, physical
-/// position) passed through unchanged, by name.
+/// by field id and coerced to their catalog types, then the scan's internal
+/// columns (embedded rowid, embedded per-row snapshot, physical position)
+/// passed through by name.
 ///
-/// The wrap is decided against a target that does NOT depend on the file, because
-/// a union's branches must all end up with the SAME output schema: `UnionExec`
-/// validates the field count only, adopts the first branch's names, and panics on
-/// a type mismatch. Wrapping "only the files that need renaming" would emit the
-/// pre-rename column name for the others.
+/// The target does not depend on the file, because every branch of a union
+/// must have the same schema: `UnionExec` checks only the field count, adopts
+/// the first branch's names, and panics on a type mismatch.
 ///
-/// Two latent hazards, both shared with the ordinary table scan, which presents
-/// its positional reads the same way:
+/// Two hazards, shared with the ordinary table scan:
 ///
-/// - A NOT NULL top-level column that an older file does not carry is read as an
-///   all-NULL array and then presented under the non-nullable catalog field, which
-///   `record_batch_with_schema` rejects. DuckDB's own extension cannot create that
-///   state (`ADD COLUMN … NOT NULL` is refused as "Adding columns with constraints
-///   not yet supported"), but this crate's writer and third-party implementations
+/// - A NOT NULL column that an older file lacks is read as all-NULL and then
+///   rejected by `record_batch_with_schema`. DuckDB cannot create that state
+///   (it refuses `ADD COLUMN … NOT NULL`), but this crate's writer and others
 ///   can.
-/// - The internal column names are not reserved: nothing stops a table column
-///   from being called `__ducklake_row_pos`, and nothing stops an older file from
-///   physically carrying a column called `__ducklake_absent_field_<id>`. Either
-///   makes two fields of one schema share a name, and the by-name lookup then
-///   binds the first — reading the table column where the position was meant, or
-///   real data where a null-fill was meant.
-///
-///   The position column is handled: its callers pass the catalog names to
-///   `positional_table_schema_reserving`, which suffixes the internal name until
-///   it clears both name spaces. The `__ducklake_absent_field_<id>` case, and the
-///   embedded rowid / snapshot-id columns (whose names come from the file footer
-///   and so cannot be suffixed), are not — binding those by index rather than by
-///   name is the durable fix.
+/// - Internal column names are not reserved, so a table column named
+///   `__ducklake_row_pos`, or a file column named
+///   `__ducklake_absent_field_<id>`, makes two fields share a name and the
+///   by-name lookup binds the wrong one. The position column is handled
+///   (`positional_table_schema_reserving` suffixes it until it is unique). The
+///   absent-field and embedded rowid / snapshot-id columns are not; binding
+///   them by index is the durable fix.
 pub(crate) fn present_catalog_schema(
     scan: Arc<dyn ExecutionPlan>,
     table_fields: &[FieldRef],

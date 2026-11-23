@@ -1,25 +1,23 @@
 //! Resolve each data file's columns by parquet field id when the reader opens
 //! the file, rather than while the scan is planned.
 //!
-//! A DuckLake column keeps its `column_id` across renames, and a data file tags
-//! each column it stores with that id as its parquet field id. Which physical
-//! column backs a catalog column is therefore a property of the file, and
-//! official DuckLake binds it per file as each reader opens
-//! (`DuckLakeMultiFileReader::Bind` declares `MultiFileColumnMappingMode::BY_FIELD_ID`
-//! and `MultiFileReader::CreateMapping` resolves the ids against the opened file's
-//! columns). [`FieldIdExprAdapterFactory`] does the same inside DataFusion's parquet
-//! opener: the opener hands it the file's Arrow schema, which carries the field ids
-//! the reader read from the footer it has just fetched, and the adapter rewrites the
+//! A DuckLake column keeps its `column_id` across renames, and each data file
+//! tags its columns with that id as the parquet field id, so which physical
+//! column backs a catalog column is a property of the file. Official DuckLake
+//! binds it per file as each reader opens
+//! (`MultiFileColumnMappingMode::BY_FIELD_ID`). [`FieldIdExprAdapterFactory`]
+//! does the same inside DataFusion's parquet opener: given the file's Arrow
+//! schema with the field ids from the footer it just fetched, it rewrites the
 //! scan's projection and predicate from catalog columns to that file's columns.
-//! Planning therefore reads no footer, and a scan that stops early never opens the
-//! files it does not reach.
+//! Planning reads no footer, and a scan that stops early never opens the files
+//! it does not reach.
 //!
-//! The per-file resolution is the one [`build_read_schema_with_field_id_mapping_from_schema`]
-//! describes: a renamed column is read under its physical name, a column the file
-//! does not carry is filled with its `initial_default` or NULL, and a nested column
-//! is read with its children resolved by nested field id. [`CatalogTypeExpr`] then
-//! presents each value under the catalog's type with the per-column conversion
-//! [`crate::column_rename::ColumnRenameExec`] applies.
+//! The per-file resolution is the one
+//! [`build_read_schema_with_field_id_mapping_from_schema`] describes: a renamed
+//! column is read under its physical name, a missing column is filled with its
+//! `initial_default` or NULL, and nested children resolve by nested field id.
+//! [`CatalogTypeExpr`] then presents each value in the catalog's type, with the
+//! conversion [`crate::column_rename::ColumnRenameExec`] applies.
 
 use std::fmt;
 use std::hash::Hash;

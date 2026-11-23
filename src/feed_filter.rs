@@ -1,39 +1,31 @@
 //! Filters pushed into the change feeds' insertion reads.
 //!
-//! A filter a query puts on `ducklake_table_insertions` (or on the rows
+//! A filter on `ducklake_table_insertions` (or on the rows
 //! `ducklake_table_changes` reports) narrows what the feed reads three ways,
-//! each only ever dropping rows the filter rejects:
+//! each dropping only rows the filter rejects:
 //!
-//! - **data files**, by their catalog column statistics: a file whose recorded
-//!   bounds prove no row can match is not read at all;
+//! - **data files**, by catalog column statistics: a file whose bounds prove no
+//!   row can match is not read;
 //! - **row groups and pages**, by handing the filter to each file's Parquet
 //!   reader;
 //! - **inlined rows**, by narrowing the catalog query that reads them.
 //!
-//! Every filter stays above the feed as well (the providers declare it
-//! `Inexact`), so what the feed returns is exactly what it returned unfiltered,
-//! filtered. Only conjuncts over the table's own columns are pushed: the CDC
-//! columns (`snapshot_id`, `rowid`, `change_type`) are derived by the feed, not
-//! read.
+//! Every filter also stays above the feed (the providers declare it `Inexact`),
+//! so results are unchanged. Only conjuncts over the table's own columns are
+//! pushed; the CDC columns (`snapshot_id`, `rowid`, `change_type`) are derived,
+//! not read.
 //!
-//! The deletion side of a feed is never narrowed by data values: a consumer
-//! reconciles insertions against deletions (and `ducklake_table_changes` pairs
-//! them into update images), so its deletions, and the keys of the insertions
-//! it pairs them with, must stay complete for the window.
+//! The deletion side is never narrowed by data values: a consumer reconciles
+//! insertions against deletions (and `ducklake_table_changes` pairs them into
+//! update images), so deletions, and the keys of the insertions they pair with,
+//! must stay complete for the window.
 //!
-//! Pruning data files by catalog statistics is a divergence from official
-//! DuckLake (at duckdb/ducklake `d8a1881e`). Official's change feeds scan
-//! through the table's multi-file list, which accepts a pushed filter only
-//! when the scan type is `SCAN_TABLE` (`ducklake_multi_file_list.cpp:61-62`,
-//! `DynamicFilterPushdown`, and `:86`, `ComplexFilterPushdown`): a feed
-//! (`SCAN_INSERTIONS`, `SCAN_DELETIONS`) lists every file of its window and
-//! filters only in the Parquet reader. Pruning is kept here because it is most
-//! of what the pushdown buys: a selective filter over a 30-file window read 1
-//! file instead of 30 (2.17 MB instead of 64.65 MB, 6.3 ms instead of
-//! 25.2 ms). It changes no answer, since every filter is still applied above
-//! the feed. Converging means either official taking the same pruning for its
-//! insertion scans or this crate dropping [`FeedFilter::pruned_files`]; see
-//! `COMPATIBILITY.md`.
+//! Pruning data files by statistics diverges from official DuckLake, whose
+//! feeds accept a pushed filter only for `SCAN_TABLE` scans and so list every
+//! file of the window. It is kept because it is most of what the pushdown buys
+//! (one file read instead of 30 for a selective filter over a 30-file window)
+//! and changes no answer. Converging means official adopting the same pruning
+//! or this crate dropping [`FeedFilter::pruned_files`]; see `COMPATIBILITY.md`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
