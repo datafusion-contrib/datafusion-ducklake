@@ -1253,3 +1253,134 @@ async fn register_refuses_duplicate_column_stats() {
         .unwrap();
     assert_eq!(stored, 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn struct_leaf_stats_prune_non_matching_files() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("stats.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap()
+        .with_data_inlining_row_limit(0);
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    table_writer
+        .write_table("main", "t", &[struct_score_batch(vec![10, 20])])
+        .await
+        .unwrap();
+    table_writer
+        .append_table("main", "t", &[struct_score_batch(vec![100, 200])])
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let files: Vec<(i64, String)> = sqlx::query(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE end_snapshot IS NULL ORDER BY data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.try_get(0).unwrap(), row.try_get(1).unwrap()))
+    .collect();
+    assert_eq!(files.len(), 2);
+
+    let provider = SqliteMetadataProvider::new(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(catalog));
+    let sql = "SELECT payload.score FROM test.main.t WHERE payload.score < 50";
+
+    assert_eq!(row_count(&ctx, sql).await, 2);
+    let plan = physical_plan(&ctx, sql).await;
+    assert!(
+        plan.contains(&files[0].1),
+        "matching file must remain in the plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains(&files[1].1),
+        "non-matching file must be pruned by the struct leaf bound:\n{plan}"
+    );
+
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, column_size_bytes,
+              value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+         SELECT data_file_id, table_id, column_id, column_size_bytes,
+                value_count, null_count, '0', '50', contains_nan, extra_stats
+         FROM ducklake_file_column_stats
+         WHERE data_file_id = ?",
+    )
+    .bind(files[1].0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let duplicate_plan = physical_plan(
+        &ctx,
+        "SELECT payload.score FROM test.main.t WHERE payload.score > 150",
+    )
+    .await;
+    assert!(
+        duplicate_plan.contains(&files[1].1),
+        "ambiguous duplicate leaf stats must keep the file:\n{duplicate_plan}"
+    );
+
+    sqlx::query(
+        "UPDATE ducklake_file_column_stats
+         SET min_value = '30', max_value = '0'
+         WHERE data_file_id = ?",
+    )
+    .bind(files[0].0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let inverted_plan = physical_plan(&ctx, sql).await;
+    assert!(
+        inverted_plan.contains(&files[0].1),
+        "inverted leaf bounds must keep the file:\n{inverted_plan}"
+    );
+    assert_eq!(row_count(&ctx, sql).await, 2);
+
+    sqlx::query(
+        "UPDATE ducklake_file_column_stats
+         SET min_value = '150', max_value = '200', value_count = 3, null_count = 0
+         WHERE data_file_id = ?",
+    )
+    .bind(files[0].0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let invalid_count_plan = physical_plan(&ctx, sql).await;
+    assert!(
+        invalid_count_plan.contains(&files[0].1),
+        "inconsistent leaf counts must keep the file:\n{invalid_count_plan}"
+    );
+    assert_eq!(row_count(&ctx, sql).await, 2);
+}
+
+fn struct_score_batch(scores: Vec<i32>) -> RecordBatch {
+    let fields = vec![Arc::new(Field::new("score", DataType::Int32, true))];
+    let values = arrow::array::StructArray::new(
+        fields.clone().into(),
+        vec![Arc::new(Int32Array::from(scores))],
+        None,
+    );
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(fields.into()),
+            true,
+        )])),
+        vec![Arc::new(values)],
+    )
+    .unwrap()
+}

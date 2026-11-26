@@ -1709,7 +1709,7 @@ async fn a_feed_gives_its_pinned_connection_back(lake: &Lake) {
     let sql = sqls.last().unwrap();
     lake.pool.settles_at(0, "before planning").await;
 
-    let (plan, _) = plan_paged(lake, sql).await;
+    let (plan, _) = planned_pinned(lake, sql, 0, plan_paged).await;
     lake.pool
         .settles_at(1, "a plan holds one pinned read for both selections")
         .await;
@@ -1718,20 +1718,22 @@ async fn a_feed_gives_its_pinned_connection_back(lake: &Lake) {
         .settles_at(0, "a plan dropped unexecuted ends its pinned read")
         .await;
 
-    let (plan, task) = plan_paged(lake, sql).await;
+    let (plan, task) = planned_pinned(lake, sql, 0, plan_paged).await;
     let mut stream = datafusion::physical_plan::execute_stream(Arc::clone(&plan), task).unwrap();
     futures::StreamExt::next(&mut stream)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(lake.pool.in_use(), 1, "the stream holds the pinned read");
+    lake.pool
+        .settles_at(1, "the stream holds the pinned read")
+        .await;
     drop(stream);
     drop(plan);
     lake.pool
         .settles_at(0, "a query cancelled mid-read ends its pinned read")
         .await;
 
-    let (plan, task) = plan_paged(lake, sql).await;
+    let (plan, task) = planned_pinned(lake, sql, 0, plan_paged).await;
     let (whole, _) = lake.session();
     assert_eq!(
         collected(Arc::clone(&plan), task).await.unwrap(),

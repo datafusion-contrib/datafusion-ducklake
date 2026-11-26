@@ -2286,6 +2286,7 @@ impl DuckLakeTable {
         inlined_filter: Option<&InlinedFilter>,
         stats_filter: Option<&StatsFilter>,
         pruning: &[PruningPredicate],
+        nested_pruning: Option<&NestedStatsPruning>,
     ) -> DataFusionResult<ScanCatalogReads> {
         let inlined_deletes = self.inlined_deletes_by_file()?;
         'read: for _ in 0..SCAN_READ_ATTEMPTS {
@@ -2301,6 +2302,10 @@ impl DuckLakeTable {
                 if written_since(&metadata, next_file_id) {
                     continue 'read;
                 }
+                let metadata = match nested_pruning {
+                    Some(pruning) => pruning.retain_matching(metadata),
+                    None => metadata,
+                };
                 let (table_files, mut file_statistics, mut summary_statistics) =
                     self.page_files_with_both_statistics(metadata);
                 #[cfg(feature = "encryption")]
@@ -6710,6 +6715,7 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
+        let nested_pruning = NestedStatsPruning::new(self, state, filters, max_in_list_size);
         // The inlined deletions, the inlined rows and every page of the
         // listing, read in one consistent read of the catalog and pruned page
         // by page (`Self::scan_catalog_reads`). Building the scans below reads
@@ -6724,6 +6730,7 @@ impl TableProvider for DuckLakeTable {
                 inlined_filter.as_ref(),
                 stats_filter.as_ref(),
                 &pruning,
+                nested_pruning.as_ref(),
             )
         })?;
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -7475,6 +7482,182 @@ pub(crate) fn feed_files_pruned_by_statistics(
         .zip(keep)
         .filter_map(|(file, keep)| (!keep).then_some(file.data_file_id))
         .collect()
+}
+
+struct NestedStatsPruning {
+    schema: SchemaRef,
+    columns: Vec<DuckLakeTableColumn>,
+    predicates: Vec<PruningPredicate>,
+}
+
+impl NestedStatsPruning {
+    fn new(
+        table: &DuckLakeTable,
+        state: &dyn Session,
+        filters: &[Expr],
+        max_in_list_size: usize,
+    ) -> Option<Self> {
+        use datafusion::common::tree_node::{Transformed, TreeNode};
+
+        let has_field_filter = filters.iter().any(|filter| {
+            filter
+                .exists(|expr| {
+                    Ok(matches!(expr, Expr::ScalarFunction(function) if function.name() == "get_field"))
+                })
+                .unwrap_or(false)
+        });
+        if !has_field_filter {
+            return None;
+        }
+        let fields_by_id: HashMap<_, _> = table
+            .fields
+            .iter()
+            .map(|field| (field.column_id, field))
+            .collect();
+        let mut names = HashMap::new();
+        let mut columns = Vec::new();
+        let mut fields = Vec::new();
+        'leaf: for field in &table.fields {
+            if field.parent_column.is_none() {
+                continue;
+            }
+            let Ok(data_type) = ducklake_to_arrow_type(&field.column_type) else {
+                continue;
+            };
+            if data_type.is_nested() {
+                continue;
+            }
+            let mut path = vec![field.column_name.clone()];
+            let mut parent = field.parent_column;
+            while let Some(parent_id) = parent {
+                let parent_field = fields_by_id.get(&parent_id)?;
+                if !parent_field.column_type.eq_ignore_ascii_case("struct") {
+                    continue 'leaf;
+                }
+                path.push(parent_field.column_name.clone());
+                parent = parent_field.parent_column;
+            }
+            path.reverse();
+            let name = format!("_ducklake_stat_{}", field.column_id);
+            if table.physical_schema.field_with_name(&name).is_ok() {
+                continue;
+            }
+            names.insert(path, name.clone());
+            columns.push(field.column());
+            fields.push(Field::new(name, data_type, true));
+        }
+        if names.is_empty() {
+            return None;
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).ok()?;
+        let predicates: Vec<_> = filters
+            .iter()
+            .flat_map(datafusion::logical_expr::utils::split_conjunction)
+            .filter_map(|expr| {
+                let rewritten = expr
+                    .clone()
+                    .transform_down(|expr| {
+                        let name = match &expr {
+                            Expr::ScalarFunction(function) if function.name() == "get_field" => {
+                                struct_field_path(&expr).and_then(|path| names.get(&path))
+                            },
+                            _ => None,
+                        };
+                        Ok(match name {
+                            Some(name) => {
+                                Transformed::yes(Expr::Column(Column::new_unqualified(name)))
+                            },
+                            None => Transformed::no(expr),
+                        })
+                    })
+                    .ok()?;
+                if !rewritten.transformed {
+                    return None;
+                }
+                let physical = state
+                    .create_physical_expr(rewritten.data, &df_schema)
+                    .ok()?;
+                PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&schema))
+                    .with_max_in_list_size(max_in_list_size)
+                    .try_build(physical)
+                    .ok()
+            })
+            .collect();
+        (!predicates.is_empty()).then_some(Self {
+            schema,
+            columns,
+            predicates,
+        })
+    }
+
+    fn retain_matching(&self, metadata: Vec<DuckLakeFileMetadata>) -> Vec<DuckLakeFileMetadata> {
+        let file_stats = metadata.iter().map(|entry| {
+            let mut raw = HashMap::new();
+            for stat in &entry.column_statistics {
+                raw.entry(stat.column_id)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(stat));
+            }
+            let mut stats = Statistics::new_unknown(&self.schema);
+            for (index, column) in self.columns.iter().enumerate() {
+                let Some(Some(bounds)) = raw.get(&column.column_id) else {
+                    continue;
+                };
+                if let (Some(values), Some(nulls), Some(rows)) =
+                    (bounds.value_count, bounds.null_count, entry.file.max_row_count)
+                    && (values < 0 || nulls < 0 || values.checked_add(nulls) != Some(rows))
+                {
+                    continue;
+                }
+                let data_type = self.schema.field(index).data_type();
+                if float_bound_is_usable(data_type, bounds.contains_nan) {
+                    let min = scalar_precision(bounds.min_value.as_deref(), column, data_type, true);
+                    let max = scalar_precision(bounds.max_value.as_deref(), column, data_type, true);
+                    if matches!((min.get_value(), max.get_value()), (Some(lo), Some(hi)) if lo > hi) {
+                        continue;
+                    }
+                    stats.column_statistics[index].min_value = min;
+                    stats.column_statistics[index].max_value = max;
+                }
+            }
+            Arc::new(stats)
+        }).collect();
+        let stats = FilePruningStatistics::new(file_stats, Arc::clone(&self.schema));
+        let mut keep = vec![true; metadata.len()];
+        for predicate in &self.predicates {
+            let Ok(mask) = predicate.prune(&stats) else {
+                continue;
+            };
+            for (kept, matches) in keep.iter_mut().zip(mask) {
+                *kept &= matches;
+            }
+        }
+        metadata
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(file, keep)| keep.then_some(file))
+            .collect()
+    }
+}
+
+fn struct_field_path(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Column(column) => Some(vec![column.name.clone()]),
+        Expr::ScalarFunction(function) if function.name() == "get_field" => {
+            let (base, fields) = function.args.split_first()?;
+            let mut path = struct_field_path(base)?;
+            for field in fields {
+                let Expr::Literal(value, _) = field else {
+                    return None;
+                };
+                path.push(value.try_as_str().flatten()?.to_string());
+            }
+            Some(path)
+        },
+        _ => None,
+    }
 }
 
 struct FilePruningStatistics {
