@@ -736,3 +736,35 @@ async fn test_filter_pushes_down_over_evolved_struct_column() -> Result<()> {
     );
     Ok(())
 }
+
+#[rstest::rstest]
+#[case("s.bb < 30", 1)]
+#[case("s.bb > 30", 2)]
+#[tokio::test]
+async fn renamed_struct_leaf_statistics_prune_files(
+    #[case] predicate: &str,
+    #[case] expected_id: i32,
+) -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("renamed_struct_pruning.ducklake");
+    create_catalog_evolved_struct_child(&catalog_path, true)?;
+    let ctx = evolved_struct_context(&catalog_path).await?;
+    let query = ctx
+        .sql(&format!("SELECT id FROM ducklake.main.t WHERE {predicate}"))
+        .await?;
+    let plan = query.clone().create_physical_plan().await?;
+    let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(rendered.matches(".parquet").count(), 1, "{rendered}");
+
+    let rows = query.collect().await?;
+    assert_eq!(rows.len(), 1);
+    let ids = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids, &Int32Array::from(vec![expected_id]));
+    Ok(())
+}
