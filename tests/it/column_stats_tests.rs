@@ -90,7 +90,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
     let table_writer =
         DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
     table_writer
-        .write_table("main", "t", &[batch])
+        .write_table("main", "t", std::slice::from_ref(&batch))
         .await
         .unwrap();
 
@@ -222,6 +222,59 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             ),
         ],
         "table-wide roll-up must reflect the single file's bounds"
+    );
+
+    let mut columns = batch.slice(0, 1).columns().to_vec();
+    let minimum_uuid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
+    columns[4] = Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size([Some(minimum_uuid)].into_iter(), 16)
+            .unwrap(),
+    );
+    let second_file = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    table_writer
+        .append_table("main", "t", &[second_file])
+        .await
+        .unwrap();
+
+    let uuid_file_bounds: Vec<(String, String)> = sqlx::query_as(
+        "SELECT stats.min_value, stats.max_value
+         FROM ducklake_file_column_stats stats
+         JOIN ducklake_column col USING (table_id, column_id)
+         WHERE col.column_name = 'object_uuid'
+         ORDER BY stats.data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uuid_file_bounds,
+        [
+            (
+                "01010101-0101-0101-0101-010101010101".to_owned(),
+                "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned(),
+            ),
+            (
+                "00000000-0000-0000-0000-00000000000a".to_owned(),
+                "00000000-0000-0000-0000-00000000000a".to_owned(),
+            ),
+        ]
+    );
+    let uuid_table_stats: (bool, String, String) = sqlx::query_as(
+        "SELECT stats.contains_null, stats.min_value, stats.max_value
+         FROM ducklake_table_column_stats stats
+         JOIN ducklake_column col USING (table_id, column_id)
+         WHERE col.column_name = 'object_uuid'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uuid_table_stats,
+        (
+            true,
+            "00000000-0000-0000-0000-00000000000a".to_owned(),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned(),
+        )
     );
 }
 

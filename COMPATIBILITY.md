@@ -840,11 +840,12 @@ official's `RequiresValueComparison` decides: numbers, booleans and `DATE`, `TIM
 record statistics per leaf field of a `STRUCT`, `LIST` or `MAP`, and float bounds that
 leave NaN out with `contains_nan` set, as official's do. Inlined bounds are DuckDB's
 text of each value (`nan`, `TIME`, escaped `BLOB`, strings of any length), with no NaN
-flag. UUID bounds use canonical UUID strings. `INTERVAL` and other values this crate has
-no DuckDB text for leave the bound unknown. File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and
-`TIME` bounds as text, as official's Parquet statistics do. A file's string and blob
-bounds over 256 bytes are truncated as DuckDB's Parquet writer truncates them: a minimum
-to its first 256 bytes (back to a character boundary for a string), a maximum to the
+flag. UUID bounds use canonical UUID strings. The bounds for `INTERVAL` and other types
+without a DuckDB text encoding remain unknown. File statistics spell `BOOLEAN` bounds
+`0`/`1`, blob bounds in hex and `TIME` bounds as text, as official's Parquet statistics do.
+A file's string and blob bounds over 256 bytes are truncated as DuckDB's Parquet writer
+truncates them: a minimum to its first 256 bytes (back to a character boundary for a
+string), a maximum to the
 last byte in its first 256 below `0x7F` (`0xFF` for a blob), incremented; a file whose
 maximum has no such byte keeps no bounds for the column. A file's string bound holding a
 NUL byte is kept as official keeps it, except on PostgreSQL, whose text holds none: there
