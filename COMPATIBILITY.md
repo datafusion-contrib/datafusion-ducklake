@@ -841,9 +841,10 @@ record statistics per leaf field of a `STRUCT`, `LIST` or `MAP`, and float bound
 leave NaN out with `contains_nan` set, as official's do. Predicates on struct fields can
 use leaf bounds to prune files during scan planning. Inlined bounds are DuckDB's text of
 each value (`nan`, `TIME`, escaped `BLOB`, strings of any length) with no NaN flag.
-The bounds for `UUID`, `INTERVAL`, and other types without a DuckDB text encoding remain
-unknown. File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and
-`TIME` bounds as text, as official's Parquet statistics do. A file's string and blob
+UUID bounds use canonical UUID strings. The bounds for `INTERVAL` and other
+types without a DuckDB text encoding remain unknown. File statistics spell `BOOLEAN`
+bounds `0`/`1`, blob bounds in hex, and `TIME` bounds as text, as official's Parquet
+statistics do. A file's string and blob
 bounds over 256 bytes are truncated as DuckDB's Parquet writer truncates them: a minimum
 to its first 256 bytes (back to a character boundary for a string), a maximum to the
 last byte in its first 256 below `0x7F` (`0xFF` for a blob), incremented; a file whose

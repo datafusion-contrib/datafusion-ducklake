@@ -867,9 +867,8 @@ pub struct InlinedColumnStat {
 /// `CAST(value AS VARCHAR)`. Beyond [`encode_scalar`], that is NaN as `nan`,
 /// `TIME` as `HH:MM:SS[.fraction]`, a blob with every byte outside printable
 /// ASCII (and `'`, `"`, `\`) escaped as `\xHH`, and strings of any length.
-/// `ducklake_type` tells a `UUID` from a 16-byte blob. `None` for a type this
-/// crate has no DuckDB text for (`INTERVAL`, `UUID` among them), which leaves
-/// the bounds unknown.
+/// `ducklake_type` distinguishes a UUID from a 16-byte blob. Types without
+/// a text encoding here, such as `INTERVAL`, leave the bounds unknown.
 pub fn inline_stat_text(value: &ScalarValue, ducklake_type: &str) -> Option<String> {
     let ducklake_type = ducklake_type.trim().to_ascii_lowercase();
     match value {
@@ -885,6 +884,9 @@ pub fn inline_stat_text(value: &ScalarValue, ducklake_type: &str) -> Option<Stri
         ScalarValue::Binary(Some(bytes))
         | ScalarValue::LargeBinary(Some(bytes))
         | ScalarValue::BinaryView(Some(bytes)) => Some(blob_text(bytes)),
+        ScalarValue::FixedSizeBinary(16, Some(bytes)) if ducklake_type == "uuid" => {
+            encode_uuid(bytes)
+        },
         ScalarValue::FixedSizeBinary(_, Some(bytes)) if ducklake_type == "blob" => {
             Some(blob_text(bytes))
         },
@@ -941,7 +943,8 @@ fn blob_text(bytes: &[u8]) -> String {
 
 /// File-level stat text for `value`, as official's Parquet statistics spell it:
 /// [`encode_scalar`], except that a `BOOLEAN` bound is `0` or `1`, a blob bound
-/// is its bytes in upper-case hex, and a `TIME` bound is DuckDB's `TIME` text.
+/// is its bytes in upper-case hex, a UUID uses its canonical string, and a
+/// `TIME` bound is DuckDB's `TIME` text.
 pub fn encode_file_stat(value: &ScalarValue) -> Option<String> {
     match value {
         ScalarValue::Boolean(Some(v)) => Some(
@@ -957,12 +960,28 @@ pub fn encode_file_stat(value: &ScalarValue) -> Option<String> {
         | ScalarValue::BinaryView(Some(bytes)) => {
             Some(bytes.iter().map(|byte| format!("{byte:02X}")).collect())
         },
+        ScalarValue::FixedSizeBinary(16, Some(bytes)) => encode_uuid(bytes),
         ScalarValue::Time32Second(Some(v)) => encode_time(i64::from(*v), 1),
         ScalarValue::Time32Millisecond(Some(v)) => encode_time(i64::from(*v), 1_000),
         ScalarValue::Time64Microsecond(Some(v)) => encode_time(*v, 1_000_000),
         ScalarValue::Time64Nanosecond(Some(v)) => encode_time(*v, 1_000_000_000),
         _ => encode_scalar(value),
     }
+}
+
+fn encode_uuid(value: &[u8]) -> Option<String> {
+    if value.len() != 16 {
+        return None;
+    }
+    let hex: String = value.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..],
+    ))
 }
 
 /// Gather [`InlinedColumnStat`]s for rows written inline, for every top-level
@@ -2280,8 +2299,8 @@ mod tests {
             Some("true")
         );
         assert_eq!(
-            text(ScalarValue::FixedSizeBinary(16, Some(vec![0; 16])), "uuid"),
-            None
+            text(ScalarValue::FixedSizeBinary(16, Some(vec![0; 16])), "uuid").as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
         );
         assert_eq!(
             encode_file_stat(&ScalarValue::Boolean(Some(true))).as_deref(),

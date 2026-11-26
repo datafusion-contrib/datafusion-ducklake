@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -56,6 +56,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
             false,
         ),
+        Field::new("object_uuid", DataType::FixedSizeBinary(16), true),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -75,6 +76,13 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 ])
                 .with_timezone("America/New_York"),
             ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some([0xff; 16]), None, Some([0x01; 16])].into_iter(),
+                    16,
+                )
+                .unwrap(),
+            ),
         ],
     )
     .unwrap();
@@ -82,7 +90,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
     let table_writer =
         DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
     table_writer
-        .write_table("main", "t", &[batch])
+        .write_table("main", "t", std::slice::from_ref(&batch))
         .await
         .unwrap();
 
@@ -136,6 +144,12 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some(0),
                 Some(3)
             ),
+            (
+                Some("01010101-0101-0101-0101-010101010101".to_string()),
+                Some("ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
+                Some(1),
+                Some(2),
+            ),
         ],
         "per-file zone maps must match DuckDB-canonical encodings"
     );
@@ -154,7 +168,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             .collect();
     assert_eq!(
         sizes.len(),
-        4,
+        5,
         "one column_size_bytes row per written column"
     );
     for (i, s) in sizes.iter().enumerate() {
@@ -164,7 +178,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
         );
     }
 
-    // Global roll-up: one row per column, contains_null true only for `name`.
+    // Global roll-up: one row per column, contains_null true for `name` and `object_uuid`.
     let table_stats: Vec<(Option<bool>, Option<String>, Option<String>)> = sqlx::query(
         "SELECT contains_null, min_value, max_value
          FROM ducklake_table_column_stats ORDER BY column_id",
@@ -201,8 +215,66 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some("1969-12-31 23:59:59.123456+00".to_string()),
                 Some("2024-01-15 12:30:00.123456+00".to_string())
             ),
+            (
+                Some(true),
+                Some("01010101-0101-0101-0101-010101010101".to_string()),
+                Some("ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
+            ),
         ],
         "table-wide roll-up must reflect the single file's bounds"
+    );
+
+    let mut columns = batch.slice(0, 1).columns().to_vec();
+    let minimum_uuid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
+    columns[4] = Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size([Some(minimum_uuid)].into_iter(), 16)
+            .unwrap(),
+    );
+    let second_file = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    table_writer
+        .append_table("main", "t", &[second_file])
+        .await
+        .unwrap();
+
+    let uuid_file_bounds: Vec<(String, String)> = sqlx::query_as(
+        "SELECT stats.min_value, stats.max_value
+         FROM ducklake_file_column_stats stats
+         JOIN ducklake_column col USING (table_id, column_id)
+         WHERE col.column_name = 'object_uuid'
+         ORDER BY stats.data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uuid_file_bounds,
+        [
+            (
+                "01010101-0101-0101-0101-010101010101".to_owned(),
+                "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned(),
+            ),
+            (
+                "00000000-0000-0000-0000-00000000000a".to_owned(),
+                "00000000-0000-0000-0000-00000000000a".to_owned(),
+            ),
+        ]
+    );
+    let uuid_table_stats: (bool, String, String) = sqlx::query_as(
+        "SELECT stats.contains_null, stats.min_value, stats.max_value
+         FROM ducklake_table_column_stats stats
+         JOIN ducklake_column col USING (table_id, column_id)
+         WHERE col.column_name = 'object_uuid'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uuid_table_stats,
+        (
+            true,
+            "00000000-0000-0000-0000-00000000000a".to_owned(),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned(),
+        )
     );
 }
 

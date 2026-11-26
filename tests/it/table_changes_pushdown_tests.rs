@@ -1724,7 +1724,9 @@ async fn a_feed_gives_its_pinned_connection_back(lake: &Lake) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(lake.pool.in_use(), 1, "the stream holds the pinned read");
+    lake.pool
+        .settles_at(1, "the stream holds the pinned read")
+        .await;
     drop(stream);
     drop(plan);
     lake.pool
