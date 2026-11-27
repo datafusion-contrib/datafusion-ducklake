@@ -29,6 +29,7 @@ use crate::metadata_provider::{
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
     inlined_version_columns_sql, inlined_version_snapshot_sql, sql_id_list,
 };
+use crate::metadata_provider::{MacroMetadata, MacroRow, assemble_macros};
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
@@ -1313,6 +1314,60 @@ impl MetadataProvider for MySqlMetadataProvider {
             .await?;
 
             rows.into_iter().map(|row| decode_view(&row)).collect()
+        })
+    }
+
+    fn list_macros(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<MacroMetadata>> {
+        block_on(async {
+            let mut connection = self.connection().await?;
+            let available: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) = 3 FROM information_schema.tables WHERE table_schema = DATABASE()
+                 AND table_name IN ('ducklake_macro', 'ducklake_macro_impl', 'ducklake_macro_parameters')",
+            )
+            .fetch_one(&mut *connection)
+            .await?;
+            if !available {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(
+                "SELECT m.macro_id, m.schema_id, m.macro_name,
+                        i.impl_id, i.dialect, i.`sql`, i.`type`,
+                        p.column_id, p.parameter_name, p.parameter_type,
+                        p.default_value, p.default_value_type
+                 FROM ducklake_macro m
+                 JOIN ducklake_macro_impl i ON i.macro_id = m.macro_id
+                 LEFT JOIN ducklake_macro_parameters p
+                   ON p.macro_id = i.macro_id AND p.impl_id = i.impl_id
+                 WHERE m.schema_id = ?
+                   AND ? >= m.begin_snapshot
+                   AND (? < m.end_snapshot OR m.end_snapshot IS NULL)
+                 ORDER BY m.macro_id, i.impl_id, p.column_id",
+            )
+            .bind(schema_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&mut *connection)
+            .await?;
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    Ok(MacroRow {
+                        macro_id: row.try_get(0)?,
+                        schema_id: row.try_get(1)?,
+                        macro_name: row.try_get(2)?,
+                        impl_id: row.try_get(3)?,
+                        dialect: row.try_get(4)?,
+                        sql: row.try_get(5)?,
+                        macro_type: row.try_get(6)?,
+                        column_id: row.try_get(7)?,
+                        parameter_name: row.try_get(8)?,
+                        parameter_type: row.try_get(9)?,
+                        default_value: row.try_get(10)?,
+                        default_value_type: row.try_get(11)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(assemble_macros(rows))
         })
     }
 

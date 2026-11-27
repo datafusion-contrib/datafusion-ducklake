@@ -765,6 +765,122 @@ pub struct ViewWithSchema {
     pub view: ViewMetadata,
 }
 
+/// One parameter of a DuckLake macro implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroParameterMetadata {
+    /// Zero-based position in the implementation signature.
+    pub column_id: i64,
+    /// Parameter name used by the stored SQL.
+    pub parameter_name: String,
+    /// DuckLake type name, or `unknown` when the parameter is untyped.
+    pub parameter_type: String,
+    /// Stored SQL expression used when the argument is omitted.
+    pub default_value: Option<String>,
+    /// DuckLake type of the default expression, or `unknown` when absent.
+    pub default_value_type: String,
+}
+
+/// One scalar or table implementation of a DuckLake macro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroImplementationMetadata {
+    /// Numeric implementation identifier within the macro.
+    pub impl_id: i64,
+    /// SQL dialect used by the stored definition.
+    pub dialect: String,
+    /// Stored expression for scalar macros or query for table macros.
+    pub sql: String,
+    /// `scalar` or `table`.
+    pub macro_type: String,
+    /// Ordered implementation parameters.
+    pub parameters: Vec<MacroParameterMetadata>,
+}
+
+/// Snapshot-visible macro from the DuckLake catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroMetadata {
+    /// Unique identifier for this macro in the catalog.
+    pub macro_id: i64,
+    /// Schema containing the macro.
+    pub schema_id: i64,
+    /// Name used in SQL calls.
+    pub macro_name: String,
+    /// Overloaded implementations ordered by implementation identifier.
+    pub implementations: Vec<MacroImplementationMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MacroRow {
+    pub macro_id: i64,
+    pub schema_id: i64,
+    pub macro_name: String,
+    pub impl_id: i64,
+    pub dialect: String,
+    pub sql: String,
+    pub macro_type: String,
+    pub column_id: Option<i64>,
+    pub parameter_name: Option<String>,
+    pub parameter_type: Option<String>,
+    pub default_value: Option<String>,
+    pub default_value_type: Option<String>,
+}
+
+pub(crate) fn assemble_macros(rows: Vec<MacroRow>) -> Vec<MacroMetadata> {
+    let mut macros: Vec<MacroMetadata> = Vec::new();
+    for row in rows {
+        if macros
+            .last()
+            .is_none_or(|item| item.macro_id != row.macro_id)
+        {
+            macros.push(MacroMetadata {
+                macro_id: row.macro_id,
+                schema_id: row.schema_id,
+                macro_name: row.macro_name.clone(),
+                implementations: Vec::new(),
+            });
+        }
+        let macro_metadata = macros.last_mut().expect("macro was inserted");
+        if macro_metadata
+            .implementations
+            .last()
+            .is_none_or(|item| item.impl_id != row.impl_id)
+        {
+            macro_metadata
+                .implementations
+                .push(MacroImplementationMetadata {
+                    impl_id: row.impl_id,
+                    dialect: row.dialect,
+                    sql: row.sql,
+                    macro_type: row.macro_type,
+                    parameters: Vec::new(),
+                });
+        }
+        if let Some(column_id) = row.column_id {
+            let default_value = match (
+                row.default_value.as_deref(),
+                row.default_value_type.as_deref(),
+            ) {
+                (Some("NULL"), Some("unknown")) => None,
+                _ => row.default_value,
+            };
+            macro_metadata
+                .implementations
+                .last_mut()
+                .expect("implementation was inserted")
+                .parameters
+                .push(MacroParameterMetadata {
+                    column_id,
+                    parameter_name: row.parameter_name.unwrap_or_default(),
+                    parameter_type: row.parameter_type.unwrap_or_else(|| "unknown".to_string()),
+                    default_value,
+                    default_value_type: row
+                        .default_value_type
+                        .unwrap_or_else(|| "unknown".to_string()),
+                });
+        }
+    }
+    macros
+}
+
 /// Column metadata with its schema and table names (for bulk queries)
 #[derive(Debug, Clone)]
 pub struct ColumnWithTable {
@@ -2852,6 +2968,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List views visible in a schema at a specific snapshot.
     fn list_views(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        Ok(Vec::new())
+    }
+
+    /// List macros visible in a schema at a specific snapshot.
+    fn list_macros(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<MacroMetadata>> {
         Ok(Vec::new())
     }
 

@@ -27,6 +27,7 @@ use crate::metadata_provider::{
     inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
     reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings, sql_id_list,
 };
+use crate::metadata_provider::{MacroMetadata, MacroRow, assemble_macros};
 use crate::metadata_provider::{SQL_FILE_SCHEMA_VERSION, SQL_NEXT_FILE_ID};
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -1701,6 +1702,52 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .query_map([schema_id, snapshot_id, snapshot_id], decode_view)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(views)
+    }
+
+    fn list_macros(&self, schema_id: i64, snapshot_id: i64) -> crate::Result<Vec<MacroMetadata>> {
+        let conn = self.connection()?;
+        let available: bool = conn.query_row(
+            "SELECT COUNT(*) = 3 FROM duckdb_tables() WHERE table_name IN
+             ('ducklake_macro', 'ducklake_macro_impl', 'ducklake_macro_parameters')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !available {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT m.macro_id, m.schema_id, m.macro_name,
+                    i.impl_id, i.dialect, i.sql, i.type,
+                    p.column_id, p.parameter_name, p.parameter_type,
+                    p.default_value, p.default_value_type
+             FROM ducklake_macro m
+             JOIN ducklake_macro_impl i ON i.macro_id = m.macro_id
+             LEFT JOIN ducklake_macro_parameters p
+               ON p.macro_id = i.macro_id AND p.impl_id = i.impl_id
+             WHERE m.schema_id = ?
+               AND ? >= m.begin_snapshot
+               AND (? < m.end_snapshot OR m.end_snapshot IS NULL)
+             ORDER BY m.macro_id, i.impl_id, p.column_id",
+        )?;
+        let rows = stmt
+            .query_map([schema_id, snapshot_id, snapshot_id], |row| {
+                Ok(MacroRow {
+                    macro_id: row.get(0)?,
+                    schema_id: row.get(1)?,
+                    macro_name: row.get(2)?,
+                    impl_id: row.get(3)?,
+                    dialect: row.get(4)?,
+                    sql: row.get(5)?,
+                    macro_type: row.get(6)?,
+                    column_id: row.get(7)?,
+                    parameter_name: row.get(8)?,
+                    parameter_type: row.get(9)?,
+                    default_value: row.get(10)?,
+                    default_value_type: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(assemble_macros(rows))
     }
 
     fn get_table_structure(

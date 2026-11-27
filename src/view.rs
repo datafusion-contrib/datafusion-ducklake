@@ -22,7 +22,7 @@ use crate::delete_memo::DuckLakeReadOptions;
 use crate::metadata_provider::{MetadataProvider, SchemaMetadata, ViewMetadata};
 use crate::snapshot_consistency::ViewGuard;
 
-const VIEW_CATALOG: &str = "__ducklake_view";
+pub(crate) const VIEW_CATALOG: &str = "__ducklake_view";
 
 #[derive(Debug)]
 pub(crate) struct UnplannableViewTable {
@@ -270,7 +270,7 @@ pub(crate) fn resolve_view_definition(
     .map_err(|e| view_error(view, e))
 }
 
-fn resolve_view_sql(
+pub(crate) fn resolve_view_sql(
     sql: &str,
     schema_name: &str,
     dialect: Dialect,

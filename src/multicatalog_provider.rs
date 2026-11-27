@@ -11,6 +11,7 @@
 //! single-catalog provider's storage-level implementation, run on this
 //! provider's connection.
 
+use crate::metadata_provider::{MacroMetadata, MacroRow, assemble_macros};
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
@@ -1767,6 +1768,65 @@ impl MetadataProvider for MulticatalogProvider {
             .await?;
 
             rows.into_iter().map(|row| decode_view(&row)).collect()
+        })
+    }
+
+    fn list_macros(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<MacroMetadata>> {
+        block_on(async {
+            let available: bool = self
+                .read_one(sqlx::query(
+                    "SELECT to_regclass('ducklake_macro') IS NOT NULL
+                     AND to_regclass('ducklake_macro_impl') IS NOT NULL
+                     AND to_regclass('ducklake_macro_parameters') IS NOT NULL",
+                ))
+                .await?
+                .try_get(0)?;
+            if !available {
+                return Ok(Vec::new());
+            }
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT m.macro_id, m.schema_id, m.macro_name,
+                        i.impl_id, i.dialect, i.sql, i.type,
+                        p.column_id, p.parameter_name, p.parameter_type,
+                        p.default_value, p.default_value_type
+                 FROM ducklake_macro m
+                 JOIN ducklake_macro_impl i ON i.macro_id = m.macro_id
+                 LEFT JOIN ducklake_macro_parameters p
+                   ON p.macro_id = i.macro_id AND p.impl_id = i.impl_id
+                 JOIN ducklake_catalog_schema_map map ON map.schema_id = m.schema_id
+                 WHERE m.schema_id = $1 AND map.catalog_id = $4
+                   AND $2 >= m.begin_snapshot
+                   AND ($3 < m.end_snapshot OR m.end_snapshot IS NULL)
+                 ORDER BY m.macro_id, i.impl_id, p.column_id",
+                    )
+                    .bind(schema_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(self.catalog_id),
+                )
+                .await?;
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    Ok(MacroRow {
+                        macro_id: row.try_get(0)?,
+                        schema_id: row.try_get(1)?,
+                        macro_name: row.try_get(2)?,
+                        impl_id: row.try_get(3)?,
+                        dialect: row.try_get(4)?,
+                        sql: row.try_get(5)?,
+                        macro_type: row.try_get(6)?,
+                        column_id: row.try_get(7)?,
+                        parameter_name: row.try_get(8)?,
+                        parameter_type: row.try_get(9)?,
+                        default_value: row.try_get(10)?,
+                        default_value_type: row.try_get(11)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(assemble_macros(rows))
         })
     }
 
