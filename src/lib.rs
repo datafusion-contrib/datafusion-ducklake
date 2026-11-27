@@ -218,8 +218,8 @@ pub use insert_exec::DuckLakeInsertExec;
 pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
+    ColumnChange, ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile,
+    DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,

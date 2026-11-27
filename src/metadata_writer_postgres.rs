@@ -20,15 +20,16 @@ use crate::metadata_provider_postgres::catalog_state;
 use crate::metadata_provider_postgres::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::CarriedTags;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata, StagedTableData,
-    StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    encode_inlined_index_columns, inlined_delete_groups, live_inlined_index_columns,
-    parse_inlined_index_columns, snapshot_has_change, staged_table_write_changes,
-    table_storage_changes, table_write_changes, tag_change, top_level_column_ids,
-    validate_delete_entries, validate_inlined_index_columns, validate_name,
+    ColumnChange, ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry,
+    DeleteFileInfo, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef,
+    MetadataWriter, MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_groups,
+    live_inlined_index_columns, parse_inlined_index_columns, plan_column_change,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
+    tag_change, top_level_column_ids, validate_delete_entries, validate_inlined_index_columns,
+    validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SourceFile, TableChanges,
@@ -5967,6 +5968,246 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             self.commit(transaction).await?;
             Ok(())
+        })
+    }
+
+    fn change_column(&self, table_id: i64, change: &ColumnChange) -> Result<i64> {
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let rows = sqlx::query(
+                "SELECT column_id, column_name, column_type, column_order,
+                        nulls_allowed, parent_column, initial_default, default_value,
+                        default_value_type, default_value_dialect
+                 FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let existing = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, sqlx::Error>((
+                        ExistingCatalogColumn {
+                            column_id: row.try_get("column_id")?,
+                            name: row.try_get("column_name")?,
+                            ducklake_type: row.try_get("column_type")?,
+                            parent_column: row.try_get("parent_column")?,
+                        },
+                        row.try_get::<Option<bool>, _>("nulls_allowed")?
+                            .unwrap_or(true),
+                    ))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let Some(plan) = plan_column_change(&existing, change)? else {
+                let head = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(snapshot_id), 0)
+                     FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1",
+                )
+                .bind(self.catalog_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                return Ok(head);
+            };
+
+            let new_count = plan
+                .iter()
+                .filter(|column| column.column_id.is_none())
+                .count() as i64;
+            let fresh_ids = if new_count == 0 {
+                Vec::new()
+            } else {
+                reserve_ids("ducklake_column", "column_id", new_count, &mut tx).await?
+            };
+            let mut fresh_ids = fresh_ids.into_iter();
+            let field_ids = plan
+                .iter()
+                .map(|column| {
+                    column
+                        .column_id
+                        .unwrap_or_else(|| fresh_ids.next().unwrap())
+                })
+                .collect::<Vec<_>>();
+            let planned_ids = field_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            let existing_by_id = existing
+                .iter()
+                .enumerate()
+                .map(|(index, (column, nullable))| (column.column_id, (index, column, nullable)))
+                .collect::<std::collections::HashMap<_, _>>();
+            let existing_orders = rows
+                .iter()
+                .map(|row| row.try_get::<i64, _>("column_order"))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let orders = crate::metadata_writer::column_orders(
+                existing
+                    .iter()
+                    .zip(&existing_orders)
+                    .map(|((column, _), order)| (column.column_id, *order))
+                    .collect(),
+                plan.iter().map(|column| column.parent_index),
+                &field_ids,
+            );
+
+            utc_snapshot_time(&mut tx).await?;
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            sqlx::query(
+                "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(self.catalog_id)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            for (index, (column, nullable)) in existing.iter().enumerate() {
+                let planned = field_ids
+                    .iter()
+                    .position(|column_id| *column_id == column.column_id);
+                let changed = planned.is_some_and(|planned_index| {
+                    let candidate = &plan[planned_index];
+                    let parent_id = candidate.parent_index.map(|parent| field_ids[parent]);
+                    candidate.name != column.name
+                        || !candidate
+                            .ducklake_type
+                            .eq_ignore_ascii_case(&column.ducklake_type)
+                        || candidate.is_nullable != *nullable
+                        || parent_id != column.parent_column
+                        || orders[planned_index] != existing_orders[index]
+                });
+                if !planned_ids.contains(&column.column_id) || changed {
+                    sqlx::query(
+                        "UPDATE ducklake_column SET end_snapshot = $1
+                         WHERE table_id = $2 AND column_id = $3 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column.column_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            for ((column, column_id), order) in plan.iter().zip(&field_ids).zip(orders) {
+                let parent_id = column.parent_index.map(|parent| field_ids[parent]);
+                let unchanged =
+                    existing_by_id
+                        .get(column_id)
+                        .is_some_and(|(old_order, existing, nullable)| {
+                            existing.name == column.name
+                                && existing
+                                    .ducklake_type
+                                    .eq_ignore_ascii_case(&column.ducklake_type)
+                                && **nullable == column.is_nullable
+                                && existing.parent_column == parent_id
+                                && existing_orders[*old_order] == order
+                        });
+                if unchanged {
+                    continue;
+                }
+                let previous = existing_by_id
+                    .get(column_id)
+                    .map(|(index, _, _)| &rows[*index]);
+                let initial_default: Option<String> = previous
+                    .map(|row| row.try_get("initial_default"))
+                    .transpose()?
+                    .flatten();
+                let default_value: Option<String> = previous
+                    .map(|row| row.try_get("default_value"))
+                    .transpose()?
+                    .flatten();
+                let default_value_type: Option<String> = previous
+                    .map(|row| row.try_get("default_value_type"))
+                    .transpose()?
+                    .flatten();
+                let default_value_dialect: Option<String> = previous
+                    .map(|row| row.try_get("default_value_dialect"))
+                    .transpose()?
+                    .flatten();
+                sqlx::query(
+                    "INSERT INTO ducklake_column
+                         (column_id, begin_snapshot, end_snapshot, table_id, column_order,
+                          column_name, column_type, nulls_allowed, parent_column,
+                          initial_default, default_value, default_value_type, default_value_dialect)
+                     OVERRIDING SYSTEM VALUE
+                     VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                )
+                .bind(column_id)
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(order)
+                .bind(&column.name)
+                .bind(&column.ducklake_type)
+                .bind(column.is_nullable)
+                .bind(parent_id)
+                .bind(initial_default)
+                .bind(default_value)
+                .bind(default_value_type)
+                .bind(default_value_dialect)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            for (column, _) in &existing {
+                if !planned_ids.contains(&column.column_id) {
+                    sqlx::query(
+                        "DELETE FROM ducklake_table_column_stats
+                         WHERE table_id = $1 AND column_id = $2",
+                    )
+                    .bind(table_id)
+                    .bind(column.column_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            let previous: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1 AND s.snapshot_id <> $2",
+            )
+            .bind(self.catalog_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            let schema_version = previous + 1;
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+                .bind(schema_version)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(snapshot_id)
+            .bind(schema_version)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            create_eager_inlined_table(&mut tx, Some(self.catalog_id), table_id, schema_version)
+                .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            self.commit(tx).await?;
+            Ok(snapshot_id)
         })
     }
 
