@@ -281,6 +281,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
 | `CREATE TABLE [IF NOT EXISTS] … AS SELECT` via `execute_ducklake_sql` — rows and table metadata in one snapshot, nullable columns as in DuckDB, an empty result publishes no data file; SQLite, DuckDB, MySQL, and single-catalog PostgreSQL                                                                                     | ✅        |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
+| Catalog SQL DDL: `CREATE SCHEMA`, `DROP SCHEMA` (empty only), `DROP TABLE`, versioned `ALTER TABLE ... RENAME TO` (SQLite and PostgreSQL multicatalog)                                                                                                                                                                           | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional deletes, inlined deletions of Parquet rows under the scoped `data_inlining_row_limit`, and inlined-row deletes, mixed in one snapshot; metadata-only truncate; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                      | ✅        |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (Parquet and inlined rows; new versions keep their row ids, inlined under the scoped `data_inlining_row_limit`; one snapshot; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                                                        | ✅        |
@@ -310,8 +311,9 @@ As in official DuckLake, schemas take no comments and a column takes only the `c
 A comment bumps `schema_version` and records `altered_table` or `altered_view`, so attached
 DuckDB sessions see it.
 
-Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
-`MetadataWriter`), not SQL DDL.
+Maintenance is driven through the Rust API. Catalog DDL supports `CREATE SCHEMA`,
+`DROP SCHEMA`, `DROP TABLE`, and versioned `RENAME TABLE`. It is available
+through both `MetadataWriter` and `execute_ducklake_sql`.
 
 ### Parquet writer defaults
 
